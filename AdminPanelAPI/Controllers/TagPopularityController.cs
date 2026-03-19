@@ -121,24 +121,18 @@ WHERE id = @id;";
 
         /// <summary>
         /// GET /api/admin/tag-popularity/search?tag={tag}
-        /// Searches tags from the in-memory cache (case-insensitive partial match).
+        /// Searches all cached keywords (case-insensitive partial match)
+        /// and returns each result with its origin (e.g. Director, Lighting Type, Shot Type).
         /// </summary>
         [HttpGet("search")]
-        [ProducesResponseType(typeof(List<string>), StatusCodes.Status200OK)]
+        [ProducesResponseType(typeof(List<TagWithOrigin>), StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
-        public ActionResult<List<string>> SearchByTag([FromQuery] string tag)
+        public ActionResult<List<TagWithOrigin>> SearchByTag([FromQuery] string tag)
         {
             if (string.IsNullOrWhiteSpace(tag))
                 return BadRequest(new { Message = "Tag query parameter is required." });
 
-            var query = tag.Trim();
-            var allTags = _keywordCache.GetImageTags();
-
-            var results = allTags
-                .Where(t => t.Contains(query, StringComparison.OrdinalIgnoreCase))
-                .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
+            var results = _keywordCache.SearchAllWithOrigin(tag);
             return Ok(results);
         }
 

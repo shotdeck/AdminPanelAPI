@@ -39,6 +39,12 @@ namespace ShotDeck.Keywords
         string? GetSynonymCategory(string keyword);
         IReadOnlyDictionary<string, HashSet<string>> GetKeywordToCategories();
         IReadOnlyCollection<string> GetImageTags();
+        List<TagWithOrigin> SearchAllWithOrigin(string query);
+    }
+    public sealed class TagWithOrigin
+    {
+        public string Tag { get; init; } = default!;
+        public string Origin { get; init; } = default!;
     }
     public sealed class CensorshipCheckResult
     {
@@ -546,6 +552,54 @@ namespace ShotDeck.Keywords
         {
             EnsureWarmOrCsvThenBackgroundRefresh();
             return _snapshot.ImageTags;
+        }
+        public List<TagWithOrigin> SearchAllWithOrigin(string query)
+        {
+            EnsureWarmOrCsvThenBackgroundRefresh();
+            if (string.IsNullOrWhiteSpace(query)) return new();
+            var q = query.Trim();
+            var snap = _snapshot;
+            var results = new List<TagWithOrigin>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in snap.KeywordSources)
+            {
+                var keyword = kv.Key;
+                if (!keyword.Contains(q, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!seen.Add(keyword)) continue;
+                var origin = ResolveOrigin(keyword, kv.Value, snap);
+                results.Add(new TagWithOrigin { Tag = keyword, Origin = origin });
+            }
+            results.Sort((a, b) => string.Compare(a.Tag, b.Tag, StringComparison.OrdinalIgnoreCase));
+            return results;
+        }
+        private static string ResolveOrigin(string keyword, HashSet<string> sources, KeywordSnapshot snap)
+        {
+            // First check if this keyword (or its master) has a category from the synonyms system
+            if (snap.MasterTermCategories.TryGetValue(keyword, out var cat))
+                return cat;
+            if (snap.SynonymToMaster.TryGetValue(keyword, out var master)
+                && snap.MasterTermCategories.TryGetValue(master, out var masterCat))
+                return masterCat;
+            // Fall back to the source label from the DB table it was loaded from
+            // Pick the most specific non-synonym source
+            foreach (var src in sources)
+            {
+                if (src.StartsWith("synonym:", StringComparison.OrdinalIgnoreCase)) continue;
+                if (src == "synonym_master") continue;
+                return FormatOrigin(src);
+            }
+            // If only synonym sources, use the first one
+            return sources.Count > 0 ? FormatOrigin(sources.First()) : "unknown";
+        }
+        private static string FormatOrigin(string source)
+        {
+            // Convert source labels like "movie:director" → "Director", "lighting_type" → "Lighting Type"
+            var label = source;
+            if (label.Contains(':'))
+                label = label.Substring(label.IndexOf(':') + 1);
+            // Convert snake_case to Title Case
+            return string.Join(' ', label.Split('_')
+                .Select(w => w.Length > 0 ? char.ToUpperInvariant(w[0]) + w.Substring(1).ToLowerInvariant() : w));
         }
         public CensorshipCheckResult CheckCensorship(string text)
         {
