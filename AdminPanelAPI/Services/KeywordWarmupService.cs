@@ -18,7 +18,7 @@ public class KeywordWarmupService : IHostedService
         var keywordService = scope.ServiceProvider.GetRequiredService<IKeywordCacheService>();
         try
         {
-            await keywordService.RefreshAsync();
+            //await keywordService.RefreshAsync();
             Console.WriteLine("✅ Keyword cache loaded.");
         }
         catch (Exception ex)
