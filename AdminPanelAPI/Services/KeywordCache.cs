@@ -551,7 +551,7 @@ namespace ShotDeck.Keywords
         public IReadOnlyCollection<string> GetImageTags()
         {
             EnsureWarmOrCsvThenBackgroundRefresh();
-            return _snapshot.ImageTags;
+            return _snapshot.KeywordSources.Keys;
         }
         public List<TagWithOrigin> SearchAllWithOrigin(string query)
         {
