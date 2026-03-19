@@ -289,7 +289,7 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
         /// POST /api/admin/tag-popularity/apply
         /// Reads all active rules from frl_popularity_tag_rules updated within the past 6 hours,
         /// then adjusts frl_images.base_weighted_score by the rule's percentage for each image
-        /// that has the matching tag in frl_join_images_tags.
+        /// matched via the rule's category (e.g. join tables, frl_images columns, or frl_movies columns).
         /// </summary>
         [HttpPost("apply")]
         [ProducesResponseType(typeof(ApplyRulesResult), StatusCodes.Status200OK)]
@@ -306,38 +306,53 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
             {
                 // Step 1: Read active rules updated within the past 6 hours
                 const string fetchRulesSql = @"
-SELECT id, tag, percentage
+SELECT id, tag, percentage, category
 FROM frl.frl_popularity_tag_rules
 WHERE is_active = true
   AND updated_at >= now() - interval '6 hours';";
 
-                var rules = new List<(long Id, string Tag, int Percentage)>();
+                var rules = new List<(long Id, string Tag, int Percentage, string? Category)>();
 
                 await using (var cmd = new NpgsqlCommand(fetchRulesSql, _connection))
                 await using (var reader = await cmd.ExecuteReaderAsync(ct))
                 {
                     while (await reader.ReadAsync(ct))
                     {
-                        rules.Add((reader.GetInt64(0), reader.GetString(1), reader.GetInt32(2)));
+                        rules.Add((
+                            reader.GetInt64(0),
+                            reader.GetString(1),
+                            reader.GetInt32(2),
+                            reader.IsDBNull(3) ? null : reader.GetString(3)
+                        ));
                     }
                 }
 
                 if (rules.Count == 0)
                     return Ok(new ApplyRulesResult { RulesProcessed = 0, TotalImagesUpdated = 0 });
 
-                // Step 2: For each rule, update frl_images.base_weighted_score
-                const string updateSql = @"
-UPDATE frl.frl_images img
-SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
-FROM frl.frl_join_images_tags jit
-WHERE jit.imageid = img.idnum
-  AND jit.tag = @tag;";
-
+                // Step 2: For each rule, build the correct UPDATE based on category
                 var totalUpdated = 0;
                 var ruleResults = new List<ApplyRuleDetail>();
 
                 foreach (var rule in rules)
                 {
+                    var updateSql = BuildUpdateSqlForCategory(rule.Category);
+                    if (updateSql == null)
+                    {
+                        _logger.LogWarning("Rule {RuleId} has unknown category '{Category}', skipping.", rule.Id, rule.Category);
+                        ruleResults.Add(new ApplyRuleDetail
+                        {
+                            RuleId = rule.Id,
+                            Tag = rule.Tag,
+                            Percentage = rule.Percentage,
+                            Category = rule.Category,
+                            ImagesUpdated = 0,
+                            Skipped = true,
+                            SkipReason = $"Unknown category: {rule.Category}"
+                        });
+                        continue;
+                    }
+
                     await using var updateCmd = new NpgsqlCommand(updateSql, _connection);
                     updateCmd.Parameters.AddWithValue("@percentage", rule.Percentage);
                     updateCmd.Parameters.AddWithValue("@tag", rule.Tag);
@@ -350,6 +365,7 @@ WHERE jit.imageid = img.idnum
                         RuleId = rule.Id,
                         Tag = rule.Tag,
                         Percentage = rule.Percentage,
+                        Category = rule.Category,
                         ImagesUpdated = rowsAffected
                     });
                 }
@@ -365,6 +381,139 @@ WHERE jit.imageid = img.idnum
             {
                 if (mustClose) await _connection.CloseAsync();
             }
+        }
+
+        /// <summary>
+        /// Returns the UPDATE SQL for a given category, or null if the category is unknown.
+        /// Each category maps to a different join table / column to find matching image IDs.
+        /// </summary>
+        private static string? BuildUpdateSqlForCategory(string? category)
+        {
+            // Join-table categories: UPDATE frl_images via a join table
+            // Image-column categories: UPDATE frl_images matching a column on frl_images directly
+            // Movie-column categories: UPDATE frl_images via frl_movies join
+
+            return category switch
+            {
+                "Time Of Day" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_join_images_time_of_day j
+WHERE j.imageid = img.idnum AND j.time_of_day = @tag;",
+
+                "Lighting Type" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_join_images_lighting_type j
+WHERE j.imageid = img.idnum AND j.lighting_type = @tag;",
+
+                "Vfx Backing" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_join_images_vfx_backing j
+WHERE j.imageid = img.idnum AND j.vfx_backing = @tag;",
+
+                "Color" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_join_images_color j
+WHERE j.imageid = img.idnum AND j.color = @tag;",
+
+                "Shot Type" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_join_images_shot_type j
+WHERE j.imageid = img.idnum AND j.shot_type = @tag;",
+
+                "Lighting" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_join_images_lighting j
+WHERE j.imageid = img.idnum AND j.lighting = @tag;",
+
+                "Lens Size" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_join_images_lens_type j
+WHERE j.imageid = img.idnum AND j.lens_type = @tag;",
+
+                "Composition" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_join_images_lens_type j
+WHERE j.imageid = img.idnum AND j.lens_type = @tag;",
+
+                "Actors" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+WHERE img.actors = @tag;",
+
+                "Int Ext" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+WHERE img.int_ext = @tag;",
+
+                "Aspect Ratio" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+WHERE img.aspect_ratio = @tag;",
+
+                "Media Type" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.media_type = @tag;",
+
+                "Title" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.title = @tag;",
+
+                "Director" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.director = @tag;",
+
+                "Cinematographer" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.cinematographer = @tag;",
+
+                "Production Designer" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.production_designer = @tag;",
+
+                "Costume Designer" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.costume_designer = @tag;",
+
+                "Mv Artist" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.mv_artist = @tag;",
+
+                "Comm Brand" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.comm_brand = @tag;",
+
+                "Image Tag" => @"
+UPDATE frl.frl_images img
+SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
+FROM frl.frl_join_images_tags jit
+WHERE jit.imageid = img.idnum AND jit.tag = @tag;",
+
+                _ => null
+            };
         }
 
         #region Helpers
@@ -426,7 +575,10 @@ WHERE jit.imageid = img.idnum
             public long RuleId { get; set; }
             public string Tag { get; set; } = default!;
             public int Percentage { get; set; }
+            public string? Category { get; set; }
             public int ImagesUpdated { get; set; }
+            public bool Skipped { get; set; }
+            public string? SkipReason { get; set; }
         }
 
         #endregion
