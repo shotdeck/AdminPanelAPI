@@ -48,14 +48,14 @@ namespace ShotDeckSearch.Controllers
                 if (string.IsNullOrWhiteSpace(tag))
                 {
                     sql = @"
-SELECT id, tag, percentage, is_active, created_at, updated_at
+SELECT id, tag, percentage, is_active, created_at, updated_at, category
 FROM frl.frl_popularity_tag_rules
 ORDER BY tag;";
                 }
                 else
                 {
                     sql = @"
-SELECT id, tag, percentage, is_active, created_at, updated_at
+SELECT id, tag, percentage, is_active, created_at, updated_at, category
 FROM frl.frl_popularity_tag_rules
 WHERE tag ILIKE @tag
 ORDER BY tag;";
@@ -100,7 +100,7 @@ ORDER BY tag;";
             try
             {
                 const string sql = @"
-SELECT id, tag, percentage, is_active, created_at, updated_at
+SELECT id, tag, percentage, is_active, created_at, updated_at, category
 FROM frl.frl_popularity_tag_rules
 WHERE id = @id;";
 
@@ -162,14 +162,15 @@ WHERE id = @id;";
             try
             {
                 const string sql = @"
-INSERT INTO frl.frl_popularity_tag_rules (tag, percentage, is_active)
-VALUES (@tag, @percentage, @is_active)
-RETURNING id, tag, percentage, is_active, created_at, updated_at;";
+INSERT INTO frl.frl_popularity_tag_rules (tag, percentage, is_active, category)
+VALUES (@tag, @percentage, @is_active, @category)
+RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
 
                 await using var cmd = new NpgsqlCommand(sql, _connection);
                 cmd.Parameters.AddWithValue("@tag", request.Tag.Trim());
                 cmd.Parameters.AddWithValue("@percentage", request.Percentage);
                 cmd.Parameters.AddWithValue("@is_active", request.IsActive ?? true);
+                cmd.Parameters.AddWithValue("@category", (object?)request.Category ?? DBNull.Value);
 
                 await using var reader = await cmd.ExecuteReaderAsync(ct);
 
@@ -220,15 +221,17 @@ UPDATE frl.frl_popularity_tag_rules
 SET tag = @tag,
     percentage = @percentage,
     is_active = @is_active,
+    category = @category,
     updated_at = now()
 WHERE id = @id
-RETURNING id, tag, percentage, is_active, created_at, updated_at;";
+RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
 
                 await using var cmd = new NpgsqlCommand(sql, _connection);
                 cmd.Parameters.AddWithValue("@id", id);
                 cmd.Parameters.AddWithValue("@tag", request.Tag.Trim());
                 cmd.Parameters.AddWithValue("@percentage", request.Percentage);
                 cmd.Parameters.AddWithValue("@is_active", request.IsActive ?? true);
+                cmd.Parameters.AddWithValue("@category", (object?)request.Category ?? DBNull.Value);
 
                 await using var reader = await cmd.ExecuteReaderAsync(ct);
 
@@ -375,7 +378,8 @@ WHERE jit.imageid = img.idnum
                 Percentage = reader.GetInt32(2),
                 IsActive = reader.GetBoolean(3),
                 CreatedAt = reader.GetDateTime(4),
-                UpdatedAt = reader.GetDateTime(5)
+                UpdatedAt = reader.GetDateTime(5),
+                Category = reader.IsDBNull(6) ? null : reader.GetString(6)
             };
         }
 
@@ -391,6 +395,7 @@ WHERE jit.imageid = img.idnum
             public bool IsActive { get; set; }
             public DateTime CreatedAt { get; set; }
             public DateTime UpdatedAt { get; set; }
+            public string? Category { get; set; }
         }
 
         public sealed class CreateTagPopularityRuleRequest
@@ -398,6 +403,7 @@ WHERE jit.imageid = img.idnum
             public string? Tag { get; set; }
             public int Percentage { get; set; }
             public bool? IsActive { get; set; }
+            public string? Category { get; set; }
         }
 
         public sealed class UpdateTagPopularityRuleRequest
@@ -405,6 +411,7 @@ WHERE jit.imageid = img.idnum
             public string? Tag { get; set; }
             public int Percentage { get; set; }
             public bool? IsActive { get; set; }
+            public string? Category { get; set; }
         }
 
         public sealed class ApplyRulesResult
