@@ -440,8 +440,8 @@ WHERE j.imageid = img.idnum AND j.lens_type = @tag;",
                 "Composition" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
-FROM frl.frl_join_images_lens_type j
-WHERE j.imageid = img.idnum AND j.lens_type = @tag;",
+FROM frl.frl_join_images_composition j
+WHERE j.imageid = img.idnum AND j.composition = @tag;",
 
                 "Actors" => @"
 UPDATE frl.frl_images img
