@@ -421,20 +421,28 @@ namespace ShotDeck.Keywords
                 var keyword = kv.Key;
                 if (!keyword.Contains(q, StringComparison.OrdinalIgnoreCase)) continue;
                 if (!seen.Add(keyword)) continue;
-                var origin = ResolveOrigin(keyword, kv.Value, snap);
-                results.Add(new TagWithOrigin { Tag = keyword, Origin = origin });
+                // Emit one result per distinct origin for this keyword
+                var origins = ResolveOrigins(kv.Value);
+                foreach (var origin in origins)
+                {
+                    results.Add(new TagWithOrigin { Tag = keyword, Origin = origin });
+                }
             }
-            results.Sort((a, b) => string.Compare(a.Tag, b.Tag, StringComparison.OrdinalIgnoreCase));
+            results.Sort((a, b) =>
+            {
+                var cmp = string.Compare(a.Tag, b.Tag, StringComparison.OrdinalIgnoreCase);
+                return cmp != 0 ? cmp : string.Compare(a.Origin, b.Origin, StringComparison.OrdinalIgnoreCase);
+            });
             return results;
         }
-        private static string ResolveOrigin(string keyword, HashSet<string> sources, KeywordSnapshot snap)
+        private static List<string> ResolveOrigins(HashSet<string> sources)
         {
-            // Use the source label from the DB table it was loaded from
+            var origins = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var src in sources)
             {
-                return FormatOrigin(src);
+                origins.Add(FormatOrigin(src));
             }
-            return sources.Count > 0 ? FormatOrigin(sources.First()) : "unknown";
+            return origins.Count > 0 ? origins.ToList() : new List<string> { "unknown" };
         }
         private static string FormatOrigin(string source)
         {
