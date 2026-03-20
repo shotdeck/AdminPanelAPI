@@ -90,14 +90,21 @@ WHERE n.nspname = 'frl'
             await dropCmd.ExecuteNonQueryAsync(ct);
         }
 
-        // Also drop any unique indexes that aren't constraints (created via CREATE UNIQUE INDEX)
+        // Also drop any unique indexes that aren't constraints and aren't primary keys
+        // (created via CREATE UNIQUE INDEX). Exclude PK backing indexes to avoid destroying the primary key.
         const string findOldIndexesSql = @"
-SELECT indexname
-FROM pg_indexes
-WHERE schemaname = 'frl'
-  AND tablename = 'frl_popularity_tag_rules'
-  AND indexdef ILIKE '%unique%'
-  AND indexname != 'uq_frl_popularity_tag_rules_tag_category';";
+SELECT i.indexname
+FROM pg_indexes i
+JOIN pg_class c ON c.relname = i.indexname
+JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = i.schemaname
+WHERE i.schemaname = 'frl'
+  AND i.tablename = 'frl_popularity_tag_rules'
+  AND i.indexdef ILIKE '%unique%'
+  AND i.indexname != 'uq_frl_popularity_tag_rules_tag_category'
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_constraint con
+      WHERE con.conindid = c.oid AND con.contype = 'p'
+  );";
 
         var indexesToDrop = new List<string>();
         await using (var findIdxCmd = new NpgsqlCommand(findOldIndexesSql, connection))
