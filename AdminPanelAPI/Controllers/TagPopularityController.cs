@@ -446,65 +446,65 @@ WHERE j.imageid = img.idnum AND j.lens_type = @tag;",
                 "Actors" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
-WHERE img.actors = @tag;",
+WHERE img.actors ILIKE '%' || @tag || '%';",
 
                 "Int Ext" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
-WHERE img.int_ext = @tag;",
+WHERE img.int_ext ILIKE '%' || @tag || '%';",
 
                 "Aspect Ratio" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
-WHERE img.aspect_ratio = @tag;",
+WHERE img.aspect_ratio ILIKE '%' || @tag || '%';",
 
                 "Media Type" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
 FROM frl.frl_movies m
-WHERE img.movieid = m.idnum AND m.media_type = @tag;",
+WHERE img.movieid = m.idnum AND m.media_type ILIKE '%' || @tag || '%';",
 
                 "Title" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
 FROM frl.frl_movies m
-WHERE img.movieid = m.idnum AND m.title = @tag;",
+WHERE img.movieid = m.idnum AND m.title ILIKE '%' || @tag || '%';",
 
                 "Director" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
 FROM frl.frl_movies m
-WHERE img.movieid = m.idnum AND m.director = @tag;",
+WHERE img.movieid = m.idnum AND m.director ILIKE '%' || @tag || '%';",
 
                 "Cinematographer" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
 FROM frl.frl_movies m
-WHERE img.movieid = m.idnum AND m.cinematographer = @tag;",
+WHERE img.movieid = m.idnum AND m.cinematographer ILIKE '%' || @tag || '%';",
 
                 "Production Designer" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
 FROM frl.frl_movies m
-WHERE img.movieid = m.idnum AND m.production_designer = @tag;",
+WHERE img.movieid = m.idnum AND m.production_designer ILIKE '%' || @tag || '%';",
 
                 "Costume Designer" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
 FROM frl.frl_movies m
-WHERE img.movieid = m.idnum AND m.costume_designer = @tag;",
+WHERE img.movieid = m.idnum AND m.costume_designer ILIKE '%' || @tag || '%';",
 
                 "Mv Artist" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
 FROM frl.frl_movies m
-WHERE img.movieid = m.idnum AND m.mv_artist = @tag;",
+WHERE img.movieid = m.idnum AND m.mv_artist ILIKE '%' || @tag || '%';",
 
                 "Comm Brand" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
 FROM frl.frl_movies m
-WHERE img.movieid = m.idnum AND m.comm_brand = @tag;",
+WHERE img.movieid = m.idnum AND m.comm_brand ILIKE '%' || @tag || '%';",
 
                 "Image Tag" => @"
 UPDATE frl.frl_images img
