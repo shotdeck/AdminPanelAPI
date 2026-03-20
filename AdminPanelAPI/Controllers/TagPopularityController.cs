@@ -161,6 +161,23 @@ WHERE id = @id;";
 
             try
             {
+                // Check for existing rule with same tag AND category
+                const string checkSql = @"
+SELECT COUNT(*) FROM frl.frl_popularity_tag_rules
+WHERE tag = @tag AND category IS NOT DISTINCT FROM @category;";
+
+                await using (var checkCmd = new NpgsqlCommand(checkSql, _connection))
+                {
+                    checkCmd.Parameters.AddWithValue("@tag", request.Tag.Trim());
+                    checkCmd.Parameters.AddWithValue("@category", (object?)request.Category ?? DBNull.Value);
+                    var count = (long)(await checkCmd.ExecuteScalarAsync(ct))!;
+                    if (count > 0)
+                    {
+                        var categoryDisplay = request.Category ?? "(no category)";
+                        return Conflict(new { Message = $"A tag popularity rule with tag '{request.Tag}' and category '{categoryDisplay}' already exists." });
+                    }
+                }
+
                 const string sql = @"
 INSERT INTO frl.frl_popularity_tag_rules (tag, percentage, is_active, category)
 VALUES (@tag, @percentage, @is_active, @category)
@@ -182,7 +199,7 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
             }
             catch (PostgresException ex) when (ex.SqlState == "23505")
             {
-                return Conflict(new { Message = $"A tag popularity rule with tag '{request.Tag}' already exists." });
+                return Conflict(new { Message = $"A tag popularity rule with tag '{request.Tag}' and category '{request.Category ?? "(no category)"}' already exists." });
             }
             finally
             {
@@ -216,6 +233,24 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
 
             try
             {
+                // Check for existing rule with same tag AND category (excluding current record)
+                const string checkSql = @"
+SELECT COUNT(*) FROM frl.frl_popularity_tag_rules
+WHERE tag = @tag AND category IS NOT DISTINCT FROM @category AND id != @id;";
+
+                await using (var checkCmd = new NpgsqlCommand(checkSql, _connection))
+                {
+                    checkCmd.Parameters.AddWithValue("@tag", request.Tag.Trim());
+                    checkCmd.Parameters.AddWithValue("@category", (object?)request.Category ?? DBNull.Value);
+                    checkCmd.Parameters.AddWithValue("@id", id);
+                    var count = (long)(await checkCmd.ExecuteScalarAsync(ct))!;
+                    if (count > 0)
+                    {
+                        var categoryDisplay = request.Category ?? "(no category)";
+                        return Conflict(new { Message = $"A tag popularity rule with tag '{request.Tag}' and category '{categoryDisplay}' already exists." });
+                    }
+                }
+
                 const string sql = @"
 UPDATE frl.frl_popularity_tag_rules
 SET tag = @tag,
@@ -242,7 +277,7 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
             }
             catch (PostgresException ex) when (ex.SqlState == "23505")
             {
-                return Conflict(new { Message = $"A tag popularity rule with tag '{request.Tag}' already exists." });
+                return Conflict(new { Message = $"A tag popularity rule with tag '{request.Tag}' and category '{request.Category ?? "(no category)"}' already exists." });
             }
             finally
             {
