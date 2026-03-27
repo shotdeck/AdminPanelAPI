@@ -541,7 +541,7 @@ SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage
 FROM frl.frl_movies m
 WHERE img.movieid = m.idnum AND m.comm_brand ILIKE '%' || @tag || '%';",
 
-                "Image Tag" => @"
+                "Tag" => @"
 UPDATE frl.frl_images img
 SET base_weighted_score = img.weighted_score + (img.weighted_score * @percentage / 100.0)
 FROM frl.frl_join_images_tags jit
