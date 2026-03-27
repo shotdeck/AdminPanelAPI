@@ -415,17 +415,33 @@ namespace ShotDeck.Keywords
             var q = query.Trim();
             var snap = _snapshot;
             var results = new List<TagWithOrigin>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // Split query into individual words for cross-field matching.
+            // e.g. "West cinematographer" → words: ["West", "cinematographer"]
+            // Each word must appear in either the tag or the origin for a match.
+            var words = q.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
             foreach (var kv in snap.KeywordSources)
             {
                 var keyword = kv.Key;
-                if (!keyword.Contains(q, StringComparison.OrdinalIgnoreCase)) continue;
-                if (!seen.Add(keyword)) continue;
-                // Emit one result per distinct origin for this keyword
                 var origins = ResolveOrigins(kv.Value);
                 foreach (var origin in origins)
                 {
-                    results.Add(new TagWithOrigin { Tag = keyword, Origin = origin });
+                    // Check that every query word appears in either the tag or the origin
+                    bool allMatch = true;
+                    foreach (var word in words)
+                    {
+                        if (!keyword.Contains(word, StringComparison.OrdinalIgnoreCase) &&
+                            !origin.Contains(word, StringComparison.OrdinalIgnoreCase))
+                        {
+                            allMatch = false;
+                            break;
+                        }
+                    }
+                    if (allMatch)
+                    {
+                        results.Add(new TagWithOrigin { Tag = keyword, Origin = origin });
+                    }
                 }
             }
             results.Sort((a, b) =>
@@ -450,6 +466,9 @@ namespace ShotDeck.Keywords
             var label = source;
             if (label.Contains(':'))
                 label = label.Substring(label.IndexOf(':') + 1);
+            // "image_tag" should display as just "Tag"
+            if (string.Equals(label, "image_tag", StringComparison.OrdinalIgnoreCase))
+                return "Tag";
             // Convert snake_case to Title Case
             return string.Join(' ', label.Split('_')
                 .Select(w => w.Length > 0 ? char.ToUpperInvariant(w[0]) + w.Substring(1).ToLowerInvariant() : w));
