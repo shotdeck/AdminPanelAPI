@@ -43,11 +43,13 @@ public class SshTunnelService : IHostedService, IDisposable
     private async Task RunLoopAsync(CancellationToken ct)
     {
         // Your constants (keep these exactly as you had them)
-        string sshHost = "35.89.51.60";
+        //string sshHost = "35.89.51.60";
+        string sshHost = "backend.shotdeck.com";
         int sshPort = 22;
         string sshUser = "ec2-user";
         string sshKeyPath = @"D:\shotdeck\pem\db\shotdeck.pem";
-        string remoteDbHost = "shotdeck-postgres-db.cnvhvhrwu7ln.us-west-2.rds.amazonaws.com";
+        //string remoteDbHost = "shotdeck-postgres-db.cnvhvhrwu7ln.us-west-2.rds.amazonaws.com";
+        string remoteDbHost = "shotdeck-backend-db.cnvhvhrwu7ln.us-west-2.rds.amazonaws.com";
         uint remoteDbPort = 5432;
         string localBindHost = "127.0.0.1";
         uint localBindPort = 5433;
