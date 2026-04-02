@@ -326,6 +326,38 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
         /// then adjusts frl_images.base_weighted_score by the rule's percentage for each image
         /// matched via the rule's category (e.g. join tables, frl_images columns, or frl_movies columns).
         /// </summary>
+        /// <summary>
+        /// GET /api/admin/tag-popularity/has-unsynced
+        /// Returns whether there are any active rules that have not been synced yet.
+        /// </summary>
+        [HttpGet("has-unsynced")]
+        [ProducesResponseType(typeof(HasUnsyncedResult), StatusCodes.Status200OK)]
+        public async Task<ActionResult<HasUnsyncedResult>> HasUnsyncedRules(CancellationToken ct)
+        {
+            var mustClose = false;
+            if (_connection.State != ConnectionState.Open)
+            {
+                await _connection.OpenAsync(ct);
+                mustClose = true;
+            }
+
+            try
+            {
+                const string sql = @"
+SELECT COUNT(*) FROM frl.frl_popularity_tag_rules
+WHERE is_active = true
+  AND (last_synced_at IS NULL OR updated_at > last_synced_at);";
+
+                await using var cmd = new NpgsqlCommand(sql, _connection);
+                var count = (long)(await cmd.ExecuteScalarAsync(ct))!;
+                return Ok(new HasUnsyncedResult { HasUnsynced = count > 0, UnsyncedCount = (int)count });
+            }
+            finally
+            {
+                if (mustClose) await _connection.CloseAsync();
+            }
+        }
+
         [HttpPost("apply")]
         [ProducesResponseType(typeof(ApplyRulesResult), StatusCodes.Status200OK)]
         public async Task<ActionResult<ApplyRulesResult>> ApplyRecentRules(CancellationToken ct)
@@ -339,12 +371,12 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
 
             try
             {
-                // Step 1: Read active rules updated within the past 6 hours
+                // Step 1: Read active rules that haven't been synced yet
                 const string fetchRulesSql = @"
 SELECT id, tag, percentage, category
 FROM frl.frl_popularity_tag_rules
 WHERE is_active = true
-  AND updated_at >= now() - interval '6 hours';";
+  AND (last_synced_at IS NULL OR updated_at > last_synced_at);";
 
                 var rules = new List<(long Id, string Tag, int Percentage, string? Category)>();
 
@@ -368,6 +400,7 @@ WHERE is_active = true
                 // Step 2: For each rule, build the correct UPDATE based on category
                 var totalUpdated = 0;
                 var ruleResults = new List<ApplyRuleDetail>();
+                var syncedRuleIds = new List<long>();
 
                 foreach (var rule in rules)
                 {
@@ -394,6 +427,7 @@ WHERE is_active = true
 
                     var rowsAffected = await updateCmd.ExecuteNonQueryAsync(ct);
                     totalUpdated += rowsAffected;
+                    syncedRuleIds.Add(rule.Id);
 
                     ruleResults.Add(new ApplyRuleDetail
                     {
@@ -403,6 +437,15 @@ WHERE is_active = true
                         Category = rule.Category,
                         ImagesUpdated = rowsAffected
                     });
+                }
+
+                // Step 3: Mark successfully applied rules as synced
+                if (syncedRuleIds.Count > 0)
+                {
+                    var idList = string.Join(", ", syncedRuleIds);
+                    var markSyncedSql = $"UPDATE frl.frl_popularity_tag_rules SET last_synced_at = now() WHERE id IN ({idList});";
+                    await using var syncCmd = new NpgsqlCommand(markSyncedSql, _connection);
+                    await syncCmd.ExecuteNonQueryAsync(ct);
                 }
 
                 return Ok(new ApplyRulesResult
@@ -596,6 +639,12 @@ WHERE jit.imageid = img.idnum AND jit.tag = @tag;",
             public int Percentage { get; set; }
             public bool? IsActive { get; set; }
             public string? Category { get; set; }
+        }
+
+        public sealed class HasUnsyncedResult
+        {
+            public bool HasUnsynced { get; set; }
+            public int UnsyncedCount { get; set; }
         }
 
         public sealed class ApplyRulesResult
