@@ -475,118 +475,138 @@ WHERE is_active = true
             {
                 "Time Of Day" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_join_images_time_of_day j
 WHERE j.imageid = img.idnum AND j.time_of_day = @tag;",
 
                 "Lighting Type" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_join_images_lighting_type j
 WHERE j.imageid = img.idnum AND j.lighting_type = @tag;",
 
                 "Vfx Backing" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_join_images_vfx_backing j
 WHERE j.imageid = img.idnum AND j.vfx_backing = @tag;",
 
                 "Color" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_join_images_color j
 WHERE j.imageid = img.idnum AND j.color = @tag;",
 
                 "Shot Type" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_join_images_shot_type j
 WHERE j.imageid = img.idnum AND j.shot_type = @tag;",
 
                 "Lighting" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_join_images_lighting j
 WHERE j.imageid = img.idnum AND j.lighting = @tag;",
 
                 "Lens Size" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_join_images_lens_type j
 WHERE j.imageid = img.idnum AND j.lens_type = @tag;",
 
                 "Composition" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_join_images_composition j
 WHERE j.imageid = img.idnum AND j.composition = @tag;",
 
                 "Actors" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 WHERE img.actors ILIKE '%' || @tag || '%';",
 
                 "Int Ext" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 WHERE img.int_ext ILIKE '%' || @tag || '%';",
 
                 "Aspect Ratio" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 WHERE img.aspect_ratio ILIKE '%' || @tag || '%';",
 
                 "Media Type" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_movies m
 WHERE img.movieid = m.idnum AND m.media_type ILIKE '%' || @tag || '%';",
 
                 "Title" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_movies m
 WHERE img.movieid = m.idnum AND m.title ILIKE '%' || @tag || '%';",
 
                 "Director" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_movies m
 WHERE img.movieid = m.idnum AND m.director ILIKE '%' || @tag || '%';",
 
                 "Cinematographer" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_movies m
 WHERE img.movieid = m.idnum AND m.cinematographer ILIKE '%' || @tag || '%';",
 
                 "Production Designer" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_movies m
 WHERE img.movieid = m.idnum AND m.production_designer ILIKE '%' || @tag || '%';",
 
                 "Costume Designer" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_movies m
 WHERE img.movieid = m.idnum AND m.costume_designer ILIKE '%' || @tag || '%';",
 
                 "Mv Artist" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_movies m
 WHERE img.movieid = m.idnum AND m.mv_artist ILIKE '%' || @tag || '%';",
 
                 "Comm Brand" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_movies m
 WHERE img.movieid = m.idnum AND m.comm_brand ILIKE '%' || @tag || '%';",
 
                 "Tag" => @"
 UPDATE frl.frl_images img
-SET weighted_score = img.base_weighted_score + (img.base_weighted_score * @percentage / 100.0)
+SET base_weighted_score = COALESCE(img.base_weighted_score, img.weighted_score),
+    weighted_score = COALESCE(img.base_weighted_score, img.weighted_score) + (COALESCE(img.base_weighted_score, img.weighted_score) * @percentage / 100.0)
 FROM frl.frl_join_images_tags jit
 WHERE jit.imageid = img.idnum AND jit.tag = @tag;",
 
