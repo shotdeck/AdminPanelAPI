@@ -210,6 +210,8 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
         /// <summary>
         /// PUT /api/admin/tag-popularity/{id}
         /// Updates an existing tag popularity rule.
+        /// If the rule is being set to inactive (was active), resets weighted_score to base_weighted_score
+        /// for all affected images.
         /// </summary>
         [HttpPut("{id:long}")]
         [ProducesResponseType(typeof(TagPopularityRuleDto), StatusCodes.Status200OK)]
@@ -251,6 +253,14 @@ WHERE tag = @tag AND category IS NOT DISTINCT FROM @category AND id != @id;";
                     }
                 }
 
+                // If the rule is being set to inactive, check if it was previously active and synced.
+                // If so, reset weighted_score to base_weighted_score for affected images.
+                var newIsActive = request.IsActive ?? true;
+                if (!newIsActive)
+                {
+                    await ResetScoresIfSynced(id, ct);
+                }
+
                 const string sql = @"
 UPDATE frl.frl_popularity_tag_rules
 SET tag = @tag,
@@ -265,7 +275,7 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
                 cmd.Parameters.AddWithValue("@id", id);
                 cmd.Parameters.AddWithValue("@tag", request.Tag.Trim());
                 cmd.Parameters.AddWithValue("@percentage", request.Percentage);
-                cmd.Parameters.AddWithValue("@is_active", request.IsActive ?? true);
+                cmd.Parameters.AddWithValue("@is_active", newIsActive);
                 cmd.Parameters.AddWithValue("@category", (object?)request.Category ?? DBNull.Value);
 
                 await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -287,7 +297,7 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
 
         /// <summary>
         /// DELETE /api/admin/tag-popularity/{id}
-        /// Deletes a tag popularity rule by ID.
+        /// Resets weighted_score to base_weighted_score for affected images, then deletes the rule.
         /// </summary>
         [HttpDelete("{id:long}")]
         [ProducesResponseType(StatusCodes.Status204NoContent)]
@@ -303,6 +313,9 @@ RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
 
             try
             {
+                // Reset weighted_score to base_weighted_score for images affected by this rule
+                await ResetScoresIfSynced(id, ct);
+
                 const string sql = @"DELETE FROM frl.frl_popularity_tag_rules WHERE id = @id;";
                 await using var cmd = new NpgsqlCommand(sql, _connection);
                 cmd.Parameters.AddWithValue("@id", id);
@@ -594,7 +607,179 @@ WHERE jit.imageid = img.idnum AND jit.tag = @tag;",
             };
         }
 
+        /// <summary>
+        /// Returns the UPDATE SQL for a given category that resets weighted_score back to base_weighted_score.
+        /// Same joins as BuildUpdateSqlForCategory but sets weighted_score = base_weighted_score.
+        /// </summary>
+        private static string? BuildResetSqlForCategory(string? category)
+        {
+            return category switch
+            {
+                "Time Of Day" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_join_images_time_of_day j
+WHERE j.imageid = img.idnum AND j.time_of_day = @tag;",
+
+                "Lighting Type" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_join_images_lighting_type j
+WHERE j.imageid = img.idnum AND j.lighting_type = @tag;",
+
+                "Vfx Backing" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_join_images_vfx_backing j
+WHERE j.imageid = img.idnum AND j.vfx_backing = @tag;",
+
+                "Color" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_join_images_color j
+WHERE j.imageid = img.idnum AND j.color = @tag;",
+
+                "Shot Type" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_join_images_shot_type j
+WHERE j.imageid = img.idnum AND j.shot_type = @tag;",
+
+                "Lighting" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_join_images_lighting j
+WHERE j.imageid = img.idnum AND j.lighting = @tag;",
+
+                "Lens Size" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_join_images_lens_type j
+WHERE j.imageid = img.idnum AND j.lens_type = @tag;",
+
+                "Composition" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_join_images_composition j
+WHERE j.imageid = img.idnum AND j.composition = @tag;",
+
+                "Actors" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+WHERE img.actors ILIKE '%' || @tag || '%';",
+
+                "Int Ext" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+WHERE img.int_ext ILIKE '%' || @tag || '%';",
+
+                "Aspect Ratio" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+WHERE img.aspect_ratio ILIKE '%' || @tag || '%';",
+
+                "Media Type" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.media_type ILIKE '%' || @tag || '%';",
+
+                "Title" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.title ILIKE '%' || @tag || '%';",
+
+                "Director" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.director ILIKE '%' || @tag || '%';",
+
+                "Cinematographer" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.cinematographer ILIKE '%' || @tag || '%';",
+
+                "Production Designer" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.production_designer ILIKE '%' || @tag || '%';",
+
+                "Costume Designer" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.costume_designer ILIKE '%' || @tag || '%';",
+
+                "Mv Artist" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.mv_artist ILIKE '%' || @tag || '%';",
+
+                "Comm Brand" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_movies m
+WHERE img.movieid = m.idnum AND m.comm_brand ILIKE '%' || @tag || '%';",
+
+                "Tag" => @"
+UPDATE frl.frl_images img
+SET weighted_score = img.base_weighted_score
+FROM frl.frl_join_images_tags jit
+WHERE jit.imageid = img.idnum AND jit.tag = @tag;",
+
+                _ => null
+            };
+        }
+
         #region Helpers
+
+        /// <summary>
+        /// Looks up the rule by ID. If it was previously synced (last_synced_at IS NOT NULL),
+        /// resets weighted_score = base_weighted_score for all images matched by the rule's category/tag.
+        /// </summary>
+        private async Task ResetScoresIfSynced(long ruleId, CancellationToken ct)
+        {
+            const string fetchSql = @"
+SELECT tag, category, last_synced_at
+FROM frl.frl_popularity_tag_rules
+WHERE id = @id;";
+
+            string? tag = null;
+            string? category = null;
+            bool wasSynced = false;
+
+            await using (var fetchCmd = new NpgsqlCommand(fetchSql, _connection))
+            {
+                fetchCmd.Parameters.AddWithValue("@id", ruleId);
+                await using var reader = await fetchCmd.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                {
+                    tag = reader.GetString(0);
+                    category = reader.IsDBNull(1) ? null : reader.GetString(1);
+                    wasSynced = !reader.IsDBNull(2);
+                }
+            }
+
+            if (!wasSynced || tag == null) return;
+
+            var resetSql = BuildResetSqlForCategory(category);
+            if (resetSql == null)
+            {
+                _logger.LogWarning("Cannot reset scores for rule {RuleId}: unknown category '{Category}'.", ruleId, category);
+                return;
+            }
+
+            await using var resetCmd = new NpgsqlCommand(resetSql, _connection);
+            resetCmd.Parameters.AddWithValue("@tag", tag);
+            var rowsReset = await resetCmd.ExecuteNonQueryAsync(ct);
+            _logger.LogInformation("Reset weighted_score to base_weighted_score for {Count} images (rule {RuleId}, tag '{Tag}', category '{Category}').",
+                rowsReset, ruleId, tag, category);
+        }
 
         private static TagPopularityRuleDto MapToDto(NpgsqlDataReader reader)
         {
