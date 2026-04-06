@@ -48,14 +48,14 @@ namespace ShotDeckSearch.Controllers
                 if (string.IsNullOrWhiteSpace(tag))
                 {
                     sql = @"
-SELECT id, tag, percentage, is_active, created_at, updated_at, category, base_weighted_score, weighted_score
+SELECT id, tag, percentage, is_active, created_at, updated_at, category
 FROM frl.frl_popularity_tag_rules
 ORDER BY tag;";
                 }
                 else
                 {
                     sql = @"
-SELECT id, tag, percentage, is_active, created_at, updated_at, category, base_weighted_score, weighted_score
+SELECT id, tag, percentage, is_active, created_at, updated_at, category
 FROM frl.frl_popularity_tag_rules
 WHERE tag ILIKE @tag
 ORDER BY tag;";
@@ -100,7 +100,7 @@ ORDER BY tag;";
             try
             {
                 const string sql = @"
-SELECT id, tag, percentage, is_active, created_at, updated_at, category, base_weighted_score, weighted_score
+SELECT id, tag, percentage, is_active, created_at, updated_at, category
 FROM frl.frl_popularity_tag_rules
 WHERE id = @id;";
 
@@ -181,7 +181,7 @@ WHERE tag = @tag AND category IS NOT DISTINCT FROM @category;";
                 const string sql = @"
 INSERT INTO frl.frl_popularity_tag_rules (tag, percentage, is_active, category)
 VALUES (@tag, @percentage, @is_active, @category)
-RETURNING id, tag, percentage, is_active, created_at, updated_at, category, base_weighted_score, weighted_score;";
+RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
 
                 await using var cmd = new NpgsqlCommand(sql, _connection);
                 cmd.Parameters.AddWithValue("@tag", request.Tag.Trim());
@@ -259,7 +259,7 @@ SET tag = @tag,
     category = @category,
     updated_at = now()
 WHERE id = @id
-RETURNING id, tag, percentage, is_active, created_at, updated_at, category, base_weighted_score, weighted_score;";
+RETURNING id, tag, percentage, is_active, created_at, updated_at, category;";
 
                 await using var cmd = new NpgsqlCommand(sql, _connection);
                 cmd.Parameters.AddWithValue("@id", id);
@@ -606,9 +606,7 @@ WHERE jit.imageid = img.idnum AND jit.tag = @tag;",
                 IsActive = reader.GetBoolean(3),
                 CreatedAt = reader.GetDateTime(4),
                 UpdatedAt = reader.GetDateTime(5),
-                Category = reader.IsDBNull(6) ? null : reader.GetString(6),
-                BaseWeightedScore = reader.IsDBNull(7) ? null : reader.GetDouble(7),
-                WeightedScore = reader.IsDBNull(8) ? null : reader.GetDouble(8)
+                Category = reader.IsDBNull(6) ? null : reader.GetString(6)
             };
         }
 
@@ -625,8 +623,6 @@ WHERE jit.imageid = img.idnum AND jit.tag = @tag;",
             public DateTime CreatedAt { get; set; }
             public DateTime UpdatedAt { get; set; }
             public string? Category { get; set; }
-            public double? BaseWeightedScore { get; set; }
-            public double? WeightedScore { get; set; }
         }
 
         public sealed class CreateTagPopularityRuleRequest
