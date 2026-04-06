@@ -41,6 +41,9 @@ builder.Services.AddSingleton<IKeywordCacheService, KeywordCacheService>();
 
 builder.Services.AddHttpClient();
 
+// Database migrations at startup
+builder.Services.AddHostedService<ShotDeckSearch.Services.DatabaseMigrationService>();
+
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
 
