@@ -99,21 +99,21 @@ WHERE i.status = 'live'
   AND i.movieid IS NOT NULL
   AND i.movieid > 0
 
-  -- only movies that have at least one live autodetected image
-  -- whose randid is not yet in scene boundaries
   AND NOT EXISTS (
       SELECT 1
       FROM frl.frl_image_scene_boundaries s
-      WHERE s.filename = i.randid
+      WHERE s.movieid = i.movieid
+        AND s.filename = i.randid
   )
 
-  -- do not retry movies where the source movie file is known missing
   AND NOT EXISTS (
       SELECT 1
       FROM frl.frl_movie_processing_jobs j
       WHERE j.movieid = i.movieid
-        AND j.status = 'Failed'
-        AND j.error LIKE '%Movie file not found%'
+        AND (
+            j.error LIKE '%Movie file not found%'
+            OR j.current_step ILIKE '%failed clips%'
+        )
   )
 
 ORDER BY i.movieid
