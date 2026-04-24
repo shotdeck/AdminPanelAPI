@@ -1,3 +1,4 @@
+using AdminPanelAPI.Services;
 using Npgsql;
 using ShotDeck.Keywords;
 
@@ -8,6 +9,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+
 
 builder.Services.AddApplicationInsightsTelemetry(options =>
 {
@@ -40,6 +42,13 @@ builder.Services.AddScoped<NpgsqlConnection>(sp => sp.GetRequiredService<Lazy<Np
 builder.Services.AddSingleton<IKeywordCacheService, KeywordCacheService>();
 
 builder.Services.AddHttpClient();
+builder.Services.AddSingleton<IMovieJobQueue, MovieJobQueue>();
+
+builder.Services.AddScoped<IMovieProcessingJobRepository, MovieProcessingJobRepository>();
+builder.Services.AddScoped<IMovieProcessingService, MovieProcessingService>();
+
+builder.Services.AddHostedService<MovieProcessingWorker>();
+
 
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
