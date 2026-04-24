@@ -6,6 +6,7 @@ public class SshTunnelService : IHostedService, IDisposable
     private SshClient? _sshClient;
     private ForwardedPortLocal? _portForward;
     private readonly string _sshPrivateKey;
+    private readonly IConfiguration _configuration;
 
     // background supervision
     private readonly CancellationTokenSource _cts = new();
@@ -17,6 +18,7 @@ public class SshTunnelService : IHostedService, IDisposable
     public SshTunnelService(IConfiguration configuration)
     {
         _sshPrivateKey = configuration["SSH_PRIVATE_KEY"]; // base64 PEM in App Settings
+        _configuration = configuration;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -42,19 +44,21 @@ public class SshTunnelService : IHostedService, IDisposable
 
     private async Task RunLoopAsync(CancellationToken ct)
     {
-        // Your constants (keep these exactly as you had them)
-        string sshHost = "35.89.51.60";
-        //string sshHost = "backend.shotdeck.com";
-        int sshPort = 22;
-        string sshUser = "ec2-user";
-        string sshKeyPath = @"D:\shotdeck\pem\db\shotdeck.pem";
-        string remoteDbHost = "shotdeck-postgres-db.cnvhvhrwu7ln.us-west-2.rds.amazonaws.com";
-        //string remoteDbHost = "shotdeck-backend-db.cnvhvhrwu7ln.us-west-2.rds.amazonaws.com";
-        uint remoteDbPort = 5432;
-        string localBindHost = "127.0.0.1";
-        uint localBindPort = 5433;
+        
 
-        var backoffMs = 2000;
+        var sshHost = _configuration["SshTunnel:SshHost"];
+        var sshPort = _configuration.GetValue<int>("SshTunnel:SshPort");
+        var sshUser = _configuration["SshTunnel:SshUser"];
+        var sshKeyPath = _configuration["SshTunnel:SshKeyPath"];
+
+        var remoteDbHost = _configuration["SshTunnel:RemoteDbHost"];
+        var remoteDbPort = _configuration.GetValue<uint>("SshTunnel:RemoteDbPort");
+
+        var localBindHost = _configuration["SshTunnel:LocalBindHost"];
+        var localBindPort = _configuration.GetValue<uint>("SshTunnel:LocalBindPort");
+
+        var backoffMs = _configuration.GetValue<int>("SshTunnel:ReconnectDelayMs", 2000);
+
 
         while (!ct.IsCancellationRequested)
         {
