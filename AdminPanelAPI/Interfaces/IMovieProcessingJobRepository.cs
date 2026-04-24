@@ -97,6 +97,7 @@ JOIN frl.frl_imagehistory h
  AND h.action = 'Shot Time Autodetected'
 WHERE i.status = 'live'
   AND i.movieid IS NOT NULL
+AND i.randid IS NOT NULL
   AND i.movieid > 0
 
   AND NOT EXISTS (
@@ -110,11 +111,9 @@ WHERE i.status = 'live'
       SELECT 1
       FROM frl.frl_movie_processing_jobs j
       WHERE j.movieid = i.movieid
-        AND (
-            j.error LIKE '%Movie file not found%'
-            OR j.current_step ILIKE '%failed clips%'
-        )
   )
+
+
 
 ORDER BY i.movieid
 LIMIT @limit;";
