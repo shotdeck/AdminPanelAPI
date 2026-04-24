@@ -52,8 +52,7 @@ namespace AdminPanelAPI.Controllers
             if (count <= 0)
                 return BadRequest(new { error = "count must be greater than 0" });
 
-            if (count > 50)
-                count = 50;
+            
 
             var movieIds = await _jobRepository.GetUnprocessedMovieIdsAsync(
                 count,
