@@ -141,7 +141,14 @@ namespace AdminPanelAPI.Services
 
                     try
                     {
-                        var boundary = await DetectWithRetry(movieId, clipFilename, threshold, ct);
+                        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        timeoutCts.CancelAfter(TimeSpan.FromMinutes(5));
+
+                        var boundary = await DetectWithRetry(
+                            movieId,
+                            clipFilename,
+                            threshold,
+                            timeoutCts.Token);
 
                         await InsertSceneBoundaryAsync(boundary, ct);
                     }
@@ -151,10 +158,19 @@ namespace AdminPanelAPI.Services
 
                         _logger.LogError(
                             ex,
-                            "Scene boundary failed. JobId={JobId}, MovieId={MovieId}, Clip={ClipFilename}",
+                            "Skipping failed scene boundary. JobId={JobId}, MovieId={MovieId}, Clip={ClipFilename}",
                             jobId,
                             movieId,
                             clipFilename);
+
+                        await _repo.UpdateProgressAsync(
+                            jobId,
+                            $"Skipped failed clip: {clipFilename}",
+                            processedCount,
+                            total,
+                            CancellationToken.None);
+
+                        return;
                     }
                 });
 
@@ -304,29 +320,39 @@ ON CONFLICT (movieid) DO NOTHING;";
         }
 
         private async Task<SceneBoundaryResponse> DetectWithRetry(
-    int movieId,
-    string filename,
-    double threshold,
-    CancellationToken ct)
+     int movieId,
+     string filename,
+     double threshold,
+     CancellationToken ct)
         {
-            var attempts = 0;
+            const int maxAttempts = 3;
 
-            while (true)
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
                 try
                 {
-                    return await DetectSceneBoundaryAsync(movieId, filename, threshold, ct);
+                    return await DetectSceneBoundaryAsync(
+                        movieId,
+                        filename,
+                        threshold,
+                        ct);
                 }
-                catch
+                catch (Exception ex) when (attempt < maxAttempts)
                 {
-                    attempts++;
+                    _logger.LogWarning(
+                        ex,
+                        "Scene detection retry {Attempt}/{MaxAttempts}. MovieId={MovieId}, Filename={Filename}",
+                        attempt,
+                        maxAttempts,
+                        movieId,
+                        filename);
 
-                    if (attempts >= 5)
-                        throw;
-
-                    await Task.Delay(1000 * attempts, ct); // backoff
+                    await Task.Delay(TimeSpan.FromSeconds(2 * attempt), ct);
                 }
             }
+
+            throw new Exception(
+                $"Scene detection failed after {maxAttempts} attempts. MovieId={movieId}, Filename={filename}");
         }
 
         private async Task<SceneBoundaryResponse> DetectSceneBoundaryAsync(
