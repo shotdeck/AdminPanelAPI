@@ -50,6 +50,9 @@ builder.Services.AddScoped<IMovieProcessingService, MovieProcessingService>();
 builder.Services.AddHostedService<MovieProcessingWorker>();
 
 
+// Database migrations at startup
+builder.Services.AddHostedService<ShotDeckSearch.Services.DatabaseMigrationService>();
+
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
 
