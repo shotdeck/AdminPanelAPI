@@ -35,9 +35,9 @@ namespace ShotDeckSearch.Controllers
 
         private (string token, string zoneId) GetCredentials()
         {
-            var token = _config["CF_API_TOKEN"]
+            var token = _config["CLOUDFLARE:CF_API_TOKEN"]
                 ?? throw new InvalidOperationException("CF_API_TOKEN is not configured.");
-            var zoneId = _config["CF_ZONE_ID"]
+            var zoneId = _config["CLOUDFLARE:CF_ZONE_ID"]
                 ?? "eb813d7b3774a5a5a2cf86848681f2bf";
             return (token, zoneId);
         }
@@ -94,12 +94,16 @@ namespace ShotDeckSearch.Controllers
                 .GetProperty("httpRequests1dGroups");
         }
 
+
+
         // ── GET /api/admin/cloudflare/health ────────────────────────────
+
+
         [HttpGet("health")]
         [ProducesResponseType(Microsoft.AspNetCore.Http.StatusCodes.Status200OK)]
         public ActionResult Health()
         {
-            var hasToken = !string.IsNullOrEmpty(_config["CF_API_TOKEN"]);
+            var hasToken = !string.IsNullOrEmpty(_config["CLOUDFLARE:CF_API_TOKEN"]);
             return Ok(new { status = "ok", hasToken });
         }
 
