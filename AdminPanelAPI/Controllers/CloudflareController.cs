@@ -74,7 +74,9 @@ namespace ShotDeckSearch.Controllers
             var doc = JsonDocument.Parse(body);
             var root = doc.RootElement;
 
-            if (root.TryGetProperty("errors", out var errors) && errors.GetArrayLength() > 0)
+            if (root.TryGetProperty("errors", out var errors)
+                && errors.ValueKind == JsonValueKind.Array
+                && errors.GetArrayLength() > 0)
             {
                 var msg = errors[0].GetProperty("message").GetString();
                 _logger.LogError("Cloudflare GraphQL error: {Message}", msg);
