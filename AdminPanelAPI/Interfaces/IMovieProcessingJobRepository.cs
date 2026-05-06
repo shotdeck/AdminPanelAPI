@@ -86,120 +86,62 @@ WHERE id = @id;";
     }
 
     public async Task<List<int>> GetUnprocessedMovieIdsAsync(
-      int limit,
-      CancellationToken cancellationToken)
+    int limit,
+    CancellationToken cancellationToken)
     {
-        var results = new List<int>();
-        var offset = 0;
-        var batchSize = 5000;
-        var maxScanned = 150000;
+        if (limit <= 0)
+            return new List<int>();
 
         const string sql = @"
-WITH candidate_movies AS (
-    SELECT m.idnum
-    FROM frl.frl_movies m
-    WHERE m.idnum > 0
-      AND NOT EXISTS (
-          SELECT 1
-          FROM frl.frl_movie_processing_jobs j
-          WHERE j.movieid = m.idnum
-      )
-    ORDER BY m.idnum
-    LIMIT @batchSize OFFSET @offset
-),
-matching_movies AS (
-    SELECT DISTINCT i.movieid
-    FROM frl.frl_images i
-    JOIN candidate_movies cm
-      ON cm.idnum = i.movieid
-    JOIN frl.frl_imagehistory h
-      ON h.imageid = i.idnum
-     AND h.action = 'Shot Time Autodetected'
-    LEFT JOIN frl.frl_image_scene_boundaries s
-      ON s.movieid = i.movieid
-     AND s.filename = i.randid
-    WHERE i.status = 'live'
-      AND i.randid IS NOT NULL
-      AND s.filename IS NULL
-)
-SELECT movieid
-FROM matching_movies
-ORDER BY movieid;";
+SELECT DISTINCT i.movieid
+FROM frl.frl_images i
+JOIN frl.frl_imagehistory h
+  ON h.imageid = i.idnum
+ AND h.action = 'Shot Time Autodetected'
+WHERE i.status = 'live'
+  AND i.movieid IS NOT NULL
+  AND i.movieid > 0
+  AND i.randid IS NOT NULL
 
-        const string countSql = @"
-SELECT COUNT(*)
-FROM (
-    SELECT m.idnum
-    FROM frl.frl_movies m
-    WHERE m.idnum > 0
-      AND NOT EXISTS (
-          SELECT 1
-          FROM frl.frl_movie_processing_jobs j
-          WHERE j.movieid = m.idnum
-      )
-    ORDER BY m.idnum
-    LIMIT @batchSize OFFSET @offset
-) x;";
+  -- image does not already have a scene boundary
+  AND NOT EXISTS (
+      SELECT 1
+      FROM frl.frl_image_scene_boundaries s
+      WHERE s.movieid = i.movieid
+        AND s.filename = i.randid
+  )
 
-        while (results.Count < limit && offset < maxScanned)
+  -- movie has never been queued / processed before
+  AND NOT EXISTS (
+      SELECT 1
+      FROM frl.frl_movie_processing_jobs j
+      WHERE j.movieid = i.movieid
+  )
+
+ORDER BY i.movieid
+LIMIT @limit;";
+
+        var movieIds = new List<int>();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 180;
+        cmd.Parameters.AddWithValue("limit", limit);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
         {
-            var foundThisBatch = 0;
-
-            await using (var conn = new NpgsqlConnection(_connectionString))
+            if (reader.GetInt32(0) == 3277)
             {
-                await conn.OpenAsync(cancellationToken);
-
-                await using var cmd = new NpgsqlCommand(sql, conn);
-                cmd.CommandTimeout = 180;
-                cmd.Parameters.AddWithValue("batchSize", batchSize);
-                cmd.Parameters.AddWithValue("offset", offset);
-
-                await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
-
-                while (await reader.ReadAsync(cancellationToken))
-                {
-                    var movieId = reader.GetInt32(0);
-
-                    if (!results.Contains(movieId))
-                    {
-                        results.Add(movieId);
-                        foundThisBatch++;
-                    }
-
-                    if (results.Count >= limit)
-                        break;
-                }
+                continue;
             }
-
-            if (foundThisBatch == 0)
-            {
-                int candidateCount;
-
-                await using (var countConn = new NpgsqlConnection(_connectionString))
-                {
-                    await countConn.OpenAsync(cancellationToken);
-
-                    await using var countCmd = new NpgsqlCommand(countSql, countConn);
-                    countCmd.CommandTimeout = 180;
-                    countCmd.Parameters.AddWithValue("batchSize", batchSize);
-                    countCmd.Parameters.AddWithValue("offset", offset);
-
-                    candidateCount = Convert.ToInt32(
-                        await countCmd.ExecuteScalarAsync(cancellationToken));
-                }
-
-                if (candidateCount == 0)
-                    break;
-            }
-
-            offset += batchSize;
+            movieIds.Add(reader.GetInt32(0));
         }
 
-        return results
-            .Distinct()
-            .OrderBy(x => x)
-            .Take(limit)
-            .ToList();
+        return movieIds;
     }
     public async Task<MovieProcessingJobStatusResponse?> GetJobAsync(long jobId, CancellationToken cancellationToken)
     {
