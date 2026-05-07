@@ -3,6 +3,8 @@ using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Npgsql;
+using System.Data;
 
 namespace ShotDeckSearch.Controllers
 {
@@ -14,13 +16,16 @@ namespace ShotDeckSearch.Controllers
         private const int MaxPageSize = 100;
         private const int PresignedUrlExpiryMinutes = 60;
 
+        private readonly NpgsqlConnection _connection;
         private readonly IConfiguration _configuration;
         private readonly ILogger<ClipsController> _logger;
 
         public ClipsController(
+            NpgsqlConnection connection,
             IConfiguration configuration,
             ILogger<ClipsController> logger)
         {
+            _connection = connection;
             _configuration = configuration;
             _logger = logger;
         }
@@ -41,97 +46,177 @@ namespace ShotDeckSearch.Controllers
             if (pageSize < 1) pageSize = DefaultPageSize;
             if (pageSize > MaxPageSize) pageSize = MaxPageSize;
 
-            var accountId = _configuration["R2:AccountId"] ?? "";
-            var accessKey = _configuration["R2:AccessKey"] ?? "";
-            var secretKey = _configuration["R2:SecretKey"] ?? "";
-            var bucketName = _configuration["R2:BucketName"] ?? "";
-
-            if (string.IsNullOrWhiteSpace(accountId) ||
-                string.IsNullOrWhiteSpace(accessKey) ||
-                string.IsNullOrWhiteSpace(secretKey) ||
-                string.IsNullOrWhiteSpace(bucketName))
+            var mustClose = false;
+            if (_connection.State != ConnectionState.Open)
             {
-                _logger.LogError("R2 settings are missing.");
-                return StatusCode(500, "R2 storage is not configured.");
+                await _connection.OpenAsync(ct);
+                mustClose = true;
             }
 
-            var creds = new BasicAWSCredentials(accessKey.Trim(), secretKey.Trim());
-            var config = new AmazonS3Config
+            try
             {
-                ServiceURL = $"https://{accountId.Trim()}.r2.cloudflarestorage.com",
-                ForcePathStyle = true,
-                UseAccelerateEndpoint = false,
-                UseDualstackEndpoint = false,
-                EndpointDiscoveryEnabled = false
-            };
+                // Count total clips for this movie
+                var countSql = @"
+SELECT COUNT(*)
+FROM frl.frl_images i
+INNER JOIN frl.frl_image_scene_boundaries sb
+    ON sb.movieid = i.movieid AND sb.filename = i.randid
+WHERE i.movieid = @movieId
+  AND i.status = 'live';";
 
-            using var client = new AmazonS3Client(creds, config);
+                await using var countCmd = new NpgsqlCommand(countSql, _connection);
+                countCmd.Parameters.AddWithValue("@movieId", movieId);
+                var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
 
-            var prefix = $"clips_9s/{movieId}/";
-            var allKeys = new List<string>();
-            string? continuationToken = null;
+                var totalPages = (int)Math.Ceiling(totalCount / (double)pageSize);
+                var offset = (page - 1) * pageSize;
 
-            do
-            {
-                var request = new ListObjectsV2Request
+                // Fetch paginated clip data
+                var dataSql = @"
+SELECT i.randid AS filename,
+       sb.start_time,
+       sb.end_time,
+       sb.duration,
+       sb.fps,
+       sb.frame_count,
+       sb.target_frame
+FROM frl.frl_images i
+INNER JOIN frl.frl_image_scene_boundaries sb
+    ON sb.movieid = i.movieid AND sb.filename = i.randid
+WHERE i.movieid = @movieId
+  AND i.status = 'live'
+ORDER BY i.randid ASC
+LIMIT @limit OFFSET @offset;";
+
+                await using var cmd = new NpgsqlCommand(dataSql, _connection);
+                cmd.Parameters.AddWithValue("@movieId", movieId);
+                cmd.Parameters.AddWithValue("@limit", pageSize);
+                cmd.Parameters.AddWithValue("@offset", offset);
+
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+                var clipRows = new List<ClipRow>();
+                while (await reader.ReadAsync(ct))
                 {
-                    BucketName = bucketName,
-                    Prefix = prefix,
-                    ContinuationToken = continuationToken
-                };
-
-                var response = await client.ListObjectsV2Async(request, ct);
-                var objects = response.S3Objects ?? new List<S3Object>();
-
-                foreach (var obj in objects)
-                {
-                    if (string.IsNullOrWhiteSpace(obj.Key))
-                        continue;
-                    if (!obj.Key.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    allKeys.Add(obj.Key);
+                    clipRows.Add(new ClipRow
+                    {
+                        Filename = reader.IsDBNull(reader.GetOrdinal("filename"))
+                            ? "" : reader.GetString(reader.GetOrdinal("filename")),
+                        StartTime = reader.IsDBNull(reader.GetOrdinal("start_time"))
+                            ? null : reader.GetDouble(reader.GetOrdinal("start_time")),
+                        EndTime = reader.IsDBNull(reader.GetOrdinal("end_time"))
+                            ? null : reader.GetDouble(reader.GetOrdinal("end_time")),
+                        Duration = reader.IsDBNull(reader.GetOrdinal("duration"))
+                            ? null : reader.GetDouble(reader.GetOrdinal("duration")),
+                        Fps = reader.IsDBNull(reader.GetOrdinal("fps"))
+                            ? null : reader.GetDouble(reader.GetOrdinal("fps")),
+                        FrameCount = reader.IsDBNull(reader.GetOrdinal("frame_count"))
+                            ? null : reader.GetInt32(reader.GetOrdinal("frame_count")),
+                        TargetFrame = reader.IsDBNull(reader.GetOrdinal("target_frame"))
+                            ? null : reader.GetInt32(reader.GetOrdinal("target_frame"))
+                    });
                 }
 
-                continuationToken = response.IsTruncated == true
-                    ? response.NextContinuationToken
-                    : null;
+                // Generate presigned R2 URLs for each clip
+                var accountId = _configuration["R2:AccountId"] ?? "";
+                var accessKey = _configuration["R2:AccessKey"] ?? "";
+                var secretKey = _configuration["R2:SecretKey"] ?? "";
+                var bucketName = _configuration["R2:BucketName"] ?? "";
 
-            } while (!string.IsNullOrEmpty(continuationToken));
+                var clips = new List<ClipDto>();
 
-            allKeys.Sort(StringComparer.OrdinalIgnoreCase);
-
-            var totalCount = allKeys.Count;
-            var totalPages = (int)Math.Ceiling(totalCount / (double)pageSize);
-            var offset = (page - 1) * pageSize;
-            var pageKeys = allKeys.Skip(offset).Take(pageSize).ToList();
-
-            var clips = new List<ClipDto>();
-            foreach (var key in pageKeys)
-            {
-                var url = client.GetPreSignedURL(new GetPreSignedUrlRequest
+                if (!string.IsNullOrWhiteSpace(accountId) &&
+                    !string.IsNullOrWhiteSpace(accessKey) &&
+                    !string.IsNullOrWhiteSpace(secretKey) &&
+                    !string.IsNullOrWhiteSpace(bucketName))
                 {
-                    BucketName = bucketName,
-                    Key = key,
-                    Expires = DateTime.UtcNow.AddMinutes(PresignedUrlExpiryMinutes),
-                    Verb = HttpVerb.GET
-                });
+                    var creds = new BasicAWSCredentials(accessKey.Trim(), secretKey.Trim());
+                    var s3Config = new AmazonS3Config
+                    {
+                        ServiceURL = $"https://{accountId.Trim()}.r2.cloudflarestorage.com",
+                        ForcePathStyle = true,
+                        UseAccelerateEndpoint = false,
+                        UseDualstackEndpoint = false,
+                        EndpointDiscoveryEnabled = false
+                    };
 
-                clips.Add(new ClipDto
+                    using var client = new AmazonS3Client(creds, s3Config);
+
+                    foreach (var row in clipRows)
+                    {
+                        var key = $"clips_9s/{movieId}/{row.Filename}.mp4";
+                        var url = client.GetPreSignedURL(new GetPreSignedUrlRequest
+                        {
+                            BucketName = bucketName,
+                            Key = key,
+                            Expires = DateTime.UtcNow.AddMinutes(PresignedUrlExpiryMinutes),
+                            Verb = HttpVerb.GET
+                        });
+
+                        double? targetTime = null;
+                        if (row.TargetFrame != null && row.Fps != null && row.Fps > 0)
+                        {
+                            targetTime = row.TargetFrame.Value / row.Fps.Value;
+                        }
+
+                        clips.Add(new ClipDto
+                        {
+                            FileName = row.Filename + ".mp4",
+                            Url = url,
+                            StartTime = row.StartTime,
+                            EndTime = row.EndTime,
+                            Duration = row.Duration,
+                            Fps = row.Fps,
+                            FrameCount = row.FrameCount,
+                            TargetFrame = row.TargetFrame,
+                            TargetTime = targetTime
+                        });
+                    }
+                }
+                else
                 {
-                    FileName = Path.GetFileName(key),
-                    Url = url
+                    _logger.LogWarning("R2 settings are missing; returning clips without URLs.");
+                    foreach (var row in clipRows)
+                    {
+                        clips.Add(new ClipDto
+                        {
+                            FileName = row.Filename + ".mp4",
+                            Url = "",
+                            StartTime = row.StartTime,
+                            EndTime = row.EndTime,
+                            Duration = row.Duration,
+                            Fps = row.Fps,
+                            FrameCount = row.FrameCount,
+                            TargetFrame = row.TargetFrame
+                        });
+                    }
+                }
+
+                return Ok(new ClipPageResponse
+                {
+                    Clips = clips,
+                    Page = page,
+                    PageSize = pageSize,
+                    TotalCount = totalCount,
+                    TotalPages = totalPages,
+                    MovieId = movieId
                 });
             }
-
-            return Ok(new ClipPageResponse
+            finally
             {
-                Clips = clips,
-                Page = page,
-                PageSize = pageSize,
-                TotalCount = totalCount,
-                TotalPages = totalPages,
-                MovieId = movieId
-            });
+                if (mustClose) await _connection.CloseAsync();
+            }
+        }
+
+        private sealed class ClipRow
+        {
+            public string Filename { get; set; } = "";
+            public double? StartTime { get; set; }
+            public double? EndTime { get; set; }
+            public double? Duration { get; set; }
+            public double? Fps { get; set; }
+            public int? FrameCount { get; set; }
+            public int? TargetFrame { get; set; }
         }
     }
 
@@ -139,6 +224,13 @@ namespace ShotDeckSearch.Controllers
     {
         public string FileName { get; set; } = "";
         public string Url { get; set; } = "";
+        public double? StartTime { get; set; }
+        public double? EndTime { get; set; }
+        public double? Duration { get; set; }
+        public double? Fps { get; set; }
+        public int? FrameCount { get; set; }
+        public int? TargetFrame { get; set; }
+        public double? TargetTime { get; set; }
     }
 
     public sealed class ClipPageResponse

@@ -73,7 +73,11 @@ namespace ShotDeckSearch.Controllers
 
                 var offset = (page - 1) * pageSize;
                 var dataSql = $@"
-SELECT m.idnum, m.title, m.year, m.media_type::text AS media_type, m.poster
+SELECT m.idnum, m.title, m.year, m.media_type::text AS media_type, m.poster,
+       (SELECT COUNT(*) FROM frl.frl_images i
+        WHERE i.movieid = m.idnum AND i.status = 'live') AS image_count,
+       (SELECT COUNT(*) FROM frl.frl_image_scene_boundaries sb
+        WHERE sb.movieid = m.idnum) AS clip_count
 FROM frl.frl_movies m
 {whereStr}
 ORDER BY m.title ASC
@@ -98,7 +102,9 @@ LIMIT @limit OFFSET @offset;";
                         MediaType = reader.IsDBNull(reader.GetOrdinal("media_type"))
                             ? "" : reader.GetString(reader.GetOrdinal("media_type")),
                         Poster = reader.IsDBNull(reader.GetOrdinal("poster"))
-                            ? null : PosterBaseUrl + reader.GetString(reader.GetOrdinal("poster"))
+                            ? null : PosterBaseUrl + reader.GetString(reader.GetOrdinal("poster")),
+                        ImageCount = Convert.ToInt32(reader["image_count"]),
+                        ClipCount = Convert.ToInt32(reader["clip_count"])
                     });
                 }
 
@@ -163,6 +169,8 @@ ORDER BY media_type;";
         public int? Year { get; set; }
         public string MediaType { get; set; } = "";
         public string? Poster { get; set; }
+        public int ImageCount { get; set; }
+        public int ClipCount { get; set; }
     }
 
     public sealed class MoviePageResponse
