@@ -59,7 +59,7 @@ namespace ShotDeckSearch.Controllers
                 if (!string.IsNullOrWhiteSpace(mediaType) &&
                     !string.Equals(mediaType, "all", StringComparison.OrdinalIgnoreCase))
                 {
-                    whereClauses.Add("m.media_type = @mediaType");
+                    whereClauses.Add("m.media_type::text = @mediaType");
                     cmd.Parameters.AddWithValue("@mediaType", mediaType.Trim().ToLower());
                 }
 
@@ -73,7 +73,7 @@ namespace ShotDeckSearch.Controllers
 
                 var offset = (page - 1) * pageSize;
                 var dataSql = $@"
-SELECT m.idnum, m.title, m.year, m.media_type, m.poster
+SELECT m.idnum, m.title, m.year, m.media_type::text AS media_type, m.poster
 FROM frl.frl_movies m
 {whereStr}
 ORDER BY m.title ASC
@@ -133,9 +133,9 @@ LIMIT @limit OFFSET @offset;";
             try
             {
                 const string sql = @"
-SELECT DISTINCT media_type
+SELECT DISTINCT media_type::text AS media_type
 FROM frl.frl_movies
-WHERE media_type IS NOT NULL AND media_type <> ''
+WHERE media_type IS NOT NULL
 ORDER BY media_type;";
 
                 await using var cmd = new NpgsqlCommand(sql, _connection);
