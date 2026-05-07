@@ -226,11 +226,11 @@ namespace AdminPanelAPI.Services
     CancellationToken cancellationToken)
         {
             const string deleteSql = @"
-DELETE FROM frl.frl_movie_info_v2
+DELETE FROM frl.frl_movie_info
 WHERE movieid = @movieid;";
 
             const string insertSql = @"
-INSERT INTO frl.frl_movie_info_v2 (
+INSERT INTO frl.frl_movie_info (
     movieid,
     duration,
     fps,
