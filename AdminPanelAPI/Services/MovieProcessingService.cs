@@ -80,7 +80,7 @@ namespace AdminPanelAPI.Services
             var videoInfo = await GetVideoInfoAsync(movieId, cancellationToken);
 
             await _repo.UpdateProgressAsync(jobId, "Saving movie metadata", null, null, cancellationToken);
-            await InsertMovieInfoAsync(movieId, videoInfo, cancellationToken);
+            await InsertMovieInfoAsync(movieId, videoInfo, overwrite, cancellationToken);
 
             if (overwrite)
             {
@@ -219,12 +219,17 @@ namespace AdminPanelAPI.Services
             return result;
         }
 
-        private async Task InsertMovieInfoAsync(
-            int movieId,
-            VideoInfoResponse info,
-            CancellationToken cancellationToken)
+        private async Task<bool> InsertMovieInfoAsync(
+    int movieId,
+    VideoInfoResponse info,
+    bool overwrite,
+    CancellationToken cancellationToken)
         {
-            const string sql = @"
+            const string deleteSql = @"
+DELETE FROM frl.frl_movie_info_v2
+WHERE movieid = @movieid;";
+
+            const string insertSql = @"
 INSERT INTO frl.frl_movie_info_v2 (
     movieid,
     duration,
@@ -266,26 +271,60 @@ ON CONFLICT (movieid) DO NOTHING;";
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync(cancellationToken);
 
-            await using var cmd = new NpgsqlCommand(sql, conn);
+            await using var tx = await conn.BeginTransactionAsync(cancellationToken);
 
-            cmd.Parameters.AddWithValue("movieid", movieId);
-            cmd.Parameters.AddWithValue("duration", (object?)info.Duration ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("fps", (object?)info.Fps ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("frame_count", (object?)info.FrameCount ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("width", (object?)info.Width ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("height", (object?)info.Height ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("aspect_ratio", (object?)info.AspectRatio ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("aspect_ratio_str", (object?)info.AspectRatioStr ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("dar", (object?)info.Dar ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("sar", (object?)info.Sar ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("codec", (object?)info.Codec ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("profile", (object?)info.Profile ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("pix_fmt", (object?)info.PixFmt ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("bit_depth", (object?)info.BitDepth ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("file_size_bytes", (object?)info.FileSizeBytes ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("file_size_mb", (object?)info.FileSizeMb ?? DBNull.Value);
+            try
+            {
+                if (overwrite)
+                {
+                    await using var deleteCmd = new NpgsqlCommand(deleteSql, conn, tx);
+                    deleteCmd.Parameters.AddWithValue("movieid", movieId);
 
-            await cmd.ExecuteNonQueryAsync(cancellationToken);
+                    var deletedRows = await deleteCmd.ExecuteNonQueryAsync(cancellationToken);
+
+                    Console.WriteLine(
+                        deletedRows > 0
+                            ? $"Existing movie info deleted for movieId {movieId}"
+                            : $"No existing movie info found to delete for movieId {movieId}");
+                }
+
+                await using var cmd = new NpgsqlCommand(insertSql, conn, tx);
+
+                cmd.Parameters.AddWithValue("movieid", movieId);
+                cmd.Parameters.AddWithValue("duration", (object?)info.Duration ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("fps", (object?)info.Fps ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("frame_count", (object?)info.FrameCount ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("width", (object?)info.Width ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("height", (object?)info.Height ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("aspect_ratio", (object?)info.AspectRatio ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("aspect_ratio_str", (object?)info.AspectRatioStr ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("dar", (object?)info.Dar ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("sar", (object?)info.Sar ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("codec", (object?)info.Codec ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("profile", (object?)info.Profile ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("pix_fmt", (object?)info.PixFmt ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("bit_depth", (object?)info.BitDepth ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("file_size_bytes", (object?)info.FileSizeBytes ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("file_size_mb", (object?)info.FileSizeMb ?? DBNull.Value);
+
+                var rowsAffected = await cmd.ExecuteNonQueryAsync(cancellationToken);
+
+                await tx.CommitAsync(cancellationToken);
+
+                if (rowsAffected == 1)
+                {
+                    Console.WriteLine($"Movie info inserted successfully for movieId {movieId}");
+                    return true;
+                }
+
+                Console.WriteLine($"Movie info already exists for movieId {movieId}; insert skipped.");
+                return false;
+            }
+            catch
+            {
+                await tx.RollbackAsync(cancellationToken);
+                throw;
+            }
         }
 
         private async Task<GenerateClipsResponse> GenerateClipsAsync(
