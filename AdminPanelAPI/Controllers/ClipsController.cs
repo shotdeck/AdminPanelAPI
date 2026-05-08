@@ -85,7 +85,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid
 WHERE i.movieid = @movieId
   AND i.status = 'live'
-ORDER BY i.randid ASC
+ORDER BY i.shot_time ASC, i.randid ASC
 LIMIT @limit OFFSET @offset;";
 
                 await using var cmd = new NpgsqlCommand(dataSql, _connection);
