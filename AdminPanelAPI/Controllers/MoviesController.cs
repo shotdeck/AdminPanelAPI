@@ -67,18 +67,33 @@ namespace ShotDeckSearch.Controllers
                     ? "WHERE " + string.Join(" AND ", whereClauses)
                     : "";
 
-                var countSql = $"SELECT COUNT(*) FROM frl.frl_movies m {whereStr};";
+                // Only include movies that have at least one live image
+                var existsClause = "EXISTS (SELECT 1 FROM frl.frl_images ei WHERE ei.movieid = m.idnum AND ei.status = 'live')";
+                var countWhere = whereClauses.Count > 0
+                    ? "WHERE " + string.Join(" AND ", whereClauses) + " AND " + existsClause
+                    : "WHERE " + existsClause;
+
+                var countSql = $"SELECT COUNT(*) FROM frl.frl_movies m {countWhere};";
                 cmd.CommandText = countSql;
                 var totalCount = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
                 var offset = (page - 1) * pageSize;
                 var dataSql = $@"
 SELECT m.idnum, m.title, m.year, m.media_type::text AS media_type, m.poster,
-       (SELECT COUNT(*) FROM frl.frl_images i
-        WHERE i.movieid = m.idnum AND i.status = 'live') AS image_count,
-       (SELECT COUNT(*) FROM frl.frl_image_scene_boundaries sb
-        WHERE sb.movieid = m.idnum) AS clip_count
+       COALESCE(ic.image_count, 0) AS image_count,
+       COALESCE(cc.clip_count, 0) AS clip_count
 FROM frl.frl_movies m
+INNER JOIN (
+    SELECT movieid, COUNT(*) AS image_count
+    FROM frl.frl_images
+    WHERE status = 'live'
+    GROUP BY movieid
+) ic ON ic.movieid = m.idnum
+LEFT JOIN (
+    SELECT movieid, COUNT(*) AS clip_count
+    FROM frl.frl_image_scene_boundaries
+    GROUP BY movieid
+) cc ON cc.movieid = m.idnum
 {whereStr}
 ORDER BY m.title ASC
 LIMIT @limit OFFSET @offset;";

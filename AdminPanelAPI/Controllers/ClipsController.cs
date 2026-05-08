@@ -156,7 +156,7 @@ LIMIT @limit OFFSET @offset;";
                         double? targetTime = null;
                         if (row.TargetFrame != null && row.Fps != null && row.Fps > 0)
                         {
-                            targetTime = row.TargetFrame.Value / row.Fps.Value;
+                            targetTime = (double)row.TargetFrame.Value / row.Fps.Value;
                         }
 
                         clips.Add(new ClipDto
