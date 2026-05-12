@@ -635,6 +635,59 @@ ON CONFLICT (imageid, movement) DO UPDATE SET status = 'ok', updated_at = now();
             return Ok(new ReassignResponse { Updated = rows > 0 });
         }
 
+        // ── DELETE /api/admin/camera-movements/tag ─────────────────────
+        // Removes a specific movement tag from an image.
+        [HttpDelete("tag")]
+        [ProducesResponseType(typeof(DeleteTagResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<DeleteTagResponse>> DeleteTag(
+            [FromBody] DeleteTagRequest request,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(request.Movement))
+                return BadRequest(new { error = "movement is required." });
+
+            await EnsureOpenAsync(ct);
+
+            const string sql = @"
+DELETE FROM frl.frl_join_image_camera_movements
+WHERE imageid = @imageid AND movement = @movement;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@imageid", request.ImageId);
+            cmd.Parameters.AddWithValue("@movement", request.Movement);
+
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+
+            return Ok(new DeleteTagResponse { Deleted = rows > 0 });
+        }
+
+        // ── POST /api/admin/camera-movements/tag ──────────────────────
+        // Adds a new movement tag to an image.
+        [HttpPost("tag")]
+        [ProducesResponseType(typeof(AddTagResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<AddTagResponse>> AddTag(
+            [FromBody] AddTagRequest request,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(request.Movement))
+                return BadRequest(new { error = "movement is required." });
+
+            await EnsureOpenAsync(ct);
+
+            const string sql = @"
+INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
+VALUES (@imageid, @movement, 0, 'ok')
+ON CONFLICT (imageid, movement) DO NOTHING;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@imageid", request.ImageId);
+            cmd.Parameters.AddWithValue("@movement", request.Movement);
+
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+
+            return Ok(new AddTagResponse { Added = rows > 0 });
+        }
+
         // ── Helpers ────────────────────────────────────────────────────
 
         private async Task EnsureOpenAsync(CancellationToken ct)
@@ -787,6 +840,28 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
         public sealed class ReassignResponse
         {
             public bool Updated { get; set; }
+        }
+
+        public sealed class DeleteTagRequest
+        {
+            public int ImageId { get; set; }
+            public string Movement { get; set; } = "";
+        }
+
+        public sealed class DeleteTagResponse
+        {
+            public bool Deleted { get; set; }
+        }
+
+        public sealed class AddTagRequest
+        {
+            public int ImageId { get; set; }
+            public string Movement { get; set; } = "";
+        }
+
+        public sealed class AddTagResponse
+        {
+            public bool Added { get; set; }
         }
 
         // VideoMAE API response DTOs
