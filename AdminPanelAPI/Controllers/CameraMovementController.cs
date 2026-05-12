@@ -3,6 +3,7 @@ using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
+using System.Collections.Concurrent;
 using System.Data;
 using System.Text;
 using System.Text.Json;
@@ -183,11 +184,14 @@ LIMIT @limit;";
 
             int processed = 0, failed = 0;
 
-            // 3. Process each image
-            foreach (var img in images)
-            {
-                if (ct.IsCancellationRequested) break;
+            // 3. Process images in parallel (up to 5 concurrent VideoMAE calls)
+            const int maxConcurrency = 5;
+            var throttle = new SemaphoreSlim(maxConcurrency);
+            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, bool Success)>();
 
+            var tasks = images.Select(async img =>
+            {
+                await throttle.WaitAsync(ct);
                 try
                 {
                     var key = $"clips_9s/{img.MovieId}/{img.RandId}.mp4";
@@ -199,7 +203,6 @@ LIMIT @limit;";
                         Verb = HttpVerb.GET
                     });
 
-                    // Call VideoMAE API (no CameraBench needed for QC)
                     var payload = new
                     {
                         url = clipUrl,
@@ -223,39 +226,50 @@ LIMIT @limit;";
                         _logger.LogWarning(
                             "VideoMAE API failed for image {ImageId}: HTTP {Status}",
                             img.ImageId, (int)response.StatusCode);
-                        failed++;
-                        continue;
+                        results.Add((img.ImageId, null, false));
+                        return;
                     }
 
                     var responseBody = await response.Content.ReadAsStringAsync(ct);
                     var result = JsonSerializer.Deserialize<VideoMaeResponse>(responseBody, JsonOpts);
-
-                    if (result?.OverallMovements == null || result.OverallMovements.Count == 0)
-                    {
-                        // Insert a 'static' record if no movements detected
-                        await InsertMovementAsync(img.ImageId, "static", 0, ct);
-                        processed++;
-                        continue;
-                    }
-
-                    // Insert each detected movement
-                    foreach (var movement in result.OverallMovements)
-                    {
-                        if (movement.Label == "too_short") continue;
-                        await InsertMovementAsync(
-                            img.ImageId,
-                            movement.Label,
-                            movement.Confidence,
-                            ct);
-                    }
-
-                    processed++;
+                    results.Add((img.ImageId, result?.OverallMovements, true));
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Failed to analyze image {ImageId}", img.ImageId);
-                    failed++;
+                    results.Add((img.ImageId, null, false));
                 }
+                finally
+                {
+                    throttle.Release();
+                }
+            });
+
+            await Task.WhenAll(tasks);
+
+            // 4. Write results to DB sequentially (NpgsqlConnection is not thread-safe)
+            foreach (var r in results)
+            {
+                if (!r.Success)
+                {
+                    failed++;
+                    continue;
+                }
+
+                if (r.Movements == null || r.Movements.Count == 0)
+                {
+                    await InsertMovementAsync(r.ImageId, "static", 0, ct);
+                    processed++;
+                    continue;
+                }
+
+                foreach (var movement in r.Movements)
+                {
+                    if (movement.Label == "too_short") continue;
+                    await InsertMovementAsync(r.ImageId, movement.Label, movement.Confidence, ct);
+                }
+
+                processed++;
             }
 
             return Ok(new AnalyzeBatchResponse
