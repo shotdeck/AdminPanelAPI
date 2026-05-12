@@ -185,7 +185,7 @@ LIMIT @limit;";
             int processed = 0, failed = 0;
 
             // 3. Process images in parallel (up to 5 concurrent VideoMAE calls)
-            const int maxConcurrency = 5;
+            const int maxConcurrency = 10;
             var throttle = new SemaphoreSlim(maxConcurrency);
             var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, bool Success)>();
 
