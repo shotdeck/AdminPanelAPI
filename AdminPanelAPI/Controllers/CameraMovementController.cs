@@ -504,6 +504,240 @@ WHERE imageid IN ({idParams});";
             });
         }
 
+        // ── POST /api/admin/camera-movements/clips/filter ────────────────
+        // Returns clips matching multi-tag include/exclude criteria.
+        [HttpPost("clips/filter")]
+        [ProducesResponseType(typeof(TagClipsResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<TagClipsResponse>> FilterClips(
+            [FromBody] FilterClipsRequest request,
+            CancellationToken ct = default)
+        {
+            var include = request.Movements ?? new List<string>();
+            var exclude = request.ExcludeMovements ?? new List<string>();
+
+            if (include.Count == 0)
+                return BadRequest(new { error = "At least one movement to include is required." });
+
+            int page = request.Page < 1 ? 1 : request.Page;
+            int pageSize = request.PageSize < 1 ? 20 : request.PageSize > 200 ? 200 : request.PageSize;
+
+            await EnsureOpenAsync(ct);
+
+            // Build parameterised include list
+            var includeParams = new List<string>();
+            for (int i = 0; i < include.Count; i++)
+                includeParams.Add($"@inc{i}");
+
+            // Build parameterised exclude list
+            var excludeParams = new List<string>();
+            for (int i = 0; i < exclude.Count; i++)
+                excludeParams.Add($"@exc{i}");
+
+            // Subquery: images that have ALL included movements
+            var imageSubquery = $@"
+SELECT imageid
+FROM frl.frl_join_image_camera_movements
+WHERE movement IN ({string.Join(",", includeParams)})
+GROUP BY imageid
+HAVING COUNT(DISTINCT movement) = @includeCount";
+
+            // If there are excludes, filter them out
+            var excludeClause = exclude.Count > 0
+                ? $@" AND imageid NOT IN (
+    SELECT DISTINCT imageid FROM frl.frl_join_image_camera_movements
+    WHERE movement IN ({string.Join(",", excludeParams)})
+)"
+                : "";
+
+            // Status filter on the first included movement
+            var statusClause = !string.IsNullOrWhiteSpace(request.Status)
+                ? " AND cm.status = @status"
+                : "";
+
+            var offset = (page - 1) * pageSize;
+
+            // Count query
+            var countSql = $@"
+SELECT COUNT(*)
+FROM frl.frl_join_image_camera_movements cm
+WHERE cm.movement = @firstMovement
+  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause};";
+
+            await using var countCmd = new NpgsqlCommand(countSql, _connection);
+            countCmd.Parameters.AddWithValue("@firstMovement", include[0]);
+            countCmd.Parameters.AddWithValue("@includeCount", include.Count);
+            for (int i = 0; i < include.Count; i++)
+                countCmd.Parameters.AddWithValue($"@inc{i}", include[i]);
+            for (int i = 0; i < exclude.Count; i++)
+                countCmd.Parameters.AddWithValue($"@exc{i}", exclude[i]);
+            if (!string.IsNullOrWhiteSpace(request.Status))
+                countCmd.Parameters.AddWithValue("@status", request.Status);
+
+            var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
+
+            // Data query
+            var dataSql = $@"
+SELECT cm.imageid,
+       cm.movement,
+       cm.confidence,
+       cm.status,
+       i.movieid,
+       i.randid,
+       sb.start_time,
+       sb.end_time,
+       sb.fps,
+       sb.target_frame,
+       m.title AS movie_title
+FROM frl.frl_join_image_camera_movements cm
+INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
+INNER JOIN frl.frl_image_scene_boundaries sb
+    ON sb.movieid = i.movieid AND sb.filename = i.randid
+LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
+WHERE cm.movement = @firstMovement
+  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}
+ORDER BY cm.confidence DESC
+LIMIT @limit OFFSET @offset;";
+
+            await using var cmd = new NpgsqlCommand(dataSql, _connection);
+            cmd.Parameters.AddWithValue("@firstMovement", include[0]);
+            cmd.Parameters.AddWithValue("@includeCount", include.Count);
+            for (int i = 0; i < include.Count; i++)
+                cmd.Parameters.AddWithValue($"@inc{i}", include[i]);
+            for (int i = 0; i < exclude.Count; i++)
+                cmd.Parameters.AddWithValue($"@exc{i}", exclude[i]);
+            if (!string.IsNullOrWhiteSpace(request.Status))
+                cmd.Parameters.AddWithValue("@status", request.Status);
+            cmd.Parameters.AddWithValue("@limit", pageSize);
+            cmd.Parameters.AddWithValue("@offset", offset);
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var clipRows = new List<TagClipRow>();
+            while (await reader.ReadAsync(ct))
+            {
+                clipRows.Add(new TagClipRow
+                {
+                    ImageId = reader.GetInt32(reader.GetOrdinal("imageid")),
+                    Movement = reader.GetString(reader.GetOrdinal("movement")),
+                    Confidence = reader.GetFloat(reader.GetOrdinal("confidence")),
+                    Status = reader.GetString(reader.GetOrdinal("status")),
+                    MovieId = reader.GetInt32(reader.GetOrdinal("movieid")),
+                    RandId = reader.GetString(reader.GetOrdinal("randid")),
+                    StartTime = reader.IsDBNull(reader.GetOrdinal("start_time"))
+                        ? null : reader.GetDouble(reader.GetOrdinal("start_time")),
+                    EndTime = reader.IsDBNull(reader.GetOrdinal("end_time"))
+                        ? null : reader.GetDouble(reader.GetOrdinal("end_time")),
+                    Fps = reader.IsDBNull(reader.GetOrdinal("fps"))
+                        ? null : reader.GetDouble(reader.GetOrdinal("fps")),
+                    TargetFrame = reader.IsDBNull(reader.GetOrdinal("target_frame"))
+                        ? null : reader.GetInt32(reader.GetOrdinal("target_frame")),
+                    MovieTitle = reader.IsDBNull(reader.GetOrdinal("movie_title"))
+                        ? "" : reader.GetString(reader.GetOrdinal("movie_title")),
+                });
+            }
+            await reader.CloseAsync();
+
+            // Generate presigned R2 URLs & fetch all movements per image
+            var clips = new List<TagClipDto>();
+            var accountId = _configuration["R2:AccountId"] ?? "";
+            var accessKeyVal = _configuration["R2:AccessKey"] ?? "";
+            var secretKeyVal = _configuration["R2:SecretKey"] ?? "";
+            var bucketName = _configuration["R2:BucketName"] ?? "";
+
+            if (!string.IsNullOrWhiteSpace(accountId) &&
+                !string.IsNullOrWhiteSpace(accessKeyVal) &&
+                !string.IsNullOrWhiteSpace(secretKeyVal) &&
+                !string.IsNullOrWhiteSpace(bucketName))
+            {
+                var creds = new BasicAWSCredentials(accessKeyVal.Trim(), secretKeyVal.Trim());
+                var s3Config = new AmazonS3Config
+                {
+                    ServiceURL = $"https://{accountId.Trim()}.r2.cloudflarestorage.com",
+                    ForcePathStyle = true,
+                    UseAccelerateEndpoint = false,
+                    UseDualstackEndpoint = false,
+                    EndpointDiscoveryEnabled = false
+                };
+
+                using var client = new AmazonS3Client(creds, s3Config);
+
+                var imageIds = clipRows.Select(r => r.ImageId).Distinct().ToList();
+                var allMovements = new Dictionary<int, List<ImageMovementInfo>>();
+
+                if (imageIds.Count > 0)
+                {
+                    var idParams = string.Join(",", imageIds.Select((_, idx) => $"@id{idx}"));
+                    var movSql = $@"
+SELECT imageid, movement, confidence, status
+FROM frl.frl_join_image_camera_movements
+WHERE imageid IN ({idParams});";
+
+                    await using var movCmd = new NpgsqlCommand(movSql, _connection);
+                    for (int idx = 0; idx < imageIds.Count; idx++)
+                        movCmd.Parameters.AddWithValue($"@id{idx}", imageIds[idx]);
+
+                    await using var movReader = await movCmd.ExecuteReaderAsync(ct);
+                    while (await movReader.ReadAsync(ct))
+                    {
+                        var imgId = movReader.GetInt32(0);
+                        if (!allMovements.ContainsKey(imgId))
+                            allMovements[imgId] = new List<ImageMovementInfo>();
+
+                        allMovements[imgId].Add(new ImageMovementInfo
+                        {
+                            Movement = movReader.GetString(1),
+                            Confidence = movReader.GetFloat(2),
+                            Status = movReader.GetString(3),
+                        });
+                    }
+                }
+
+                foreach (var row in clipRows)
+                {
+                    var r2Key = $"clips_9s/{row.MovieId}/{row.RandId}.mp4";
+                    var url = client.GetPreSignedURL(new GetPreSignedUrlRequest
+                    {
+                        BucketName = bucketName,
+                        Key = r2Key,
+                        Expires = DateTime.UtcNow.AddMinutes(PresignedUrlExpiryMinutes),
+                        Verb = HttpVerb.GET
+                    });
+
+                    clips.Add(new TagClipDto
+                    {
+                        ImageId = row.ImageId,
+                        MovieId = row.MovieId,
+                        MovieTitle = row.MovieTitle,
+                        Url = url,
+                        StartTime = row.StartTime,
+                        EndTime = row.EndTime,
+                        Fps = row.Fps,
+                        Confidence = row.Confidence,
+                        Status = row.Status,
+                        AllMovements = allMovements.GetValueOrDefault(row.ImageId)
+                            ?? new List<ImageMovementInfo>(),
+                    });
+                }
+            }
+
+            var label = string.Join(" + ", include.Select(formatMovement));
+            if (exclude.Count > 0)
+                label += " - " + string.Join(" - ", exclude.Select(formatMovement));
+
+            return Ok(new TagClipsResponse
+            {
+                Movement = label,
+                Clips = clips,
+                Page = page,
+                PageSize = pageSize,
+                TotalCount = totalCount,
+                TotalPages = (int)Math.Ceiling(totalCount / (double)pageSize),
+            });
+
+            static string formatMovement(string m) =>
+                string.IsNullOrEmpty(m) ? m : m.Replace("_", " ");
+        }
+
         // ── PUT /api/admin/camera-movements/review ─────────────────────
         // Update the status of one or more imageid+movement pairs.
         [HttpPut("review")]
@@ -862,6 +1096,15 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
         public sealed class AddTagResponse
         {
             public bool Added { get; set; }
+        }
+
+        public sealed class FilterClipsRequest
+        {
+            public List<string> Movements { get; set; } = new();
+            public List<string> ExcludeMovements { get; set; } = new();
+            public string? Status { get; set; }
+            public int Page { get; set; } = 1;
+            public int PageSize { get; set; } = 50;
         }
 
         // VideoMAE API response DTOs
