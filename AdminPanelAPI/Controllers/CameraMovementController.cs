@@ -575,6 +575,66 @@ ORDER BY confidence DESC;";
             return Ok(movements);
         }
 
+        // ── GET /api/admin/camera-movements/movements ─────────────────
+        // Returns all distinct movement labels (for reassign dropdown).
+        [HttpGet("movements")]
+        [ProducesResponseType(typeof(MovementListResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<MovementListResponse>> GetMovements(CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+
+            const string sql = @"
+SELECT DISTINCT movement
+FROM frl.frl_join_image_camera_movements
+ORDER BY movement;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var movements = new List<string>();
+            while (await reader.ReadAsync(ct))
+            {
+                movements.Add(reader.GetString(0));
+            }
+
+            return Ok(new MovementListResponse { Movements = movements });
+        }
+
+        // ── PUT /api/admin/camera-movements/reassign ─────────────────────
+        // Change the movement label for an image (e.g. "static" → "dolly_in").
+        [HttpPut("reassign")]
+        [ProducesResponseType(typeof(ReassignResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ReassignResponse>> Reassign(
+            [FromBody] ReassignRequest request,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(request.NewMovement))
+                return BadRequest(new { error = "newMovement is required." });
+
+            await EnsureOpenAsync(ct);
+
+            // Delete old row + insert new one (movement is part of the PK)
+            const string sql = @"
+WITH deleted AS (
+    DELETE FROM frl.frl_join_image_camera_movements
+    WHERE imageid = @imageid AND movement = @oldMovement
+    RETURNING imageid, confidence
+)
+INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
+SELECT imageid, @newMovement, confidence, 'ok'
+FROM deleted
+ON CONFLICT (imageid, movement) DO UPDATE SET status = 'ok', updated_at = now();";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@imageid", request.ImageId);
+            cmd.Parameters.AddWithValue("@oldMovement", request.OldMovement);
+            cmd.Parameters.AddWithValue("@newMovement", request.NewMovement);
+
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+
+            return Ok(new ReassignResponse { Updated = rows > 0 });
+        }
+
         // ── Helpers ────────────────────────────────────────────────────
 
         private async Task EnsureOpenAsync(CancellationToken ct)
@@ -710,6 +770,23 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
         public sealed class ReviewResponse
         {
             public int Updated { get; set; }
+        }
+
+        public sealed class MovementListResponse
+        {
+            public List<string> Movements { get; set; } = new();
+        }
+
+        public sealed class ReassignRequest
+        {
+            public int ImageId { get; set; }
+            public string OldMovement { get; set; } = "";
+            public string NewMovement { get; set; } = "";
+        }
+
+        public sealed class ReassignResponse
+        {
+            public bool Updated { get; set; }
         }
 
         // VideoMAE API response DTOs
