@@ -281,6 +281,192 @@ LIMIT @limit;";
             });
         }
 
+        // ── POST /api/admin/camera-movements/analyze-movie ─────────────
+        // Batch-analyze images for a specific movie: calls VideoMAE API for each, stores results.
+        [HttpPost("analyze-movie")]
+        [ProducesResponseType(typeof(AnalyzeBatchResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<AnalyzeBatchResponse>> AnalyzeMovie(
+            [FromQuery] int movieId,
+            [FromQuery] int limit = 100,
+            CancellationToken ct = default)
+        {
+            if (movieId <= 0) return BadRequest(new { error = "movieId is required." });
+            if (limit < 1) limit = 1;
+            if (limit > 500) limit = 500;
+
+            var cameraMotionApiUrl = _configuration["CameraMotion:ApiUrl"]
+                ?? "https://colin-bracey--camera-motion-api-fastapi-app.modal.run";
+
+            await EnsureOpenAsync(ct);
+
+            // 1. Get images for this movie that need analysis
+            const string queueSql = @"
+SELECT i.idnum,
+       i.movieid,
+       i.randid,
+       sb.start_time,
+       sb.end_time
+FROM frl.frl_images i
+INNER JOIN frl.frl_image_scene_boundaries sb
+    ON sb.movieid = i.movieid AND sb.filename = i.randid
+WHERE i.status = 'live'
+  AND i.movieid = @movieId
+  AND NOT EXISTS (
+      SELECT 1 FROM frl.frl_join_image_camera_movements cm
+      WHERE cm.imageid = i.idnum
+  )
+ORDER BY i.idnum
+LIMIT @limit;";
+
+            await using var queueCmd = new NpgsqlCommand(queueSql, _connection);
+            queueCmd.Parameters.AddWithValue("@movieId", movieId);
+            queueCmd.Parameters.AddWithValue("@limit", limit);
+            await using var queueReader = await queueCmd.ExecuteReaderAsync(ct);
+
+            var images = new List<AnalyzeItem>();
+            while (await queueReader.ReadAsync(ct))
+            {
+                images.Add(new AnalyzeItem
+                {
+                    ImageId = queueReader.GetInt32(queueReader.GetOrdinal("idnum")),
+                    MovieId = queueReader.GetInt32(queueReader.GetOrdinal("movieid")),
+                    RandId = queueReader.GetString(queueReader.GetOrdinal("randid")),
+                    StartTime = queueReader.IsDBNull(queueReader.GetOrdinal("start_time"))
+                        ? null : queueReader.GetDouble(queueReader.GetOrdinal("start_time")),
+                    EndTime = queueReader.IsDBNull(queueReader.GetOrdinal("end_time"))
+                        ? null : queueReader.GetDouble(queueReader.GetOrdinal("end_time")),
+                });
+            }
+            await queueReader.CloseAsync();
+
+            if (images.Count == 0)
+                return Ok(new AnalyzeBatchResponse { Processed = 0, Failed = 0, Message = "No un-analyzed clips for this movie." });
+
+            // 2. Generate presigned R2 URLs
+            var accountId = _configuration["R2:AccountId"] ?? "";
+            var accessKey = _configuration["R2:AccessKey"] ?? "";
+            var secretKey = _configuration["R2:SecretKey"] ?? "";
+            var bucketName = _configuration["R2:BucketName"] ?? "";
+
+            if (string.IsNullOrWhiteSpace(accountId) || string.IsNullOrWhiteSpace(accessKey) ||
+                string.IsNullOrWhiteSpace(secretKey) || string.IsNullOrWhiteSpace(bucketName))
+            {
+                return StatusCode(500, new { error = "R2 settings are missing." });
+            }
+
+            var creds = new BasicAWSCredentials(accessKey.Trim(), secretKey.Trim());
+            var s3Config = new AmazonS3Config
+            {
+                ServiceURL = $"https://{accountId.Trim()}.r2.cloudflarestorage.com",
+                ForcePathStyle = true,
+                UseAccelerateEndpoint = false,
+                UseDualstackEndpoint = false,
+                EndpointDiscoveryEnabled = false
+            };
+
+            using var s3Client = new AmazonS3Client(creds, s3Config);
+            var httpClient = _httpClientFactory.CreateClient();
+            httpClient.Timeout = TimeSpan.FromMinutes(2);
+
+            int processed = 0, failed = 0;
+
+            // 3. Process images in parallel (up to 5 concurrent VideoMAE calls)
+            const int maxConcurrency = 5;
+            var throttle = new SemaphoreSlim(maxConcurrency);
+            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, bool Success)>();
+
+            var tasks = images.Select(async img =>
+            {
+                await throttle.WaitAsync(ct);
+                try
+                {
+                    var key = $"clips_9s/{img.MovieId}/{img.RandId}.mp4";
+                    var clipUrl = s3Client.GetPreSignedURL(new GetPreSignedUrlRequest
+                    {
+                        BucketName = bucketName,
+                        Key = key,
+                        Expires = DateTime.UtcNow.AddMinutes(PresignedUrlExpiryMinutes),
+                        Verb = HttpVerb.GET
+                    });
+
+                    var payload = new
+                    {
+                        url = clipUrl,
+                        start_time = img.StartTime,
+                        end_time = img.EndTime,
+                        include_camerabench = false,
+                    };
+
+                    var jsonContent = new StringContent(
+                        JsonSerializer.Serialize(payload, JsonOpts),
+                        Encoding.UTF8,
+                        "application/json");
+
+                    var response = await httpClient.PostAsync(
+                        $"{cameraMotionApiUrl.TrimEnd('/')}/analyze",
+                        jsonContent,
+                        ct);
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        _logger.LogWarning(
+                            "VideoMAE API failed for image {ImageId}: HTTP {Status}",
+                            img.ImageId, (int)response.StatusCode);
+                        results.Add((img.ImageId, null, false));
+                        return;
+                    }
+
+                    var responseBody = await response.Content.ReadAsStringAsync(ct);
+                    var result = JsonSerializer.Deserialize<VideoMaeResponse>(responseBody, JsonOpts);
+                    results.Add((img.ImageId, result?.OverallMovements, true));
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to analyze image {ImageId}", img.ImageId);
+                    results.Add((img.ImageId, null, false));
+                }
+                finally
+                {
+                    throttle.Release();
+                }
+            });
+
+            await Task.WhenAll(tasks);
+
+            // 4. Write results to DB sequentially
+            foreach (var r in results)
+            {
+                if (!r.Success)
+                {
+                    failed++;
+                    continue;
+                }
+
+                if (r.Movements == null || r.Movements.Count == 0)
+                {
+                    await InsertMovementAsync(r.ImageId, "static", 0, ct);
+                    processed++;
+                    continue;
+                }
+
+                foreach (var movement in r.Movements)
+                {
+                    if (movement.Label == "too_short") continue;
+                    await InsertMovementAsync(r.ImageId, movement.Label, movement.Confidence, ct);
+                }
+
+                processed++;
+            }
+
+            return Ok(new AnalyzeBatchResponse
+            {
+                Processed = processed,
+                Failed = failed,
+                Total = images.Count,
+                Message = $"Analyzed {processed} clips for movie {movieId}, {failed} failed."
+            });
+        }
+
         // ── GET /api/admin/camera-movements/tags ───────────────────────
         // Returns all distinct tags with counts by status.
         [HttpGet("tags")]
@@ -294,7 +480,8 @@ SELECT movement,
        COUNT(*) AS total,
        COUNT(*) FILTER (WHERE status = 'ok') AS confirmed,
        COUNT(*) FILTER (WHERE status = 'bad') AS rejected,
-       COUNT(*) FILTER (WHERE status = 'not_checked') AS remaining
+       COUNT(*) FILTER (WHERE status = 'not_checked') AS remaining,
+       COUNT(*) FILTER (WHERE status = 'flagged') AS flagged
 FROM frl.frl_join_image_camera_movements
 GROUP BY movement
 ORDER BY total DESC;";
@@ -312,6 +499,7 @@ ORDER BY total DESC;";
                     Confirmed = reader.GetInt32(reader.GetOrdinal("confirmed")),
                     Rejected = reader.GetInt32(reader.GetOrdinal("rejected")),
                     Remaining = reader.GetInt32(reader.GetOrdinal("remaining")),
+                    Flagged = reader.GetInt32(reader.GetOrdinal("flagged")),
                 });
             }
 
@@ -989,6 +1177,7 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
             public int Confirmed { get; set; }
             public int Rejected { get; set; }
             public int Remaining { get; set; }
+            public int Flagged { get; set; }
         }
 
         public sealed class TagSummaryResponse
