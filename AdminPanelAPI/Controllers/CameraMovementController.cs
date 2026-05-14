@@ -294,7 +294,8 @@ SELECT movement,
        COUNT(*) AS total,
        COUNT(*) FILTER (WHERE status = 'ok') AS confirmed,
        COUNT(*) FILTER (WHERE status = 'bad') AS rejected,
-       COUNT(*) FILTER (WHERE status = 'not_checked') AS remaining
+       COUNT(*) FILTER (WHERE status = 'not_checked') AS remaining,
+       COUNT(*) FILTER (WHERE status = 'flagged') AS flagged
 FROM frl.frl_join_image_camera_movements
 GROUP BY movement
 ORDER BY total DESC;";
@@ -312,6 +313,7 @@ ORDER BY total DESC;";
                     Confirmed = reader.GetInt32(reader.GetOrdinal("confirmed")),
                     Rejected = reader.GetInt32(reader.GetOrdinal("rejected")),
                     Remaining = reader.GetInt32(reader.GetOrdinal("remaining")),
+                    Flagged = reader.GetInt32(reader.GetOrdinal("flagged")),
                 });
             }
 
@@ -989,6 +991,7 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
             public int Confirmed { get; set; }
             public int Rejected { get; set; }
             public int Remaining { get; set; }
+            public int Flagged { get; set; }
         }
 
         public sealed class TagSummaryResponse
