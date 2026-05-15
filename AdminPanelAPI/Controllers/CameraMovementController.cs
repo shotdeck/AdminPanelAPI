@@ -939,7 +939,7 @@ WHERE imageid IN ({idParams});";
             if (request.Items == null || request.Items.Count == 0)
                 return BadRequest(new { error = "No items provided." });
 
-            var validStatuses = new HashSet<string> { "ok", "bad", "not_checked" };
+            var validStatuses = new HashSet<string> { "ok", "bad", "not_checked", "flagged" };
 
             await EnsureOpenAsync(ct);
 
