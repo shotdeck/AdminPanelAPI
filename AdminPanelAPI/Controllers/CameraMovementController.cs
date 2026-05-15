@@ -673,6 +673,7 @@ WHERE imageid IN ({idParams});";
                         StartTime = row.StartTime,
                         EndTime = row.EndTime,
                         Fps = row.Fps,
+                        TargetFrame = row.TargetFrame,
                         Confidence = row.Confidence,
                         Status = row.Status,
                         AllMovements = allMovements.GetValueOrDefault(row.ImageId)
@@ -900,6 +901,7 @@ WHERE imageid IN ({idParams});";
                         StartTime = row.StartTime,
                         EndTime = row.EndTime,
                         Fps = row.Fps,
+                        TargetFrame = row.TargetFrame,
                         Confidence = row.Confidence,
                         Status = row.Status,
                         AllMovements = allMovements.GetValueOrDefault(row.ImageId)
@@ -1216,6 +1218,7 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
             public double? StartTime { get; set; }
             public double? EndTime { get; set; }
             public double? Fps { get; set; }
+            public int? TargetFrame { get; set; }
             public float Confidence { get; set; }
             public string Status { get; set; } = "";
             public List<ImageMovementInfo> AllMovements { get; set; } = new();
