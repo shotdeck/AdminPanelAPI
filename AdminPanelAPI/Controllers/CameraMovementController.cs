@@ -653,6 +653,7 @@ WHERE imageid IN ({idParams});";
                     }
                 }
 
+
                 foreach (var row in clipRows)
                 {
                     var r2Key = $"clips_9s/{row.MovieId}/{row.RandId}.mp4";
