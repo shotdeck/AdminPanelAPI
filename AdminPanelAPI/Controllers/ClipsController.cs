@@ -71,6 +71,30 @@ WHERE i.movieid = @movieId
                 var totalPages = (int)Math.Ceiling(totalCount / (double)pageSize);
                 var offset = (page - 1) * pageSize;
 
+                // Fetch movie-level QC summary (across all clips, not just current page)
+                var qcSummarySql = @"
+SELECT COUNT(*) AS qc_total,
+       COUNT(*) FILTER (WHERE sub.all_checked) AS qc_checked
+FROM (
+    SELECT cm.imageid,
+           bool_and(cm.status IN ('ok', 'bad', 'flagged')) AS all_checked
+    FROM frl.frl_join_image_camera_movements cm
+    INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
+    WHERE i.movieid = @movieId AND i.status = 'live'
+    GROUP BY cm.imageid
+) sub;";
+
+                await using var qcCmd = new NpgsqlCommand(qcSummarySql, _connection);
+                qcCmd.Parameters.AddWithValue("@movieId", movieId);
+                await using var qcReader = await qcCmd.ExecuteReaderAsync(ct);
+                int movieQcTotal = 0, movieQcChecked = 0;
+                if (await qcReader.ReadAsync(ct))
+                {
+                    movieQcTotal = Convert.ToInt32(qcReader["qc_total"]);
+                    movieQcChecked = Convert.ToInt32(qcReader["qc_checked"]);
+                }
+                await qcReader.CloseAsync();
+
                 // Fetch paginated clip data with QC status
                 var dataSql = @"
 SELECT i.randid AS filename,
@@ -213,7 +237,9 @@ LIMIT @limit OFFSET @offset;";
                     PageSize = pageSize,
                     TotalCount = totalCount,
                     TotalPages = totalPages,
-                    MovieId = movieId
+                    MovieId = movieId,
+                    QcTotal = movieQcTotal,
+                    QcChecked = movieQcChecked
                 });
             }
             finally
@@ -257,5 +283,7 @@ LIMIT @limit OFFSET @offset;";
         public int TotalCount { get; set; }
         public int TotalPages { get; set; }
         public int MovieId { get; set; }
+        public int QcTotal { get; set; }
+        public int QcChecked { get; set; }
     }
 }
