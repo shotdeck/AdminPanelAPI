@@ -81,7 +81,9 @@ namespace ShotDeckSearch.Controllers
                 var dataSql = $@"
 SELECT m.idnum, m.title, m.year, m.media_type::text AS media_type, m.poster,
        COALESCE(ic.image_count, 0) AS image_count,
-       COALESCE(cc.clip_count, 0) AS clip_count
+       COALESCE(cc.clip_count, 0) AS clip_count,
+       COALESCE(qc.qc_total, 0) AS qc_total,
+       COALESCE(qc.qc_checked, 0) AS qc_checked
 FROM frl.frl_movies m
 INNER JOIN (
     SELECT movieid, COUNT(*) AS image_count
@@ -94,6 +96,15 @@ LEFT JOIN (
     FROM frl.frl_image_scene_boundaries
     GROUP BY movieid
 ) cc ON cc.movieid = m.idnum
+LEFT JOIN (
+    SELECT i.movieid,
+           COUNT(DISTINCT cm.imageid) AS qc_total,
+           COUNT(DISTINCT cm.imageid) FILTER (WHERE cm.status IN ('ok', 'bad', 'flagged')) AS qc_checked
+    FROM frl.frl_join_image_camera_movements cm
+    INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
+    WHERE i.status = 'live'
+    GROUP BY i.movieid
+) qc ON qc.movieid = m.idnum
 {whereStr}
 ORDER BY m.title ASC
 LIMIT @limit OFFSET @offset;";
@@ -107,6 +118,18 @@ LIMIT @limit OFFSET @offset;";
 
                 while (await reader.ReadAsync(ct))
                 {
+                    var qcTotal = Convert.ToInt32(reader["qc_total"]);
+                    var qcChecked = Convert.ToInt32(reader["qc_checked"]);
+                    string qcStatus;
+                    if (qcTotal == 0)
+                        qcStatus = "none";
+                    else if (qcChecked == 0)
+                        qcStatus = "not_started";
+                    else if (qcChecked >= qcTotal)
+                        qcStatus = "processed";
+                    else
+                        qcStatus = "partial";
+
                     movies.Add(new MovieDto
                     {
                         Id = reader.GetInt32(reader.GetOrdinal("idnum")),
@@ -119,7 +142,10 @@ LIMIT @limit OFFSET @offset;";
                         Poster = reader.IsDBNull(reader.GetOrdinal("poster"))
                             ? null : PosterBaseUrl + reader.GetString(reader.GetOrdinal("poster")),
                         ImageCount = Convert.ToInt32(reader["image_count"]),
-                        ClipCount = Convert.ToInt32(reader["clip_count"])
+                        ClipCount = Convert.ToInt32(reader["clip_count"]),
+                        QcStatus = qcStatus,
+                        QcTotal = qcTotal,
+                        QcChecked = qcChecked
                     });
                 }
 
@@ -186,6 +212,9 @@ ORDER BY media_type;";
         public string? Poster { get; set; }
         public int ImageCount { get; set; }
         public int ClipCount { get; set; }
+        public string QcStatus { get; set; } = "none";
+        public int QcTotal { get; set; }
+        public int QcChecked { get; set; }
     }
 
     public sealed class MoviePageResponse

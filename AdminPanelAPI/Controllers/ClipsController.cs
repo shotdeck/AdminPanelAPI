@@ -71,7 +71,7 @@ WHERE i.movieid = @movieId
                 var totalPages = (int)Math.Ceiling(totalCount / (double)pageSize);
                 var offset = (page - 1) * pageSize;
 
-                // Fetch paginated clip data
+                // Fetch paginated clip data with QC status
                 var dataSql = @"
 SELECT i.randid AS filename,
        sb.start_time,
@@ -79,10 +79,21 @@ SELECT i.randid AS filename,
        sb.duration,
        sb.fps,
        sb.frame_count,
-       sb.target_frame
+       sb.target_frame,
+       COALESCE(qc.qc_status, 'no_tags') AS qc_status
 FROM frl.frl_images i
 INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid
+LEFT JOIN (
+    SELECT cm.imageid,
+           CASE
+               WHEN bool_and(cm.status IN ('ok', 'bad', 'flagged')) THEN 'checked'
+               WHEN bool_or(cm.status IN ('ok', 'bad', 'flagged')) THEN 'partial'
+               ELSE 'not_checked'
+           END AS qc_status
+    FROM frl.frl_join_image_camera_movements cm
+    GROUP BY cm.imageid
+) qc ON qc.imageid = i.idnum
 WHERE i.movieid = @movieId
   AND i.status = 'live'
 ORDER BY i.shot_time ASC, i.randid ASC
@@ -113,7 +124,8 @@ LIMIT @limit OFFSET @offset;";
                         FrameCount = reader.IsDBNull(reader.GetOrdinal("frame_count"))
                             ? null : reader.GetInt32(reader.GetOrdinal("frame_count")),
                         TargetFrame = reader.IsDBNull(reader.GetOrdinal("target_frame"))
-                            ? null : reader.GetInt32(reader.GetOrdinal("target_frame"))
+                            ? null : reader.GetInt32(reader.GetOrdinal("target_frame")),
+                        QcStatus = reader.GetString(reader.GetOrdinal("qc_status"))
                     });
                 }
 
@@ -169,7 +181,8 @@ LIMIT @limit OFFSET @offset;";
                             Fps = row.Fps,
                             FrameCount = row.FrameCount,
                             TargetFrame = row.TargetFrame,
-                            TargetTime = targetTime
+                            TargetTime = targetTime,
+                            QcStatus = row.QcStatus
                         });
                     }
                 }
@@ -178,17 +191,18 @@ LIMIT @limit OFFSET @offset;";
                     _logger.LogWarning("R2 settings are missing; returning clips without URLs.");
                     foreach (var row in clipRows)
                     {
-                        clips.Add(new ClipDto
-                        {
-                            FileName = row.Filename + ".mp4",
-                            Url = "",
-                            StartTime = row.StartTime,
-                            EndTime = row.EndTime,
-                            Duration = row.Duration,
-                            Fps = row.Fps,
-                            FrameCount = row.FrameCount,
-                            TargetFrame = row.TargetFrame
-                        });
+                            clips.Add(new ClipDto
+                            {
+                                FileName = row.Filename + ".mp4",
+                                Url = "",
+                                StartTime = row.StartTime,
+                                EndTime = row.EndTime,
+                                Duration = row.Duration,
+                                Fps = row.Fps,
+                                FrameCount = row.FrameCount,
+                                TargetFrame = row.TargetFrame,
+                                QcStatus = row.QcStatus
+                            });
                     }
                 }
 
@@ -217,6 +231,7 @@ LIMIT @limit OFFSET @offset;";
             public double? Fps { get; set; }
             public int? FrameCount { get; set; }
             public int? TargetFrame { get; set; }
+            public string QcStatus { get; set; } = "no_tags";
         }
     }
 
@@ -231,6 +246,7 @@ LIMIT @limit OFFSET @offset;";
         public int? FrameCount { get; set; }
         public int? TargetFrame { get; set; }
         public double? TargetTime { get; set; }
+        public string QcStatus { get; set; } = "no_tags";
     }
 
     public sealed class ClipPageResponse
