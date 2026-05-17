@@ -184,10 +184,13 @@ LIMIT @limit;";
 
             int processed = 0, failed = 0;
 
+            // Ensure segments table exists
+            await EnsureSegmentsTableAsync(ct);
+
             // 3. Process images in parallel (up to 5 concurrent VideoMAE calls)
             const int maxConcurrency = 5;
             var throttle = new SemaphoreSlim(maxConcurrency);
-            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, bool Success)>();
+            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, List<VideoMaeSegment>? Segments, bool Success)>();
 
             var tasks = images.Select(async img =>
             {
@@ -226,18 +229,18 @@ LIMIT @limit;";
                         _logger.LogWarning(
                             "VideoMAE API failed for image {ImageId}: HTTP {Status}",
                             img.ImageId, (int)response.StatusCode);
-                        results.Add((img.ImageId, null, false));
+                        results.Add((img.ImageId, null, null, false));
                         return;
                     }
 
                     var responseBody = await response.Content.ReadAsStringAsync(ct);
                     var result = JsonSerializer.Deserialize<VideoMaeResponse>(responseBody, JsonOpts);
-                    results.Add((img.ImageId, result?.OverallMovements, true));
+                    results.Add((img.ImageId, result?.OverallMovements, result?.Segments, true));
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Failed to analyze image {ImageId}", img.ImageId);
-                    results.Add((img.ImageId, null, false));
+                    results.Add((img.ImageId, null, null, false));
                 }
                 finally
                 {
@@ -259,6 +262,7 @@ LIMIT @limit;";
                 if (r.Movements == null || r.Movements.Count == 0)
                 {
                     await InsertMovementAsync(r.ImageId, "static", 0, ct);
+                    await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
                     processed++;
                     continue;
                 }
@@ -269,6 +273,7 @@ LIMIT @limit;";
                     await InsertMovementAsync(r.ImageId, movement.Label, movement.Confidence, ct);
                 }
 
+                await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
                 processed++;
             }
 
@@ -370,10 +375,13 @@ LIMIT @limit;";
 
             int processed = 0, failed = 0;
 
+            // Ensure segments table exists
+            await EnsureSegmentsTableAsync(ct);
+
             // 3. Process images in parallel (up to 5 concurrent VideoMAE calls)
             const int maxConcurrency = 5;
             var throttle = new SemaphoreSlim(maxConcurrency);
-            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, bool Success)>();
+            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, List<VideoMaeSegment>? Segments, bool Success)>();
 
             var tasks = images.Select(async img =>
             {
@@ -412,18 +420,18 @@ LIMIT @limit;";
                         _logger.LogWarning(
                             "VideoMAE API failed for image {ImageId}: HTTP {Status}",
                             img.ImageId, (int)response.StatusCode);
-                        results.Add((img.ImageId, null, false));
+                        results.Add((img.ImageId, null, null, false));
                         return;
                     }
 
                     var responseBody = await response.Content.ReadAsStringAsync(ct);
                     var result = JsonSerializer.Deserialize<VideoMaeResponse>(responseBody, JsonOpts);
-                    results.Add((img.ImageId, result?.OverallMovements, true));
+                    results.Add((img.ImageId, result?.OverallMovements, result?.Segments, true));
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Failed to analyze image {ImageId}", img.ImageId);
-                    results.Add((img.ImageId, null, false));
+                    results.Add((img.ImageId, null, null, false));
                 }
                 finally
                 {
@@ -445,6 +453,7 @@ LIMIT @limit;";
                 if (r.Movements == null || r.Movements.Count == 0)
                 {
                     await InsertMovementAsync(r.ImageId, "static", 0, ct);
+                    await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
                     processed++;
                     continue;
                 }
@@ -455,6 +464,7 @@ LIMIT @limit;";
                     await InsertMovementAsync(r.ImageId, movement.Label, movement.Confidence, ct);
                 }
 
+                await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
                 processed++;
             }
 
@@ -653,6 +663,8 @@ WHERE imageid IN ({idParams});";
                     }
                 }
 
+                // Fetch stored segments for all images
+                var allSegments = await FetchSegmentsAsync(imageIds, ct);
 
                 foreach (var row in clipRows)
                 {
@@ -679,6 +691,7 @@ WHERE imageid IN ({idParams});";
                         Status = row.Status,
                         AllMovements = allMovements.GetValueOrDefault(row.ImageId)
                             ?? new List<ImageMovementInfo>(),
+                        Segments = allSegments.GetValueOrDefault(row.ImageId),
                     });
                 }
             }
@@ -882,6 +895,9 @@ WHERE imageid IN ({idParams});";
                     }
                 }
 
+                // Fetch stored segments for all images
+                var allSegments = await FetchSegmentsAsync(imageIds, ct);
+
                 foreach (var row in clipRows)
                 {
                     var r2Key = $"clips_9s/{row.MovieId}/{row.RandId}.mp4";
@@ -907,6 +923,7 @@ WHERE imageid IN ({idParams});";
                         Status = row.Status,
                         AllMovements = allMovements.GetValueOrDefault(row.ImageId)
                             ?? new List<ImageMovementInfo>(),
+                        Segments = allSegments.GetValueOrDefault(row.ImageId),
                     });
                 }
             }
@@ -1137,6 +1154,84 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
             await cmd.ExecuteNonQueryAsync(ct);
         }
 
+        private async Task<Dictionary<int, List<SegmentDto>>> FetchSegmentsAsync(
+            List<int> imageIds, CancellationToken ct)
+        {
+            var result = new Dictionary<int, List<SegmentDto>>();
+            if (imageIds.Count == 0) return result;
+
+            var idParams = string.Join(",", imageIds.Select((_, idx) => $"@sid{idx}"));
+            var sql = $@"
+SELECT imageid, segments_json
+FROM frl.frl_image_analysis_segments
+WHERE imageid IN ({idParams});";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            for (int idx = 0; idx < imageIds.Count; idx++)
+                cmd.Parameters.AddWithValue($"@sid{idx}", imageIds[idx]);
+
+            try
+            {
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    var imgId = reader.GetInt32(0);
+                    var json = reader.GetString(1);
+                    var segments = JsonSerializer.Deserialize<List<VideoMaeSegment>>(json, JsonOpts);
+                    if (segments != null)
+                    {
+                        result[imgId] = segments.Select(s => new SegmentDto
+                        {
+                            Start = s.Start,
+                            End = s.End,
+                            Movements = s.Movements?.Select(m => new SegmentMovementDto
+                            {
+                                Label = m.Label,
+                                Confidence = m.Confidence,
+                            }).ToList() ?? new List<SegmentMovementDto>(),
+                        }).ToList();
+                    }
+                }
+            }
+            catch (Npgsql.PostgresException ex) when (ex.SqlState == "42P01")
+            {
+                // Table doesn't exist yet — no segments stored
+            }
+
+            return result;
+        }
+
+        private async Task EnsureSegmentsTableAsync(CancellationToken ct)
+        {
+            const string sql = @"
+CREATE TABLE IF NOT EXISTS frl.frl_image_analysis_segments (
+    imageid INTEGER PRIMARY KEY,
+    segments_json JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        private async Task StoreSegmentsAsync(
+            int imageId, List<VideoMaeSegment>? segments, CancellationToken ct)
+        {
+            if (segments == null || segments.Count == 0) return;
+
+            var json = JsonSerializer.Serialize(segments, JsonOpts);
+
+            const string sql = @"
+INSERT INTO frl.frl_image_analysis_segments (imageid, segments_json)
+VALUES (@imageid, @segments::jsonb)
+ON CONFLICT (imageid) DO UPDATE SET segments_json = @segments::jsonb, created_at = NOW();";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@imageid", imageId);
+            cmd.Parameters.AddWithValue("@segments", json);
+
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
         // ── DTOs ───────────────────────────────────────────────────────
 
         public sealed class QueueItem
@@ -1223,6 +1318,7 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
             public float Confidence { get; set; }
             public string Status { get; set; } = "";
             public List<ImageMovementInfo> AllMovements { get; set; } = new();
+            public List<SegmentDto>? Segments { get; set; }
         }
 
         public sealed class TagClipsResponse
@@ -1305,6 +1401,9 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
         {
             [JsonPropertyName("overall_movements")]
             public List<VideoMaeMovement>? OverallMovements { get; set; }
+
+            [JsonPropertyName("segments")]
+            public List<VideoMaeSegment>? Segments { get; set; }
         }
 
         private sealed class VideoMaeMovement
@@ -1313,6 +1412,31 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
             public string Label { get; set; } = "";
 
             [JsonPropertyName("confidence")]
+            public double Confidence { get; set; }
+        }
+
+        private sealed class VideoMaeSegment
+        {
+            [JsonPropertyName("start")]
+            public double Start { get; set; }
+
+            [JsonPropertyName("end")]
+            public double End { get; set; }
+
+            [JsonPropertyName("movements")]
+            public List<VideoMaeMovement>? Movements { get; set; }
+        }
+
+        public sealed class SegmentDto
+        {
+            public double Start { get; set; }
+            public double End { get; set; }
+            public List<SegmentMovementDto> Movements { get; set; } = new();
+        }
+
+        public sealed class SegmentMovementDto
+        {
+            public string Label { get; set; } = "";
             public double Confidence { get; set; }
         }
     }
