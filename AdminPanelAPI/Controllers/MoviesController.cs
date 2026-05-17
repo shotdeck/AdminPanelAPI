@@ -97,13 +97,18 @@ LEFT JOIN (
     GROUP BY movieid
 ) cc ON cc.movieid = m.idnum
 LEFT JOIN (
-    SELECT i.movieid,
-           COUNT(DISTINCT cm.imageid) AS qc_total,
-           COUNT(DISTINCT cm.imageid) FILTER (WHERE cm.status IN ('ok', 'bad', 'flagged')) AS qc_checked
-    FROM frl.frl_join_image_camera_movements cm
-    INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
-    WHERE i.status = 'live'
-    GROUP BY i.movieid
+    SELECT sub.movieid,
+           COUNT(*) AS qc_total,
+           COUNT(*) FILTER (WHERE sub.all_checked) AS qc_checked
+    FROM (
+        SELECT i.movieid, cm.imageid,
+               bool_and(cm.status IN ('ok', 'bad', 'flagged')) AS all_checked
+        FROM frl.frl_join_image_camera_movements cm
+        INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
+        WHERE i.status = 'live'
+        GROUP BY i.movieid, cm.imageid
+    ) sub
+    GROUP BY sub.movieid
 ) qc ON qc.movieid = m.idnum
 {whereStr}
 ORDER BY m.title ASC
