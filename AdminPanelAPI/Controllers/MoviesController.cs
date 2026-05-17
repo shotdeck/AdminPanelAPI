@@ -125,12 +125,13 @@ LIMIT @limit OFFSET @offset;";
                 {
                     var qcTotal = Convert.ToInt32(reader["qc_total"]);
                     var qcChecked = Convert.ToInt32(reader["qc_checked"]);
+                    var clipCount = Convert.ToInt32(reader["clip_count"]);
                     string qcStatus;
                     if (qcTotal == 0)
                         qcStatus = "none";
                     else if (qcChecked == 0)
                         qcStatus = "not_started";
-                    else if (qcChecked >= qcTotal)
+                    else if (qcChecked >= clipCount)
                         qcStatus = "processed";
                     else
                         qcStatus = "partial";
