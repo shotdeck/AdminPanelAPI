@@ -977,7 +977,25 @@ WHERE imageid = @imageid AND movement = @movement;";
                 cmd.Parameters.AddWithValue("@imageid", item.ImageId);
                 cmd.Parameters.AddWithValue("@movement", item.Movement);
 
-                updated += await cmd.ExecuteNonQueryAsync(ct);
+                var rows = await cmd.ExecuteNonQueryAsync(ct);
+                updated += rows;
+
+                if (rows > 0)
+                {
+                    var action = item.Status switch
+                    {
+                        "ok" => "confirmed",
+                        "bad" => "rejected",
+                        "flagged" => "flagged",
+                        _ => (string?)null,
+                    };
+                    if (action != null)
+                    {
+                        await LogQcActionAsync(
+                            item.ImageId, action, item.Movement, null,
+                            item.Confidence, ct);
+                    }
+                }
             }
 
             return Ok(new ReviewResponse { Updated = updated });
@@ -1055,6 +1073,20 @@ ORDER BY movement;";
 
             await EnsureOpenAsync(ct);
 
+            // Fetch confidence before deleting
+            float? confidence = null;
+            {
+                const string lookupSql = @"
+SELECT confidence FROM frl.frl_join_image_camera_movements
+WHERE imageid = @imageid AND movement = @movement LIMIT 1;";
+                await using var lookupCmd = new NpgsqlCommand(lookupSql, _connection);
+                lookupCmd.Parameters.AddWithValue("@imageid", request.ImageId);
+                lookupCmd.Parameters.AddWithValue("@movement", request.OldMovement);
+                var val = await lookupCmd.ExecuteScalarAsync(ct);
+                if (val is float f) confidence = f;
+                else if (val is double d) confidence = (float)d;
+            }
+
             // Delete old row + insert new one (movement is part of the PK)
             const string sql = @"
 WITH deleted AS (
@@ -1074,6 +1106,13 @@ ON CONFLICT (imageid, movement) DO UPDATE SET status = 'ok', updated_at = now();
 
             var rows = await cmd.ExecuteNonQueryAsync(ct);
 
+            if (rows > 0)
+            {
+                await LogQcActionAsync(
+                    request.ImageId, "reassigned", request.OldMovement,
+                    request.NewMovement, confidence, ct);
+            }
+
             return Ok(new ReassignResponse { Updated = rows > 0 });
         }
 
@@ -1090,6 +1129,20 @@ ON CONFLICT (imageid, movement) DO UPDATE SET status = 'ok', updated_at = now();
 
             await EnsureOpenAsync(ct);
 
+            // Fetch confidence before deleting
+            float? confidence = null;
+            {
+                const string lookupSql = @"
+SELECT confidence FROM frl.frl_join_image_camera_movements
+WHERE imageid = @imageid AND movement = @movement LIMIT 1;";
+                await using var lookupCmd = new NpgsqlCommand(lookupSql, _connection);
+                lookupCmd.Parameters.AddWithValue("@imageid", request.ImageId);
+                lookupCmd.Parameters.AddWithValue("@movement", request.Movement);
+                var val = await lookupCmd.ExecuteScalarAsync(ct);
+                if (val is float f) confidence = f;
+                else if (val is double d) confidence = (float)d;
+            }
+
             const string sql = @"
 DELETE FROM frl.frl_join_image_camera_movements
 WHERE imageid = @imageid AND movement = @movement;";
@@ -1099,6 +1152,13 @@ WHERE imageid = @imageid AND movement = @movement;";
             cmd.Parameters.AddWithValue("@movement", request.Movement);
 
             var rows = await cmd.ExecuteNonQueryAsync(ct);
+
+            if (rows > 0)
+            {
+                await LogQcActionAsync(
+                    request.ImageId, "deleted", request.Movement, null,
+                    confidence, ct);
+            }
 
             return Ok(new DeleteTagResponse { Deleted = rows > 0 });
         }
@@ -1127,7 +1187,78 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
 
             var rows = await cmd.ExecuteNonQueryAsync(ct);
 
+            if (rows > 0)
+            {
+                await LogQcActionAsync(
+                    request.ImageId, "added", null, request.Movement,
+                    null, ct);
+            }
+
             return Ok(new AddTagResponse { Added = rows > 0 });
+        }
+
+        // ── GET /api/admin/camera-movements/training-export ──────────
+        // Returns all QC audit log entries for model retraining.
+        [HttpGet("training-export")]
+        [ProducesResponseType(typeof(TrainingExportResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<TrainingExportResponse>> TrainingExport(
+            [FromQuery] string? action = null,
+            [FromQuery] string? since = null,
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureAuditLogTableAsync(ct);
+
+            var conditions = new List<string>();
+            var parameters = new List<NpgsqlParameter>();
+
+            if (!string.IsNullOrWhiteSpace(action))
+            {
+                conditions.Add("action = @action");
+                parameters.Add(new NpgsqlParameter("@action", action));
+            }
+            if (!string.IsNullOrWhiteSpace(since) && DateTime.TryParse(since, out var sinceDate))
+            {
+                conditions.Add("created_at >= @since");
+                parameters.Add(new NpgsqlParameter("@since", sinceDate));
+            }
+
+            var where = conditions.Count > 0
+                ? "WHERE " + string.Join(" AND ", conditions)
+                : "";
+
+            var sql = $@"
+SELECT id, imageid, action, original_movement, corrected_movement, confidence, created_at
+FROM frl.frl_qc_training_log
+{where}
+ORDER BY created_at DESC;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            foreach (var p in parameters)
+                cmd.Parameters.Add(p);
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var entries = new List<TrainingLogEntry>();
+            while (await reader.ReadAsync(ct))
+            {
+                entries.Add(new TrainingLogEntry
+                {
+                    Id = reader.GetInt32(0),
+                    ImageId = reader.GetInt32(1),
+                    Action = reader.GetString(2),
+                    OriginalMovement = reader.IsDBNull(3) ? null : reader.GetString(3),
+                    CorrectedMovement = reader.IsDBNull(4) ? null : reader.GetString(4),
+                    Confidence = reader.IsDBNull(5) ? null : reader.GetFloat(5),
+                    CreatedAt = reader.GetDateTime(6).ToString("o"),
+                });
+            }
+
+            return Ok(new TrainingExportResponse
+            {
+                Entries = entries,
+                TotalCount = entries.Count,
+            });
         }
 
         // ── Helpers ────────────────────────────────────────────────────
@@ -1228,6 +1359,42 @@ ON CONFLICT (imageid) DO UPDATE SET segments_json = @segments::jsonb, created_at
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@imageid", imageId);
             cmd.Parameters.AddWithValue("@segments", json);
+
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        private async Task EnsureAuditLogTableAsync(CancellationToken ct)
+        {
+            const string sql = @"
+CREATE TABLE IF NOT EXISTS frl.frl_qc_training_log (
+    id SERIAL PRIMARY KEY,
+    imageid INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    original_movement TEXT,
+    corrected_movement TEXT,
+    confidence REAL,
+    created_at TIMESTAMP DEFAULT NOW()
+);";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        private async Task LogQcActionAsync(
+            int imageId, string action, string? originalMovement,
+            string? correctedMovement, float? confidence, CancellationToken ct)
+        {
+            await EnsureAuditLogTableAsync(ct);
+
+            const string sql = @"
+INSERT INTO frl.frl_qc_training_log (imageid, action, original_movement, corrected_movement, confidence)
+VALUES (@imageid, @action, @original, @corrected, @confidence);";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@imageid", imageId);
+            cmd.Parameters.AddWithValue("@action", action);
+            cmd.Parameters.AddWithValue("@original", (object?)originalMovement ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@corrected", (object?)correctedMovement ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@confidence", (object?)confidence ?? DBNull.Value);
 
             await cmd.ExecuteNonQueryAsync(ct);
         }
@@ -1336,6 +1503,7 @@ ON CONFLICT (imageid) DO UPDATE SET segments_json = @segments::jsonb, created_at
             public int ImageId { get; set; }
             public string Movement { get; set; } = "";
             public string Status { get; set; } = "";
+            public float? Confidence { get; set; }
         }
 
         public sealed class ReviewRequest
@@ -1438,6 +1606,23 @@ ON CONFLICT (imageid) DO UPDATE SET segments_json = @segments::jsonb, created_at
         {
             public string Label { get; set; } = "";
             public double Confidence { get; set; }
+        }
+
+        public sealed class TrainingLogEntry
+        {
+            public int Id { get; set; }
+            public int ImageId { get; set; }
+            public string Action { get; set; } = "";
+            public string? OriginalMovement { get; set; }
+            public string? CorrectedMovement { get; set; }
+            public float? Confidence { get; set; }
+            public string CreatedAt { get; set; } = "";
+        }
+
+        public sealed class TrainingExportResponse
+        {
+            public List<TrainingLogEntry> Entries { get; set; } = new();
+            public int TotalCount { get; set; }
         }
     }
 }
