@@ -206,10 +206,10 @@ namespace AdminPanelAPI.Helpers
         {
             input = Clean(input);
             if (input == null) return null;
-            return input switch
+            return input.ToLowerInvariant() switch
             {
-                "Interior" => "This is an interior shot",
-                "Exterior" => "This is an exterior shot",
+                "interior" => "This is an interior shot",
+                "exterior" => "This is an exterior shot",
                 _ => null
             };
         }

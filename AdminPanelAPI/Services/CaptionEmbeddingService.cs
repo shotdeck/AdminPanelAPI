@@ -148,6 +148,73 @@ namespace AdminPanelAPI.Services
                 jobId, processed, failed, total);
         }
 
+        public async Task<CaptionEmbeddingResult> ProcessSingleImageAsync(
+            int imageId,
+            CancellationToken cancellationToken)
+        {
+            var result = new CaptionEmbeddingResult { ImageId = imageId };
+
+            try
+            {
+                var rec = await _repo.GetImageByIdAsync(imageId, cancellationToken);
+                if (rec == null)
+                {
+                    result.Status = "Failed";
+                    result.Error = $"Image {imageId} not found in frl_images.";
+                    return result;
+                }
+
+                if (rec.Filename == null)
+                {
+                    result.Status = "Failed";
+                    result.Error = $"Image {imageId} has no filename.";
+                    return result;
+                }
+
+                var imageIds = new List<int> { rec.Id };
+                var movieIds = rec.MovieId.HasValue
+                    ? new List<int> { rec.MovieId.Value }
+                    : new List<int>();
+
+                var gender = await _repo.FetchTagsAsync("frl_join_images_gender", "gender", imageIds, cancellationToken);
+                var subjectAge = await _repo.FetchTagsAsync("frl_join_images_subject_age", "subject_age", imageIds, cancellationToken);
+                var subjectEth = await _repo.FetchTagsAsync("frl_join_images_subject_ethnicity", "subject_ethnicity", imageIds, cancellationToken);
+                var frameSize = await _repo.FetchTagsAsync("frl_join_images_frame_size", "frame_size", imageIds, cancellationToken);
+                var tags = await _repo.FetchTagsAsync("frl_join_images_tags", "tag", imageIds, cancellationToken);
+                var timeOfDay = await _repo.FetchTagsAsync("frl_join_images_time_of_day", "time_of_day", imageIds, cancellationToken);
+                var movieFields = await _repo.FetchMovieFieldsAsync(movieIds, cancellationToken);
+
+                var httpClient = _httpClientFactory.CreateClient();
+                httpClient.Timeout = TimeSpan.FromMinutes(5);
+
+                var imageBytes = await DownloadImageAsync(httpClient, rec.Filename, cancellationToken);
+                var caption = await GetImageCaptionAsync(httpClient, imageBytes, rec.Filename, cancellationToken);
+                var embeddings = await GetImageEmbeddingAsync(httpClient, imageBytes, rec.Filename, cancellationToken);
+
+                var metadata = KeywordMetadataBuilder.BuildMetadata(
+                    rec, gender, subjectAge, subjectEth,
+                    frameSize, tags, timeOfDay, movieFields);
+
+                await InsertCaptionEmbeddingAsync(
+                    rec.Id, rec.Randid, caption, embeddings, metadata, cancellationToken);
+
+                result.Status = "Completed";
+                result.Caption = caption;
+                result.KeywordMetadata = metadata;
+                result.EmbeddingLength = embeddings.Length;
+
+                _logger.LogInformation("Processed single image {ImageId} successfully.", imageId);
+            }
+            catch (Exception ex)
+            {
+                result.Status = "Failed";
+                result.Error = ex.Message;
+                _logger.LogError(ex, "Failed to process single image {ImageId}.", imageId);
+            }
+
+            return result;
+        }
+
         private async Task<byte[]> DownloadImageAsync(
             HttpClient httpClient,
             string filename,
