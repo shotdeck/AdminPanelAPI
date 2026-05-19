@@ -1,3 +1,5 @@
+using AdminPanelAPI.Helpers;
+using AdminPanelAPI.Models;
 using Npgsql;
 using NpgsqlTypes;
 using System.Net.Http.Headers;
@@ -53,7 +55,7 @@ namespace AdminPanelAPI.Services
 
             await _repo.UpdateProgressAsync(jobId, "Fetching unprocessed images", null, null, cancellationToken);
 
-            var images = await _repo.GetUnprocessedImageIdsAsync(batchSize, cancellationToken);
+            var images = await _repo.GetUnprocessedImagesAsync(batchSize, cancellationToken);
 
             if (images.Count == 0)
             {
@@ -66,37 +68,63 @@ namespace AdminPanelAPI.Services
             var processed = 0;
             var failed = 0;
 
+            // Pre-fetch metadata for the whole batch
+            await _repo.UpdateProgressAsync(jobId, "Fetching tags and movie metadata", null, null, cancellationToken);
+
+            var imageIds = images.Select(r => r.Id).ToList();
+            var movieIds = images.Where(r => r.MovieId.HasValue).Select(r => r.MovieId!.Value).Distinct().ToList();
+
+            var gender = await _repo.FetchTagsAsync("frl_join_images_gender", "gender", imageIds, cancellationToken);
+            var subjectAge = await _repo.FetchTagsAsync("frl_join_images_subject_age", "subject_age", imageIds, cancellationToken);
+            var subjectEth = await _repo.FetchTagsAsync("frl_join_images_subject_ethnicity", "subject_ethnicity", imageIds, cancellationToken);
+            var frameSize = await _repo.FetchTagsAsync("frl_join_images_frame_size", "frame_size", imageIds, cancellationToken);
+            var tags = await _repo.FetchTagsAsync("frl_join_images_tags", "tag", imageIds, cancellationToken);
+            var timeOfDay = await _repo.FetchTagsAsync("frl_join_images_time_of_day", "time_of_day", imageIds, cancellationToken);
+            var movieFields = await _repo.FetchMovieFieldsAsync(movieIds, cancellationToken);
+
             await _repo.UpdateProgressAsync(jobId, "Processing images", 0, total, cancellationToken);
 
             var httpClient = _httpClientFactory.CreateClient();
             httpClient.Timeout = TimeSpan.FromMinutes(5);
 
-            foreach (var (idnum, filename, randid) in images)
+            foreach (var rec in images)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                if (rec.Filename == null)
+                {
+                    failed++;
+                    _logger.LogWarning("JobId={JobId}: Skipping image {Idnum} — no filename.", jobId, rec.Id);
+                    continue;
+                }
 
                 try
                 {
                     await _repo.UpdateProgressAsync(
                         jobId,
-                        $"Processing image {processed + 1}/{total} (idnum={idnum})",
+                        $"Processing image {processed + 1}/{total} (idnum={rec.Id})",
                         processed,
                         total,
                         cancellationToken);
 
-                    var imageBytes = await DownloadImageAsync(httpClient, filename, cancellationToken);
+                    var imageBytes = await DownloadImageAsync(httpClient, rec.Filename, cancellationToken);
 
-                    var caption = await GetImageCaptionAsync(httpClient, imageBytes, filename, cancellationToken);
+                    var caption = await GetImageCaptionAsync(httpClient, imageBytes, rec.Filename, cancellationToken);
 
-                    var embeddings = await GetImageEmbeddingAsync(httpClient, imageBytes, filename, cancellationToken);
+                    var embeddings = await GetImageEmbeddingAsync(httpClient, imageBytes, rec.Filename, cancellationToken);
 
-                    await InsertCaptionEmbeddingAsync(idnum, randid, caption, embeddings, cancellationToken);
+                    var metadata = KeywordMetadataBuilder.BuildMetadata(
+                        rec, gender, subjectAge, subjectEth,
+                        frameSize, tags, timeOfDay, movieFields);
+
+                    await InsertCaptionEmbeddingAsync(
+                        rec.Id, rec.Randid, caption, embeddings, metadata, cancellationToken);
 
                     processed++;
 
                     _logger.LogInformation(
                         "JobId={JobId}: Processed image {Idnum} ({Processed}/{Total})",
-                        jobId, idnum, processed, total);
+                        jobId, rec.Id, processed, total);
                 }
                 catch (Exception ex)
                 {
@@ -104,7 +132,7 @@ namespace AdminPanelAPI.Services
                     _logger.LogError(
                         ex,
                         "JobId={JobId}: Failed to process image {Idnum}",
-                        jobId, idnum);
+                        jobId, rec.Id);
                 }
             }
 
@@ -201,11 +229,12 @@ namespace AdminPanelAPI.Services
             string? randid,
             string caption,
             float[] embeddings,
+            string? keywordMetadata,
             CancellationToken cancellationToken)
         {
             const string sql = @"
-INSERT INTO frl.frl_caption_embeddings (idnum, randid, captions, vectorized_embeddings, status)
-VALUES (@idnum, @randid, @captions, @embeddings::halfvec, 'completed')
+INSERT INTO frl.frl_caption_embeddings (idnum, randid, captions, vectorized_embeddings, keyword_vectorized_metadata, status)
+VALUES (@idnum, @randid, @captions, @embeddings::halfvec, @metadata, 'completed')
 ON CONFLICT (idnum) DO NOTHING;";
 
             await using var conn = new NpgsqlConnection(_connectionString);
@@ -218,6 +247,8 @@ ON CONFLICT (idnum) DO NOTHING;";
 
             var embeddingString = "[" + string.Join(",", embeddings) + "]";
             cmd.Parameters.AddWithValue("embeddings", embeddingString);
+            cmd.Parameters.AddWithValue("metadata",
+                (object?)keywordMetadata ?? DBNull.Value);
 
             await cmd.ExecuteNonQueryAsync(cancellationToken);
         }

@@ -16,9 +16,18 @@ public interface ICaptionEmbeddingJobRepository
         int? total,
         CancellationToken cancellationToken);
 
-    Task<List<(int Idnum, string Filename, string? Randid)>> GetUnprocessedImageIdsAsync(
+    Task<List<ImageRecord>> GetUnprocessedImagesAsync(
         int limit,
         CancellationToken cancellationToken);
+
+    Task<Dictionary<int, List<string>>> FetchTagsAsync(
+        string tableName,
+        string columnName,
+        List<int> imageIds,
+        CancellationToken cancellationToken);
+
+    Task<Dictionary<int, (string? Title, string? Year, string? Genre, string? Product, string? Brand, string? MediaType, string? Director, string? Cinematographer)>>
+        FetchMovieFieldsAsync(List<int> movieIds, CancellationToken cancellationToken);
 }
 
 public class CaptionEmbeddingJobRepository : ICaptionEmbeddingJobRepository
@@ -184,15 +193,18 @@ WHERE id = @id;";
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public async Task<List<(int Idnum, string Filename, string? Randid)>> GetUnprocessedImageIdsAsync(
+    public async Task<List<ImageRecord>> GetUnprocessedImagesAsync(
         int limit,
         CancellationToken cancellationToken)
     {
         if (limit <= 0)
-            return new List<(int, string, string?)>();
+            return new List<ImageRecord>();
 
         const string sql = @"
-SELECT i.idnum, i.filename, i.randid
+SELECT i.idnum, i.filename, i.randid, i.movieid,
+       i.format, i.optical_format, i.time_period,
+       i.setting, i.location, i.filming_location,
+       i.actors, i.int_ext
 FROM frl.frl_images i
 WHERE i.status = 'live'
   AND i.filename IS NOT NULL
@@ -204,7 +216,7 @@ WHERE i.status = 'live'
 ORDER BY i.idnum
 LIMIT @limit;";
 
-        var results = new List<(int Idnum, string Filename, string? Randid)>();
+        var results = new List<ImageRecord>();
 
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);
@@ -217,14 +229,155 @@ LIMIT @limit;";
 
         while (await reader.ReadAsync(cancellationToken))
         {
-            results.Add((
-                reader.GetInt32(reader.GetOrdinal("idnum")),
-                reader.GetString(reader.GetOrdinal("filename")),
-                reader.IsDBNull(reader.GetOrdinal("randid"))
-                    ? null : reader.GetString(reader.GetOrdinal("randid"))
-            ));
+            results.Add(new ImageRecord
+            {
+                Id = reader.GetInt32(reader.GetOrdinal("idnum")),
+                Filename = reader.IsDBNull(reader.GetOrdinal("filename"))
+                    ? null : reader.GetString(reader.GetOrdinal("filename")),
+                Randid = reader.IsDBNull(reader.GetOrdinal("randid"))
+                    ? null : reader.GetString(reader.GetOrdinal("randid")),
+                MovieId = reader.IsDBNull(reader.GetOrdinal("movieid"))
+                    ? null : reader.GetInt32(reader.GetOrdinal("movieid")),
+                Format = reader.IsDBNull(reader.GetOrdinal("format"))
+                    ? null : reader.GetValue(reader.GetOrdinal("format"))?.ToString(),
+                OpticalFormat = reader.IsDBNull(reader.GetOrdinal("optical_format"))
+                    ? null : reader.GetValue(reader.GetOrdinal("optical_format"))?.ToString(),
+                TimePeriod = reader.IsDBNull(reader.GetOrdinal("time_period"))
+                    ? null : reader.GetValue(reader.GetOrdinal("time_period"))?.ToString(),
+                Setting = reader.IsDBNull(reader.GetOrdinal("setting"))
+                    ? null : reader.GetValue(reader.GetOrdinal("setting"))?.ToString(),
+                Location = reader.IsDBNull(reader.GetOrdinal("location"))
+                    ? null : reader.GetValue(reader.GetOrdinal("location"))?.ToString(),
+                FilmingLocation = reader.IsDBNull(reader.GetOrdinal("filming_location"))
+                    ? null : reader.GetValue(reader.GetOrdinal("filming_location"))?.ToString(),
+                Actors = reader.IsDBNull(reader.GetOrdinal("actors"))
+                    ? null : reader.GetValue(reader.GetOrdinal("actors"))?.ToString(),
+                IntExt = reader.IsDBNull(reader.GetOrdinal("int_ext"))
+                    ? null : reader.GetValue(reader.GetOrdinal("int_ext"))?.ToString(),
+            });
         }
 
         return results;
+    }
+
+    public async Task<Dictionary<int, List<string>>> FetchTagsAsync(
+        string tableName,
+        string columnName,
+        List<int> imageIds,
+        CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<int, List<string>>();
+        if (imageIds.Count == 0) return result;
+
+        var allowedTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "frl_join_images_gender",
+            "frl_join_images_subject_age",
+            "frl_join_images_subject_ethnicity",
+            "frl_join_images_frame_size",
+            "frl_join_images_tags",
+            "frl_join_images_time_of_day"
+        };
+        var allowedColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "gender", "subject_age", "subject_ethnicity", "frame_size", "tag", "time_of_day"
+        };
+
+        if (!allowedTables.Contains(tableName))
+            throw new ArgumentException("Invalid table name.", nameof(tableName));
+        if (!allowedColumns.Contains(columnName))
+            throw new ArgumentException("Invalid column name.", nameof(columnName));
+
+        var sql = $@"
+SELECT imageid, {columnName}
+FROM {tableName}
+WHERE imageid = ANY(@ids);";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.Add(new NpgsqlParameter<int[]>("ids", imageIds.ToArray())
+        {
+            NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Integer
+        });
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            int imageId = reader.GetInt32(0);
+            if (!reader.IsDBNull(1))
+            {
+                var raw = reader.GetValue(1)?.ToString();
+                if (!string.IsNullOrWhiteSpace(raw) &&
+                    raw != "--" &&
+                    !raw.Equals("null", StringComparison.OrdinalIgnoreCase) &&
+                    !System.Text.RegularExpressions.Regex.IsMatch(raw, "^:+$"))
+                {
+                    if (!result.TryGetValue(imageId, out var list))
+                        result[imageId] = list = new List<string>();
+                    list.Add(raw.Trim());
+                }
+            }
+        }
+        return result;
+    }
+
+    public async Task<Dictionary<int, (string? Title, string? Year, string? Genre, string? Product, string? Brand, string? MediaType, string? Director, string? Cinematographer)>>
+        FetchMovieFieldsAsync(List<int> movieIds, CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<int, (string?, string?, string?, string?, string?, string?, string?, string?)>();
+        if (movieIds.Count == 0) return result;
+
+        const string sql = @"
+SELECT idnum, title, year, genre, comm_product, comm_brand, media_type, director, cinematographer
+FROM frl.frl_movies
+WHERE idnum = ANY(@ids);";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.Add(new NpgsqlParameter<int[]>("ids", movieIds.ToArray())
+        {
+            NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Integer
+        });
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        int ordId = reader.GetOrdinal("idnum");
+        int ordTitle = reader.GetOrdinal("title");
+        int ordYear = reader.GetOrdinal("year");
+        int ordGenre = reader.GetOrdinal("genre");
+        int ordProd = reader.GetOrdinal("comm_product");
+        int ordBrand = reader.GetOrdinal("comm_brand");
+        int ordMedia = reader.GetOrdinal("media_type");
+        int ordDirector = reader.GetOrdinal("director");
+        int ordCinematographer = reader.GetOrdinal("cinematographer");
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            int id = reader.GetInt32(ordId);
+            string? t = reader.IsDBNull(ordTitle) ? null : reader.GetValue(ordTitle)?.ToString();
+            string? y = reader.IsDBNull(ordYear) ? null : reader.GetValue(ordYear)?.ToString();
+            string? g = reader.IsDBNull(ordGenre) ? null : reader.GetValue(ordGenre)?.ToString();
+            string? p = reader.IsDBNull(ordProd) ? null : reader.GetValue(ordProd)?.ToString();
+            string? b = reader.IsDBNull(ordBrand) ? null : reader.GetValue(ordBrand)?.ToString();
+            string? mt = reader.IsDBNull(ordMedia) ? null : reader.GetValue(ordMedia)?.ToString();
+            string? d = reader.IsDBNull(ordDirector) ? null : reader.GetValue(ordDirector)?.ToString();
+            string? c = reader.IsDBNull(ordCinematographer) ? null : reader.GetValue(ordCinematographer)?.ToString();
+
+            result[id] = (
+                AdminPanelAPI.Helpers.KeywordMetadataBuilder.Clean(t),
+                AdminPanelAPI.Helpers.KeywordMetadataBuilder.Clean(y),
+                AdminPanelAPI.Helpers.KeywordMetadataBuilder.Clean(g),
+                AdminPanelAPI.Helpers.KeywordMetadataBuilder.Clean(p),
+                AdminPanelAPI.Helpers.KeywordMetadataBuilder.Clean(b),
+                AdminPanelAPI.Helpers.KeywordMetadataBuilder.Clean(mt),
+                AdminPanelAPI.Helpers.KeywordMetadataBuilder.Clean(d),
+                AdminPanelAPI.Helpers.KeywordMetadataBuilder.Clean(c)
+            );
+        }
+        return result;
     }
 }
