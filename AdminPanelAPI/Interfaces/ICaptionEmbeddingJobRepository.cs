@@ -20,6 +20,10 @@ public interface ICaptionEmbeddingJobRepository
         int limit,
         CancellationToken cancellationToken);
 
+    Task<ImageRecord?> GetImageByIdAsync(
+        int imageId,
+        CancellationToken cancellationToken);
+
     Task<Dictionary<int, List<string>>> FetchTagsAsync(
         string tableName,
         string columnName,
@@ -260,6 +264,59 @@ LIMIT @limit;";
         return results;
     }
 
+    public async Task<ImageRecord?> GetImageByIdAsync(
+        int imageId,
+        CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT i.idnum, i.filename, i.randid, i.movieid,
+       i.format, i.optical_format, i.time_period,
+       i.setting, i.location, i.filming_location,
+       i.actors, i.int_ext
+FROM frl.frl_images i
+WHERE i.idnum = @imageId;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("imageId", imageId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        if (await reader.ReadAsync(cancellationToken))
+        {
+            return new ImageRecord
+            {
+                Id = reader.GetInt32(reader.GetOrdinal("idnum")),
+                Filename = reader.IsDBNull(reader.GetOrdinal("filename"))
+                    ? null : reader.GetString(reader.GetOrdinal("filename")),
+                Randid = reader.IsDBNull(reader.GetOrdinal("randid"))
+                    ? null : reader.GetString(reader.GetOrdinal("randid")),
+                MovieId = reader.IsDBNull(reader.GetOrdinal("movieid"))
+                    ? null : reader.GetInt32(reader.GetOrdinal("movieid")),
+                Format = reader.IsDBNull(reader.GetOrdinal("format"))
+                    ? null : reader.GetValue(reader.GetOrdinal("format"))?.ToString(),
+                OpticalFormat = reader.IsDBNull(reader.GetOrdinal("optical_format"))
+                    ? null : reader.GetValue(reader.GetOrdinal("optical_format"))?.ToString(),
+                TimePeriod = reader.IsDBNull(reader.GetOrdinal("time_period"))
+                    ? null : reader.GetValue(reader.GetOrdinal("time_period"))?.ToString(),
+                Setting = reader.IsDBNull(reader.GetOrdinal("setting"))
+                    ? null : reader.GetValue(reader.GetOrdinal("setting"))?.ToString(),
+                Location = reader.IsDBNull(reader.GetOrdinal("location"))
+                    ? null : reader.GetValue(reader.GetOrdinal("location"))?.ToString(),
+                FilmingLocation = reader.IsDBNull(reader.GetOrdinal("filming_location"))
+                    ? null : reader.GetValue(reader.GetOrdinal("filming_location"))?.ToString(),
+                Actors = reader.IsDBNull(reader.GetOrdinal("actors"))
+                    ? null : reader.GetValue(reader.GetOrdinal("actors"))?.ToString(),
+                IntExt = reader.IsDBNull(reader.GetOrdinal("int_ext"))
+                    ? null : reader.GetValue(reader.GetOrdinal("int_ext"))?.ToString(),
+            };
+        }
+
+        return null;
+    }
+
     public async Task<Dictionary<int, List<string>>> FetchTagsAsync(
         string tableName,
         string columnName,
@@ -290,7 +347,7 @@ LIMIT @limit;";
 
         var sql = $@"
 SELECT imageid, {columnName}
-FROM {tableName}
+FROM frl.{tableName}
 WHERE imageid = ANY(@ids);";
 
         await using var conn = new NpgsqlConnection(_connectionString);

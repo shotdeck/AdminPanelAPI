@@ -8,13 +8,29 @@ namespace AdminPanelAPI.Controllers
     {
         private readonly ICaptionEmbeddingJobRepository _jobRepository;
         private readonly ICaptionEmbeddingJobQueue _jobQueue;
+        private readonly ICaptionEmbeddingService _service;
 
         public CaptionEmbeddingController(
             ICaptionEmbeddingJobRepository jobRepository,
-            ICaptionEmbeddingJobQueue jobQueue)
+            ICaptionEmbeddingJobQueue jobQueue,
+            ICaptionEmbeddingService service)
         {
             _jobRepository = jobRepository;
             _jobQueue = jobQueue;
+            _service = service;
+        }
+
+        [HttpPost("process/{imageId:int}")]
+        public async Task<IActionResult> ProcessSingleImage(
+            int imageId,
+            CancellationToken cancellationToken = default)
+        {
+            var result = await _service.ProcessSingleImageAsync(imageId, cancellationToken);
+
+            if (result.Status == "Failed" && result.Error?.Contains("not found") == true)
+                return NotFound(result);
+
+            return Ok(result);
         }
 
         [HttpPost("start-batch")]
