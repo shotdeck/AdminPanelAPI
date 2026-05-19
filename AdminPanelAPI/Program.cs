@@ -49,6 +49,12 @@ builder.Services.AddScoped<IMovieProcessingService, MovieProcessingService>();
 
 builder.Services.AddHostedService<MovieProcessingWorker>();
 
+// Caption embedding batch processing
+builder.Services.AddSingleton<ICaptionEmbeddingJobQueue, CaptionEmbeddingJobQueue>();
+builder.Services.AddScoped<ICaptionEmbeddingJobRepository, CaptionEmbeddingJobRepository>();
+builder.Services.AddScoped<ICaptionEmbeddingService, CaptionEmbeddingService>();
+builder.Services.AddHostedService<CaptionEmbeddingWorker>();
+
 
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
