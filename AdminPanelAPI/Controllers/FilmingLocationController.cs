@@ -54,16 +54,17 @@ WHERE i.filming_location IS NOT NULL
                 var processed = 0;
                 var skipped = 0;
                 var failed = 0;
-                var offset = 0;
+                var lastId = 0;
 
-                while (offset < totalImages)
+                while (true)
                 {
                     ct.ThrowIfCancellationRequested();
 
                     var fetchSql = @"
 SELECT i.idnum, i.filming_location
 FROM frl.frl_images i
-WHERE i.filming_location IS NOT NULL
+WHERE i.idnum > @lastId
+  AND i.filming_location IS NOT NULL
   AND TRIM(i.filming_location) <> ''
   AND TRIM(i.filming_location) <> ':::::'
   AND NOT EXISTS (
@@ -73,6 +74,7 @@ ORDER BY i.idnum
 LIMIT @limit;";
 
                     await using var fetchCmd = new NpgsqlCommand(fetchSql, _connection);
+                    fetchCmd.Parameters.AddWithValue("@lastId", lastId);
                     fetchCmd.Parameters.AddWithValue("@limit", batchSize);
 
                     var batch = new List<(int imageId, string rawLocation)>();
@@ -126,7 +128,7 @@ ON CONFLICT DO NOTHING;";
                         }
                     }
 
-                    offset += batch.Count;
+                    lastId = batch.Max(b => b.imageId);
                 }
 
                 return Ok(new ParseProgressResponse
