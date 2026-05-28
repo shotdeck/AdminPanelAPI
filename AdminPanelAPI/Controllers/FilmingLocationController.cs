@@ -61,6 +61,13 @@ namespace AdminPanelAPI.Controllers
             ["The Arctic"] = "Antarctica",
             ["Scandinavia"] = "Europe",
             ["America"] = "North America",
+            // Oceans
+            ["Atlantic"] = "Atlantic Ocean",
+            ["Pacific"] = "Pacific Ocean",
+            ["Indian Ocean"] = "Indian Ocean",
+            ["Arctic"] = "Arctic Ocean",
+            ["Southern Ocean"] = "Southern Ocean",
+            ["Antarctic Ocean"] = "Southern Ocean",
         };
 
         private static readonly Dictionary<string, string> CountryCorrections = new(StringComparer.OrdinalIgnoreCase)
