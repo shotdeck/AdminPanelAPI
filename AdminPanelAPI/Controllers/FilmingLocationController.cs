@@ -153,6 +153,7 @@ namespace AdminPanelAPI.Controllers
 
             try
             {
+                var planetCache = await LoadLookupCacheAsync("frl_location_planets", ct);
                 var continentCache = await LoadLookupCacheAsync("frl_location_continents", ct);
                 var countryCache = await LoadLookupCacheAsync("frl_location_countries", ct);
                 var regionCache = await LoadRegionCacheAsync(ct);
@@ -209,6 +210,7 @@ LIMIT @limit;";
 
                     // Phase 1: Parse all rows in-memory, resolve lookups with cache-first approach
                     var pendingInserts = new List<ParsedRow>();
+                    var newPlanets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     var newCountries = new Dictionary<string, (string name, int? continentId)>(StringComparer.OrdinalIgnoreCase);
                     var newRegions = new Dictionary<string, (string name, int countryId)>(StringComparer.OrdinalIgnoreCase);
                     var newCities = new Dictionary<string, (string name, string? regionKey, int countryId)>(StringComparer.OrdinalIgnoreCase);
@@ -222,6 +224,23 @@ LIMIT @limit;";
 
                             var minConfidence = 1.0f;
                             var needsReview = false;
+
+                            // Resolve planet
+                            int? planetId = null;
+                            var planetName = NullIfEmpty(parts.Planet);
+                            if (planetName != null)
+                            {
+                                var (pId, pConf) = ResolveWithFuzzy(planetName, planetCache);
+                                planetId = pId;
+                                if (pConf < minConfidence) minConfidence = pConf;
+                                if (pConf < 1.0f && pId != null) fuzzyMatched++;
+                                if (pId == null)
+                                {
+                                    var pKey = planetName.ToLowerInvariant();
+                                    if (!newPlanets.ContainsKey(pKey))
+                                        newPlanets[pKey] = planetName.Trim();
+                                }
+                            }
 
                             var correctedContinent = CorrectValue(parts.Continent, ContinentCorrections);
                             int? continentId = null;
@@ -273,6 +292,8 @@ LIMIT @limit;";
                             {
                                 ImageId = imageId,
                                 RawLocation = rawLocation.Trim(),
+                                PlanetId = planetId,
+                                PlanetName = planetName,
                                 ContinentId = continentId,
                                 CountryId = countryId,
                                 CorrectedCountry = correctedCountry,
@@ -291,8 +312,9 @@ LIMIT @limit;";
                         }
                     }
 
-                    // Phase 2: Bulk-create any new countries, regions, cities
+                    // Phase 2: Bulk-create any new planets, countries, regions, cities
                     // Accumulate new cache entries in temp dicts; merge only after commit
+                    var batchPlanetCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                     var batchCountryCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                     var batchRegionCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                     var batchCityCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -300,6 +322,19 @@ LIMIT @limit;";
                     await using var tx = await _connection.BeginTransactionAsync(ct);
                     try
                     {
+                        foreach (var (key, name) in newPlanets)
+                        {
+                            var sql = @"
+INSERT INTO frl.frl_location_planets (name)
+VALUES (@name)
+ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+RETURNING id;";
+                            await using var cmd = new NpgsqlCommand(sql, _connection);
+                            cmd.Parameters.AddWithValue("@name", name);
+                            var id = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
+                            batchPlanetCache[key] = id;
+                        }
+
                         foreach (var (key, (name, continentId)) in newCountries)
                         {
                             var id = await GetOrCreateCountryAsync(name, continentId, ct);
@@ -340,11 +375,21 @@ LIMIT @limit;";
                         if (pendingInserts.Count > 0)
                         {
                             await using var writer = await _connection.BeginBinaryImportAsync(
-                                "COPY frl.frl_images_location (image_id, raw_location, continent_id, country_id, region_id, city_id, specific_location, confidence, needs_review) FROM STDIN (FORMAT BINARY)",
+                                "COPY frl.frl_images_location (image_id, raw_location, planet_id, continent_id, country_id, region_id, city_id, specific_location, confidence, needs_review) FROM STDIN (FORMAT BINARY)",
                                 ct);
 
                             foreach (var row in pendingInserts)
                             {
+                                // Resolve planet_id
+                                var resolvedPlanetId = row.PlanetId;
+                                if (resolvedPlanetId == null && row.PlanetName != null)
+                                {
+                                    var pk = row.PlanetName.ToLowerInvariant();
+                                    if (planetCache.TryGetValue(pk, out var rpid) ||
+                                        batchPlanetCache.TryGetValue(pk, out rpid))
+                                        resolvedPlanetId = rpid;
+                                }
+
                                 // Use stored CountryId from Phase 1 (handles fuzzy matches);
                                 // fall back to cache lookup for newly-created countries
                                 var countryId = row.CountryId;
@@ -376,6 +421,7 @@ LIMIT @limit;";
                                 await writer.StartRowAsync(ct);
                                 await writer.WriteAsync(row.ImageId, NpgsqlDbType.Integer, ct);
                                 await writer.WriteAsync(row.RawLocation, NpgsqlDbType.Text, ct);
+                                await WriteNullableIntAsync(writer, resolvedPlanetId, ct);
                                 await WriteNullableIntAsync(writer, row.ContinentId, ct);
                                 await WriteNullableIntAsync(writer, countryId, ct);
                                 await WriteNullableIntAsync(writer, regionId, ct);
@@ -396,6 +442,7 @@ LIMIT @limit;";
                         await tx.CommitAsync(ct);
 
                         // Merge batch caches into main caches only after successful commit
+                        foreach (var (k, v) in batchPlanetCache) planetCache[k] = v;
                         foreach (var (k, v) in batchCountryCache) countryCache[k] = v;
                         foreach (var (k, v) in batchRegionCache) regionCache[k] = v;
                         foreach (var (k, v) in batchCityCache) cityCache[k] = v;
@@ -453,12 +500,13 @@ LIMIT @limit;";
                 var offset = (page - 1) * pageSize;
                 var dataSql = @"
 SELECT l.id, l.image_id, l.raw_location,
-       co.name AS continent_name, c.name AS country_name,
+       p.name AS planet_name, co.name AS continent_name, c.name AS country_name,
        r.name AS region_name, ci.name AS city_name,
        l.specific_location, l.confidence, l.needs_review,
-       l.continent_id, l.country_id, l.region_id, l.city_id,
+       l.planet_id, l.continent_id, l.country_id, l.region_id, l.city_id,
        l.coordinates, l.created_at, l.updated_at
 FROM frl.frl_images_location l
+LEFT JOIN frl.frl_location_planets p ON p.id = l.planet_id
 LEFT JOIN frl.frl_location_continents co ON co.id = l.continent_id
 LEFT JOIN frl.frl_location_countries c ON c.id = l.country_id
 LEFT JOIN frl.frl_location_regions r ON r.id = l.region_id
@@ -569,12 +617,13 @@ LEFT JOIN frl.frl_location_cities ci ON ci.id = l.city_id
                 var offset = (page - 1) * pageSize;
                 var dataSql = $@"
 SELECT l.id, l.image_id, l.raw_location,
-       co.name AS continent_name, c.name AS country_name,
+       p.name AS planet_name, co.name AS continent_name, c.name AS country_name,
        r.name AS region_name, ci.name AS city_name,
        l.specific_location, l.confidence, l.needs_review,
-       l.continent_id, l.country_id, l.region_id, l.city_id,
+       l.planet_id, l.continent_id, l.country_id, l.region_id, l.city_id,
        l.coordinates, l.created_at, l.updated_at
 FROM frl.frl_images_location l
+LEFT JOIN frl.frl_location_planets p ON p.id = l.planet_id
 LEFT JOIN frl.frl_location_continents co ON co.id = l.continent_id
 LEFT JOIN frl.frl_location_countries c ON c.id = l.country_id
 LEFT JOIN frl.frl_location_regions r ON r.id = l.region_id
@@ -627,12 +676,13 @@ LIMIT @limit OFFSET @offset;";
             {
                 var sql = @"
 SELECT l.id, l.image_id, l.raw_location,
-       co.name AS continent_name, c.name AS country_name,
+       p.name AS planet_name, co.name AS continent_name, c.name AS country_name,
        r.name AS region_name, ci.name AS city_name,
        l.specific_location, l.confidence, l.needs_review,
-       l.continent_id, l.country_id, l.region_id, l.city_id,
+       l.planet_id, l.continent_id, l.country_id, l.region_id, l.city_id,
        l.coordinates, l.created_at, l.updated_at
 FROM frl.frl_images_location l
+LEFT JOIN frl.frl_location_planets p ON p.id = l.planet_id
 LEFT JOIN frl.frl_location_continents co ON co.id = l.continent_id
 LEFT JOIN frl.frl_location_countries c ON c.id = l.country_id
 LEFT JOIN frl.frl_location_regions r ON r.id = l.region_id
@@ -667,15 +717,16 @@ ORDER BY l.id;";
             {
                 var sql = @"
 INSERT INTO frl.frl_images_location
-    (image_id, continent_id, country_id, region_id, city_id,
+    (image_id, planet_id, continent_id, country_id, region_id, city_id,
      specific_location, coordinates, confidence, needs_review)
 VALUES
-    (@imageId, @continentId, @countryId, @regionId, @cityId,
+    (@imageId, @planetId, @continentId, @countryId, @regionId, @cityId,
      @specificLocation, @coordinates, 1.0, FALSE)
 RETURNING id;";
 
                 await using var cmd = new NpgsqlCommand(sql, _connection);
                 cmd.Parameters.AddWithValue("@imageId", dto.ImageId);
+                cmd.Parameters.AddWithValue("@planetId", (object?)dto.PlanetId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@continentId", (object?)dto.ContinentId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@countryId", (object?)dto.CountryId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@regionId", (object?)dto.RegionId ?? DBNull.Value);
@@ -706,7 +757,8 @@ RETURNING id;";
             {
                 var sql = @"
 UPDATE frl.frl_images_location
-SET continent_id = @continentId,
+SET planet_id = @planetId,
+    continent_id = @continentId,
     country_id = @countryId,
     region_id = @regionId,
     city_id = @cityId,
@@ -719,6 +771,7 @@ RETURNING id;";
 
                 await using var cmd = new NpgsqlCommand(sql, _connection);
                 cmd.Parameters.AddWithValue("@id", id);
+                cmd.Parameters.AddWithValue("@planetId", (object?)dto.PlanetId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@continentId", (object?)dto.ContinentId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@countryId", (object?)dto.CountryId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@regionId", (object?)dto.RegionId ?? DBNull.Value);
@@ -824,8 +877,25 @@ FROM frl.frl_images_location;";
         }
 
         // ═══════════════════════════════════════════════════════════
-        //  LOOKUP endpoints – continents, countries, regions, cities
+        //  LOOKUP endpoints – planets, continents, countries, regions, cities
         // ═══════════════════════════════════════════════════════════
+
+        [HttpGet("planets")]
+        public async Task<ActionResult<List<PlanetDto>>> GetPlanets(CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            try
+            {
+                const string sql = "SELECT id, name FROM frl.frl_location_planets ORDER BY name;";
+                await using var cmd = new NpgsqlCommand(sql, _connection);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                var list = new List<PlanetDto>();
+                while (await reader.ReadAsync(ct))
+                    list.Add(new PlanetDto { Id = reader.GetInt32(0), Name = reader.GetString(1) });
+                return Ok(list);
+            }
+            finally { await _connection.CloseAsync(); }
+        }
 
         [HttpGet("continents")]
         public async Task<ActionResult<List<ContinentDto>>> GetContinents(CancellationToken ct = default)
@@ -982,6 +1052,8 @@ ORDER BY ci.name;";
         {
             public int ImageId { get; set; }
             public string RawLocation { get; set; } = string.Empty;
+            public int? PlanetId { get; set; }
+            public string? PlanetName { get; set; }
             public int? ContinentId { get; set; }
             public int? CountryId { get; set; }
             public string? CorrectedCountry { get; set; }
@@ -1157,12 +1229,13 @@ RETURNING id;";
         {
             var sql = @"
 SELECT l.id, l.image_id, l.raw_location,
-       co.name AS continent_name, c.name AS country_name,
+       p.name AS planet_name, co.name AS continent_name, c.name AS country_name,
        r.name AS region_name, ci.name AS city_name,
        l.specific_location, l.confidence, l.needs_review,
-       l.continent_id, l.country_id, l.region_id, l.city_id,
+       l.planet_id, l.continent_id, l.country_id, l.region_id, l.city_id,
        l.coordinates, l.created_at, l.updated_at
 FROM frl.frl_images_location l
+LEFT JOIN frl.frl_location_planets p ON p.id = l.planet_id
 LEFT JOIN frl.frl_location_continents co ON co.id = l.continent_id
 LEFT JOIN frl.frl_location_countries c ON c.id = l.country_id
 LEFT JOIN frl.frl_location_regions r ON r.id = l.region_id
@@ -1194,6 +1267,8 @@ WHERE l.id = @id;";
                 Id = reader.GetInt64(reader.GetOrdinal("id")),
                 ImageId = reader.GetInt32(reader.GetOrdinal("image_id")),
                 RawLocation = reader.IsDBNull(reader.GetOrdinal("raw_location")) ? null : reader.GetString(reader.GetOrdinal("raw_location")),
+                PlanetId = reader.IsDBNull(reader.GetOrdinal("planet_id")) ? null : reader.GetInt32(reader.GetOrdinal("planet_id")),
+                PlanetName = reader.IsDBNull(reader.GetOrdinal("planet_name")) ? null : reader.GetString(reader.GetOrdinal("planet_name")),
                 ContinentId = reader.IsDBNull(reader.GetOrdinal("continent_id")) ? null : reader.GetInt32(reader.GetOrdinal("continent_id")),
                 ContinentName = reader.IsDBNull(reader.GetOrdinal("continent_name")) ? null : reader.GetString(reader.GetOrdinal("continent_name")),
                 CountryId = reader.IsDBNull(reader.GetOrdinal("country_id")) ? null : reader.GetInt32(reader.GetOrdinal("country_id")),

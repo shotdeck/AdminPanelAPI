@@ -2,6 +2,12 @@ namespace AdminPanelAPI.Models
 {
     // ── Lookup table DTOs ────────────────────────────────────────
 
+    public sealed class PlanetDto
+    {
+        public int Id { get; set; }
+        public string Name { get; set; } = string.Empty;
+    }
+
     public sealed class ContinentDto
     {
         public int Id { get; set; }
@@ -41,6 +47,8 @@ namespace AdminPanelAPI.Models
         public long Id { get; set; }
         public int ImageId { get; set; }
         public string? RawLocation { get; set; }
+        public int? PlanetId { get; set; }
+        public string? PlanetName { get; set; }
         public int? ContinentId { get; set; }
         public string? ContinentName { get; set; }
         public int? CountryId { get; set; }
@@ -61,6 +69,7 @@ namespace AdminPanelAPI.Models
     public sealed class FilmingLocationCreateDto
     {
         public int ImageId { get; set; }
+        public int? PlanetId { get; set; }
         public int? ContinentId { get; set; }
         public int? CountryId { get; set; }
         public int? RegionId { get; set; }
@@ -72,6 +81,7 @@ namespace AdminPanelAPI.Models
 
     public sealed class FilmingLocationUpdateDto
     {
+        public int? PlanetId { get; set; }
         public int? ContinentId { get; set; }
         public int? CountryId { get; set; }
         public int? RegionId { get; set; }
