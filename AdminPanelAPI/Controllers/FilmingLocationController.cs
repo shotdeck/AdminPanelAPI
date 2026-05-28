@@ -61,6 +61,16 @@ namespace AdminPanelAPI.Controllers
             ["The Arctic"] = "Antarctica",
             ["Scandinavia"] = "Europe",
             ["America"] = "North America",
+            // Oceans
+            ["Atlantic"] = "Atlantic Ocean",
+            ["Pacific"] = "Pacific Ocean",
+            ["Indian Ocean"] = "Indian Ocean",
+            ["Arctic"] = "Arctic Ocean",
+            ["Southern Ocean"] = "Southern Ocean",
+            ["Antarctic Ocean"] = "Southern Ocean",
+            // Edge cases
+            ["Artic Tundra"] = "Arctic Ocean",
+            ["Open Sea"] = "Atlantic Ocean",
         };
 
         private static readonly Dictionary<string, string> CountryCorrections = new(StringComparer.OrdinalIgnoreCase)
@@ -224,6 +234,8 @@ LIMIT @limit;";
                         {
                             var parts = ParseParts(rawLocation);
                             if (parts == null) { skipped++; continue; }
+
+                            parts = RealignParts(parts, continentCache, countryCache);
 
                             var minConfidence = 1.0f;
                             var needsReview = false;
@@ -1137,6 +1149,112 @@ ORDER BY ci.name;";
                 City = parts.Length > 4 ? parts[4].Trim() : null,
                 SpecificLocation = parts.Length > 5 ? parts[5].Trim() : null
             };
+        }
+
+        private static ParsedParts RealignParts(
+            ParsedParts parts,
+            Dictionary<string, int> continentCache,
+            Dictionary<string, int> countryCache)
+        {
+            // Fix 1: Leading colon — planet is empty, everything shifted right
+            if (string.IsNullOrWhiteSpace(parts.Planet) && !string.IsNullOrWhiteSpace(parts.Continent))
+            {
+                parts = new ParsedParts
+                {
+                    Planet = parts.Continent,
+                    Continent = parts.Country,
+                    Country = parts.StateRegion,
+                    StateRegion = parts.City,
+                    City = parts.SpecificLocation,
+                    SpecificLocation = null
+                };
+            }
+
+            // Fix 2: Doubled planet — e.g. "Earth:Earth:USA:New Jersey::"
+            var planet = NullIfEmpty(parts.Planet);
+            var continent = NullIfEmpty(parts.Continent);
+            if (planet != null && continent != null &&
+                string.Equals(planet, continent, StringComparison.OrdinalIgnoreCase))
+            {
+                parts = new ParsedParts
+                {
+                    Planet = parts.Planet,
+                    Continent = parts.Country,
+                    Country = parts.StateRegion,
+                    StateRegion = parts.City,
+                    City = parts.SpecificLocation,
+                    SpecificLocation = null
+                };
+                continent = NullIfEmpty(parts.Continent);
+            }
+
+            // Fix 3: Country in continent field
+            if (!string.IsNullOrWhiteSpace(continent))
+            {
+                var correctedAsContinent = CorrectValue(continent, ContinentCorrections);
+                var continentKey = correctedAsContinent.ToLowerInvariant();
+                bool validContinent = !string.IsNullOrWhiteSpace(correctedAsContinent) &&
+                    continentCache.ContainsKey(continentKey);
+
+                if (!validContinent && IsLikelyCountry(continent, countryCache))
+                {
+                    var countryField = NullIfEmpty(parts.Country);
+                    bool countryFieldIsContinent = countryField != null &&
+                        IsLikelyContinent(countryField, continentCache);
+
+                    if (countryFieldIsContinent)
+                    {
+                        // Swap: continent and country were reversed
+                        parts = new ParsedParts
+                        {
+                            Planet = parts.Planet,
+                            Continent = parts.Country,
+                            Country = parts.Continent,
+                            StateRegion = parts.StateRegion,
+                            City = parts.City,
+                            SpecificLocation = parts.SpecificLocation
+                        };
+                    }
+                    else
+                    {
+                        // Shift: country was placed in continent slot
+                        var mergedSpecific = NullIfEmpty(parts.City);
+                        var origSpecific = NullIfEmpty(parts.SpecificLocation);
+                        if (mergedSpecific != null && origSpecific != null)
+                            mergedSpecific = mergedSpecific + ", " + origSpecific;
+                        else
+                            mergedSpecific ??= origSpecific;
+
+                        parts = new ParsedParts
+                        {
+                            Planet = parts.Planet,
+                            Continent = null,
+                            Country = parts.Continent,
+                            StateRegion = parts.Country,
+                            City = parts.StateRegion,
+                            SpecificLocation = mergedSpecific
+                        };
+                    }
+                }
+            }
+
+            return parts;
+        }
+
+        private static bool IsLikelyContinent(string value, Dictionary<string, int> continentCache)
+        {
+            var corrected = CorrectValue(value.Trim(), ContinentCorrections);
+            return !string.IsNullOrWhiteSpace(corrected) &&
+                continentCache.ContainsKey(corrected.ToLowerInvariant());
+        }
+
+        private static bool IsLikelyCountry(string value, Dictionary<string, int> countryCache)
+        {
+            var trimmed = value.Trim();
+            if (CountryCorrections.ContainsKey(trimmed)) return true;
+            var corrected = CorrectValue(trimmed, CountryCorrections);
+            return !string.IsNullOrWhiteSpace(corrected) &&
+                countryCache.ContainsKey(corrected.ToLowerInvariant());
         }
 
         private static string CorrectValue(string? input, Dictionary<string, string> corrections)
