@@ -158,6 +158,9 @@ namespace AdminPanelAPI.Controllers
                 var countryCache = await LoadLookupCacheAsync("frl_location_countries", ct);
                 var regionCache = await LoadRegionCacheAsync(ct);
                 var cityCache = await LoadCityCacheAsync(ct);
+                var cityHierarchy = await LoadCityHierarchyCacheAsync(ct);
+                var regionHierarchy = await LoadRegionHierarchyCacheAsync(ct);
+                var countryHierarchy = await LoadCountryHierarchyCacheAsync(ct);
 
                 var countSql = @"
 SELECT COUNT(*)
@@ -284,6 +287,61 @@ LIMIT @limit;";
                                 var cityKey = $"{correctedCountry.ToLowerInvariant()}|{cityName.ToLowerInvariant()}";
                                 if (!cityCache.ContainsKey(cityKey) && !newCities.ContainsKey(cityKey))
                                     newCities[cityKey] = (cityName, regionKey, 0);
+                            }
+
+                            // Hierarchy inference: backfill missing parent levels
+                            // from existing DB data when a child level is known
+                            if (cityName != null && countryId == null)
+                            {
+                                var cityLower = cityName.ToLowerInvariant();
+                                if (cityHierarchy.TryGetValue(cityLower, out var ch))
+                                {
+                                    countryId ??= ch.CountryId;
+                                    correctedCountry ??= ch.CountryName;
+                                    continentId ??= ch.ContinentId;
+                                    planetId ??= ch.PlanetId;
+                                    if (regionName == null && ch.RegionId.HasValue)
+                                    {
+                                        regionName = ch.RegionName;
+                                        regionKey = ch.CountryName != null && ch.RegionName != null
+                                            ? $"{ch.CountryName.ToLowerInvariant()}|{ch.RegionName.ToLowerInvariant()}"
+                                            : null;
+                                    }
+                                }
+                            }
+                            else if (regionName != null && countryId == null)
+                            {
+                                var regionLower = regionName.ToLowerInvariant();
+                                if (regionHierarchy.TryGetValue(regionLower, out var rh))
+                                {
+                                    countryId ??= rh.CountryId;
+                                    correctedCountry ??= rh.CountryName;
+                                    continentId ??= rh.ContinentId;
+                                    planetId ??= rh.PlanetId;
+                                }
+                            }
+                            else if (correctedCountry != null && continentId == null)
+                            {
+                                var countryLower = correctedCountry.ToLowerInvariant();
+                                if (countryHierarchy.TryGetValue(countryLower, out var coh))
+                                {
+                                    continentId ??= coh.ContinentId;
+                                    planetId ??= coh.PlanetId;
+                                }
+                            }
+
+                            // After inference, register new lookups for any newly-resolved values
+                            if (cityName != null && correctedCountry != null)
+                            {
+                                var cityKey = $"{correctedCountry.ToLowerInvariant()}|{cityName.ToLowerInvariant()}";
+                                if (!cityCache.ContainsKey(cityKey) && !newCities.ContainsKey(cityKey))
+                                    newCities[cityKey] = (cityName, regionKey, 0);
+                            }
+                            if (regionName != null && correctedCountry != null && regionKey == null)
+                            {
+                                regionKey = $"{correctedCountry.ToLowerInvariant()}|{regionName.ToLowerInvariant()}";
+                                if (!regionCache.ContainsKey(regionKey) && !newRegions.ContainsKey(regionKey))
+                                    newRegions[regionKey] = (regionName, 0);
                             }
 
                             if (needsReview) flaggedForReview++;
@@ -1179,6 +1237,90 @@ JOIN frl.frl_location_countries c ON c.id = ci.country_id;";
                 await writer.WriteAsync(value.Value, NpgsqlDbType.Integer, ct);
             else
                 await writer.WriteNullAsync(ct);
+        }
+
+        private sealed record CityHierarchyEntry(
+            int CityId, int? RegionId, string? RegionName,
+            int? CountryId, string? CountryName, int? ContinentId, int? PlanetId);
+
+        private sealed record RegionHierarchyEntry(
+            int RegionId, int? CountryId, string? CountryName,
+            int? ContinentId, int? PlanetId);
+
+        private sealed record CountryHierarchyEntry(
+            int CountryId, int? ContinentId, int? PlanetId);
+
+        private async Task<Dictionary<string, CityHierarchyEntry>> LoadCityHierarchyCacheAsync(CancellationToken ct)
+        {
+            var sql = @"
+SELECT ci.id, ci.name, ci.region_id, r.name AS region_name,
+       ci.country_id, c.name AS country_name, c.continent_id,
+       (SELECT l.planet_id FROM frl.frl_images_location l
+        WHERE l.city_id = ci.id AND l.planet_id IS NOT NULL LIMIT 1) AS planet_id
+FROM frl.frl_location_cities ci
+LEFT JOIN frl.frl_location_regions r ON r.id = ci.region_id
+LEFT JOIN frl.frl_location_countries c ON c.id = ci.country_id;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            var cache = new Dictionary<string, CityHierarchyEntry>(StringComparer.OrdinalIgnoreCase);
+            while (await reader.ReadAsync(ct))
+            {
+                var name = reader.GetString(1).Trim().ToLowerInvariant();
+                cache.TryAdd(name, new CityHierarchyEntry(
+                    CityId: reader.GetInt32(0),
+                    RegionId: reader.IsDBNull(2) ? null : reader.GetInt32(2),
+                    RegionName: reader.IsDBNull(3) ? null : reader.GetString(3),
+                    CountryId: reader.IsDBNull(4) ? null : reader.GetInt32(4),
+                    CountryName: reader.IsDBNull(5) ? null : reader.GetString(5),
+                    ContinentId: reader.IsDBNull(6) ? null : reader.GetInt32(6),
+                    PlanetId: reader.IsDBNull(7) ? null : reader.GetInt32(7)));
+            }
+            return cache;
+        }
+
+        private async Task<Dictionary<string, RegionHierarchyEntry>> LoadRegionHierarchyCacheAsync(CancellationToken ct)
+        {
+            var sql = @"
+SELECT r.id, r.name, r.country_id, c.name AS country_name, c.continent_id,
+       (SELECT l.planet_id FROM frl.frl_images_location l
+        WHERE l.region_id = r.id AND l.planet_id IS NOT NULL LIMIT 1) AS planet_id
+FROM frl.frl_location_regions r
+LEFT JOIN frl.frl_location_countries c ON c.id = r.country_id;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            var cache = new Dictionary<string, RegionHierarchyEntry>(StringComparer.OrdinalIgnoreCase);
+            while (await reader.ReadAsync(ct))
+            {
+                var name = reader.GetString(1).Trim().ToLowerInvariant();
+                cache.TryAdd(name, new RegionHierarchyEntry(
+                    RegionId: reader.GetInt32(0),
+                    CountryId: reader.IsDBNull(2) ? null : reader.GetInt32(2),
+                    CountryName: reader.IsDBNull(3) ? null : reader.GetString(3),
+                    ContinentId: reader.IsDBNull(4) ? null : reader.GetInt32(4),
+                    PlanetId: reader.IsDBNull(5) ? null : reader.GetInt32(5)));
+            }
+            return cache;
+        }
+
+        private async Task<Dictionary<string, CountryHierarchyEntry>> LoadCountryHierarchyCacheAsync(CancellationToken ct)
+        {
+            var sql = @"
+SELECT c.id, c.name, c.continent_id,
+       (SELECT l.planet_id FROM frl.frl_images_location l
+        WHERE l.country_id = c.id AND l.planet_id IS NOT NULL LIMIT 1) AS planet_id
+FROM frl.frl_location_countries c;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            var cache = new Dictionary<string, CountryHierarchyEntry>(StringComparer.OrdinalIgnoreCase);
+            while (await reader.ReadAsync(ct))
+            {
+                var name = reader.GetString(1).Trim().ToLowerInvariant();
+                cache.TryAdd(name, new CountryHierarchyEntry(
+                    CountryId: reader.GetInt32(0),
+                    ContinentId: reader.IsDBNull(2) ? null : reader.GetInt32(2),
+                    PlanetId: reader.IsDBNull(3) ? null : reader.GetInt32(3)));
+            }
+            return cache;
         }
 
         private async Task<int> GetOrCreateCountryAsync(
