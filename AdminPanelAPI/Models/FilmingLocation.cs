@@ -34,22 +34,6 @@ namespace AdminPanelAPI.Models
         public string Name { get; set; } = string.Empty;
     }
 
-    // ── Alias DTOs ───────────────────────────────────────────────
-
-    public sealed class AliasDto
-    {
-        public int Id { get; set; }
-        public string Alias { get; set; } = string.Empty;
-        public int CanonicalId { get; set; }
-        public string CanonicalName { get; set; } = string.Empty;
-    }
-
-    public sealed class CreateAliasDto
-    {
-        public string Alias { get; set; } = string.Empty;
-        public int CanonicalId { get; set; }
-    }
-
     // ── Image location DTOs ──────────────────────────────────────
 
     public sealed class FilmingLocationDto
@@ -133,16 +117,4 @@ namespace AdminPanelAPI.Models
         public long DistinctImages { get; set; }
     }
 
-    public sealed class ReviewItemDto
-    {
-        public long Id { get; set; }
-        public int ImageId { get; set; }
-        public string? RawLocation { get; set; }
-        public string? ContinentName { get; set; }
-        public string? CountryName { get; set; }
-        public string? RegionName { get; set; }
-        public string? CityName { get; set; }
-        public string? SpecificLocation { get; set; }
-        public float Confidence { get; set; }
-    }
 }
