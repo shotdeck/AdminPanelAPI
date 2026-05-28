@@ -1,35 +1,31 @@
 -- ============================================================
--- 008: Add latitude/longitude to location lookup tables
+-- 008: Add coordinates (POINT) to location lookup tables
 --      for tiered geocoding (specific → city → region → country)
+--      Uses POINT type consistent with frl_images_location.coordinates
 -- ============================================================
 
--- Add coords to cities
+-- Add coordinates to cities
 ALTER TABLE frl.frl_location_cities
-    ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+    ADD COLUMN IF NOT EXISTS coordinates POINT;
 
--- Add coords to regions
+-- Add coordinates to regions
 ALTER TABLE frl.frl_location_regions
-    ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+    ADD COLUMN IF NOT EXISTS coordinates POINT;
 
--- Add coords to countries
+-- Add coordinates to countries
 ALTER TABLE frl.frl_location_countries
-    ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+    ADD COLUMN IF NOT EXISTS coordinates POINT;
 
--- Add coords to continents (for fallback)
+-- Add coordinates to continents (for fallback)
 ALTER TABLE frl.frl_location_continents
-    ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+    ADD COLUMN IF NOT EXISTS coordinates POINT;
 
 -- Geocode cache for specific_location values
 -- (avoids re-geocoding the same location name repeatedly)
 CREATE TABLE IF NOT EXISTS frl.frl_geocode_cache (
     id              SERIAL          PRIMARY KEY,
     location_key    TEXT            NOT NULL UNIQUE,
-    latitude        DOUBLE PRECISION,
-    longitude       DOUBLE PRECISION,
+    coordinates     POINT,
     source          VARCHAR(50)     NOT NULL DEFAULT 'nominatim',
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );

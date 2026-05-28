@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
+using NpgsqlTypes;
 using System.Net.Http.Headers;
 using System.Text.Json;
 
@@ -38,7 +39,6 @@ namespace AdminPanelAPI.Controllers
         }
 
         // ─── GET /api/admin/geocode/stats ──────────────────────────────
-        // Returns counts of distinct geocodable entities at each tier
         [HttpGet("stats")]
         [ProducesResponseType(typeof(GeocodeStatsResponse), StatusCodes.Status200OK)]
         public async Task<ActionResult<GeocodeStatsResponse>> GetStats(CancellationToken ct = default)
@@ -48,56 +48,51 @@ namespace AdminPanelAPI.Controllers
             {
                 var stats = new GeocodeStatsResponse();
 
-                // Total images_location records
                 await using (var cmd = new NpgsqlCommand(
                     "SELECT COUNT(*) FROM frl.frl_images_location", _connection))
                     stats.TotalRecords = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
-                // Records with coordinates already set
                 await using (var cmd = new NpgsqlCommand(
                     "SELECT COUNT(*) FROM frl.frl_images_location WHERE coordinates IS NOT NULL", _connection))
                     stats.AlreadyGeocoded = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
-                // Distinct cities (total and geocoded)
                 await using (var cmd = new NpgsqlCommand(
                     "SELECT COUNT(*) FROM frl.frl_location_cities", _connection))
                     stats.TotalCities = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
                 await using (var cmd = new NpgsqlCommand(
-                    "SELECT COUNT(*) FROM frl.frl_location_cities WHERE latitude IS NOT NULL", _connection))
+                    "SELECT COUNT(*) FROM frl.frl_location_cities WHERE coordinates IS NOT NULL", _connection))
                     stats.GeocodedCities = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
-                // Distinct regions (total and geocoded)
                 await using (var cmd = new NpgsqlCommand(
                     "SELECT COUNT(*) FROM frl.frl_location_regions", _connection))
                     stats.TotalRegions = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
                 await using (var cmd = new NpgsqlCommand(
-                    "SELECT COUNT(*) FROM frl.frl_location_regions WHERE latitude IS NOT NULL", _connection))
+                    "SELECT COUNT(*) FROM frl.frl_location_regions WHERE coordinates IS NOT NULL", _connection))
                     stats.GeocodedRegions = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
-                // Distinct countries (total and geocoded)
                 await using (var cmd = new NpgsqlCommand(
                     "SELECT COUNT(*) FROM frl.frl_location_countries", _connection))
                     stats.TotalCountries = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
                 await using (var cmd = new NpgsqlCommand(
-                    "SELECT COUNT(*) FROM frl.frl_location_countries WHERE latitude IS NOT NULL", _connection))
+                    "SELECT COUNT(*) FROM frl.frl_location_countries WHERE coordinates IS NOT NULL", _connection))
                     stats.GeocodedCountries = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
-                // Distinct specific_location values (non-null, non-empty)
                 await using (var cmd = new NpgsqlCommand(@"
                     SELECT COUNT(DISTINCT specific_location)
                     FROM frl.frl_images_location
                     WHERE specific_location IS NOT NULL AND TRIM(specific_location) <> ''", _connection))
                     stats.TotalSpecificLocations = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
-                // Specific locations already in geocode cache
                 await using (var cmd = new NpgsqlCommand(@"
                     SELECT COUNT(DISTINCT il.specific_location)
                     FROM frl.frl_images_location il
                     INNER JOIN frl.frl_geocode_cache gc ON gc.location_key = il.specific_location
-                    WHERE il.specific_location IS NOT NULL AND TRIM(il.specific_location) <> ''", _connection))
+                    WHERE il.specific_location IS NOT NULL
+                      AND TRIM(il.specific_location) <> ''
+                      AND gc.coordinates IS NOT NULL", _connection))
                     stats.GeocodedSpecificLocations = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
                 return Ok(stats);
@@ -106,7 +101,6 @@ namespace AdminPanelAPI.Controllers
         }
 
         // ─── POST /api/admin/geocode/countries ─────────────────────────
-        // Geocode all countries that don't have coordinates yet
         [HttpPost("countries")]
         [ProducesResponseType(typeof(GeocodeResultResponse), StatusCodes.Status200OK)]
         public async Task<ActionResult<GeocodeResultResponse>> GeocodeCountries(
@@ -118,7 +112,7 @@ namespace AdminPanelAPI.Controllers
             {
                 var sql = @"
                     SELECT id, name FROM frl.frl_location_countries
-                    WHERE latitude IS NULL
+                    WHERE coordinates IS NULL
                     ORDER BY id
                     LIMIT @limit";
 
@@ -141,10 +135,10 @@ namespace AdminPanelAPI.Controllers
                     if (coords.HasValue)
                     {
                         await using var upd = new NpgsqlCommand(
-                            "UPDATE frl.frl_location_countries SET latitude = @lat, longitude = @lng WHERE id = @id",
+                            "UPDATE frl.frl_location_countries SET coordinates = POINT(@lng, @lat) WHERE id = @id",
                             _connection);
-                        upd.Parameters.AddWithValue("@lat", coords.Value.lat);
                         upd.Parameters.AddWithValue("@lng", coords.Value.lng);
+                        upd.Parameters.AddWithValue("@lat", coords.Value.lat);
                         upd.Parameters.AddWithValue("@id", id);
                         await upd.ExecuteNonQueryAsync(ct);
                         geocoded++;
@@ -155,12 +149,11 @@ namespace AdminPanelAPI.Controllers
                         _logger.LogWarning("Failed to geocode country: {Name}", name);
                     }
 
-                    await Task.Delay(1100, ct); // Nominatim rate limit
+                    await Task.Delay(1100, ct);
                 }
 
-                // Count remaining
                 await using var remCmd = new NpgsqlCommand(
-                    "SELECT COUNT(*) FROM frl.frl_location_countries WHERE latitude IS NULL", _connection);
+                    "SELECT COUNT(*) FROM frl.frl_location_countries WHERE coordinates IS NULL", _connection);
                 var remaining = Convert.ToInt32(await remCmd.ExecuteScalarAsync(ct));
 
                 return Ok(new GeocodeResultResponse
@@ -188,7 +181,7 @@ namespace AdminPanelAPI.Controllers
                     SELECT r.id, r.name, c.name AS country_name
                     FROM frl.frl_location_regions r
                     LEFT JOIN frl.frl_location_countries c ON c.id = r.country_id
-                    WHERE r.latitude IS NULL
+                    WHERE r.coordinates IS NULL
                     ORDER BY r.id
                     LIMIT @limit";
 
@@ -215,10 +208,10 @@ namespace AdminPanelAPI.Controllers
                     if (coords.HasValue)
                     {
                         await using var upd = new NpgsqlCommand(
-                            "UPDATE frl.frl_location_regions SET latitude = @lat, longitude = @lng WHERE id = @id",
+                            "UPDATE frl.frl_location_regions SET coordinates = POINT(@lng, @lat) WHERE id = @id",
                             _connection);
-                        upd.Parameters.AddWithValue("@lat", coords.Value.lat);
                         upd.Parameters.AddWithValue("@lng", coords.Value.lng);
+                        upd.Parameters.AddWithValue("@lat", coords.Value.lat);
                         upd.Parameters.AddWithValue("@id", id);
                         await upd.ExecuteNonQueryAsync(ct);
                         geocoded++;
@@ -233,7 +226,7 @@ namespace AdminPanelAPI.Controllers
                 }
 
                 await using var remCmd = new NpgsqlCommand(
-                    "SELECT COUNT(*) FROM frl.frl_location_regions WHERE latitude IS NULL", _connection);
+                    "SELECT COUNT(*) FROM frl.frl_location_regions WHERE coordinates IS NULL", _connection);
                 var remaining = Convert.ToInt32(await remCmd.ExecuteScalarAsync(ct));
 
                 return Ok(new GeocodeResultResponse
@@ -262,7 +255,7 @@ namespace AdminPanelAPI.Controllers
                     FROM frl.frl_location_cities ci
                     LEFT JOIN frl.frl_location_regions r ON r.id = ci.region_id
                     LEFT JOIN frl.frl_location_countries c ON c.id = ci.country_id
-                    WHERE ci.latitude IS NULL
+                    WHERE ci.coordinates IS NULL
                     ORDER BY ci.id
                     LIMIT @limit";
 
@@ -290,10 +283,10 @@ namespace AdminPanelAPI.Controllers
                     if (coords.HasValue)
                     {
                         await using var upd = new NpgsqlCommand(
-                            "UPDATE frl.frl_location_cities SET latitude = @lat, longitude = @lng WHERE id = @id",
+                            "UPDATE frl.frl_location_cities SET coordinates = POINT(@lng, @lat) WHERE id = @id",
                             _connection);
-                        upd.Parameters.AddWithValue("@lat", coords.Value.lat);
                         upd.Parameters.AddWithValue("@lng", coords.Value.lng);
+                        upd.Parameters.AddWithValue("@lat", coords.Value.lat);
                         upd.Parameters.AddWithValue("@id", id);
                         await upd.ExecuteNonQueryAsync(ct);
                         geocoded++;
@@ -308,7 +301,7 @@ namespace AdminPanelAPI.Controllers
                 }
 
                 await using var remCmd = new NpgsqlCommand(
-                    "SELECT COUNT(*) FROM frl.frl_location_cities WHERE latitude IS NULL", _connection);
+                    "SELECT COUNT(*) FROM frl.frl_location_cities WHERE coordinates IS NULL", _connection);
                 var remaining = Convert.ToInt32(await remCmd.ExecuteScalarAsync(ct));
 
                 return Ok(new GeocodeResultResponse
@@ -323,7 +316,6 @@ namespace AdminPanelAPI.Controllers
         }
 
         // ─── POST /api/admin/geocode/specific-locations ────────────────
-        // Geocode distinct specific_location values not already in cache
         [HttpPost("specific-locations")]
         [ProducesResponseType(typeof(GeocodeResultResponse), StatusCodes.Status200OK)]
         public async Task<ActionResult<GeocodeResultResponse>> GeocodeSpecificLocations(
@@ -333,7 +325,6 @@ namespace AdminPanelAPI.Controllers
             await EnsureOpenAsync(ct);
             try
             {
-                // Get distinct specific_location values that aren't in the cache yet
                 var sql = @"
                     SELECT DISTINCT il.specific_location, ci.name AS city_name,
                            r.name AS region_name, c.name AS country_name
@@ -370,7 +361,6 @@ namespace AdminPanelAPI.Controllers
                 {
                     if (ct.IsCancellationRequested) break;
 
-                    // Build a query string: "specific_location, city, country"
                     var queryParts = new List<string> { location };
                     if (!string.IsNullOrEmpty(city)) queryParts.Add(city);
                     if (!string.IsNullOrEmpty(country)) queryParts.Add(country);
@@ -379,19 +369,28 @@ namespace AdminPanelAPI.Controllers
                     var coords = await GeocodeWithNominatimRaw(query, ct);
 
                     // Insert into cache (even if null, so we don't retry)
-                    await using var ins = new NpgsqlCommand(@"
-                        INSERT INTO frl.frl_geocode_cache (location_key, latitude, longitude, source)
-                        VALUES (@key, @lat, @lng, 'nominatim')
-                        ON CONFLICT (location_key) DO NOTHING",
-                        _connection);
-                    ins.Parameters.AddWithValue("@key", location);
-                    ins.Parameters.AddWithValue("@lat", coords.HasValue ? coords.Value.lat : (object)DBNull.Value);
-                    ins.Parameters.AddWithValue("@lng", coords.HasValue ? coords.Value.lng : (object)DBNull.Value);
-                    await ins.ExecuteNonQueryAsync(ct);
-
-                    if (coords.HasValue) geocoded++;
+                    if (coords.HasValue)
+                    {
+                        await using var ins = new NpgsqlCommand(@"
+                            INSERT INTO frl.frl_geocode_cache (location_key, coordinates, source)
+                            VALUES (@key, POINT(@lng, @lat), 'nominatim')
+                            ON CONFLICT (location_key) DO NOTHING",
+                            _connection);
+                        ins.Parameters.AddWithValue("@key", location);
+                        ins.Parameters.AddWithValue("@lng", coords.Value.lng);
+                        ins.Parameters.AddWithValue("@lat", coords.Value.lat);
+                        await ins.ExecuteNonQueryAsync(ct);
+                        geocoded++;
+                    }
                     else
                     {
+                        await using var ins = new NpgsqlCommand(@"
+                            INSERT INTO frl.frl_geocode_cache (location_key, coordinates, source)
+                            VALUES (@key, NULL, 'nominatim')
+                            ON CONFLICT (location_key) DO NOTHING",
+                            _connection);
+                        ins.Parameters.AddWithValue("@key", location);
+                        await ins.ExecuteNonQueryAsync(ct);
                         failed++;
                         _logger.LogWarning("Failed to geocode specific location: {Location}", location);
                     }
@@ -399,7 +398,6 @@ namespace AdminPanelAPI.Controllers
                     await Task.Delay(1100, ct);
                 }
 
-                // Count remaining
                 await using var remCmd = new NpgsqlCommand(@"
                     SELECT COUNT(DISTINCT il.specific_location)
                     FROM frl.frl_images_location il
@@ -425,9 +423,9 @@ namespace AdminPanelAPI.Controllers
         // ─── POST /api/admin/geocode/propagate ─────────────────────────
         // Updates frl_images_location.coordinates from resolved tiers:
         //   1. specific_location (from geocode_cache) → most precise
-        //   2. city (from frl_location_cities.lat/lng)
-        //   3. region (from frl_location_regions.lat/lng)
-        //   4. country (from frl_location_countries.lat/lng)
+        //   2. city (from frl_location_cities.coordinates)
+        //   3. region (from frl_location_regions.coordinates)
+        //   4. country (from frl_location_countries.coordinates)
         [HttpPost("propagate")]
         [ProducesResponseType(typeof(PropagateResponse), StatusCodes.Status200OK)]
         public async Task<ActionResult<PropagateResponse>> Propagate(CancellationToken ct = default)
@@ -440,11 +438,11 @@ namespace AdminPanelAPI.Controllers
                 // Tier 1: specific_location from geocode_cache
                 await using (var cmd = new NpgsqlCommand(@"
                     UPDATE frl.frl_images_location il
-                    SET coordinates = POINT(gc.longitude, gc.latitude),
+                    SET coordinates = gc.coordinates,
                         updated_at = NOW()
                     FROM frl.frl_geocode_cache gc
                     WHERE gc.location_key = il.specific_location
-                      AND gc.latitude IS NOT NULL
+                      AND gc.coordinates IS NOT NULL
                       AND il.coordinates IS NULL", _connection))
                 {
                     result.SpecificLocationUpdated = await cmd.ExecuteNonQueryAsync(ct);
@@ -453,11 +451,11 @@ namespace AdminPanelAPI.Controllers
                 // Tier 2: city coordinates
                 await using (var cmd = new NpgsqlCommand(@"
                     UPDATE frl.frl_images_location il
-                    SET coordinates = POINT(ci.longitude, ci.latitude),
+                    SET coordinates = ci.coordinates,
                         updated_at = NOW()
                     FROM frl.frl_location_cities ci
                     WHERE ci.id = il.city_id
-                      AND ci.latitude IS NOT NULL
+                      AND ci.coordinates IS NOT NULL
                       AND il.coordinates IS NULL", _connection))
                 {
                     result.CityUpdated = await cmd.ExecuteNonQueryAsync(ct);
@@ -466,11 +464,11 @@ namespace AdminPanelAPI.Controllers
                 // Tier 3: region coordinates
                 await using (var cmd = new NpgsqlCommand(@"
                     UPDATE frl.frl_images_location il
-                    SET coordinates = POINT(r.longitude, r.latitude),
+                    SET coordinates = r.coordinates,
                         updated_at = NOW()
                     FROM frl.frl_location_regions r
                     WHERE r.id = il.region_id
-                      AND r.latitude IS NOT NULL
+                      AND r.coordinates IS NOT NULL
                       AND il.coordinates IS NULL", _connection))
                 {
                     result.RegionUpdated = await cmd.ExecuteNonQueryAsync(ct);
@@ -479,11 +477,11 @@ namespace AdminPanelAPI.Controllers
                 // Tier 4: country coordinates
                 await using (var cmd = new NpgsqlCommand(@"
                     UPDATE frl.frl_images_location il
-                    SET coordinates = POINT(c.longitude, c.latitude),
+                    SET coordinates = c.coordinates,
                         updated_at = NOW()
                     FROM frl.frl_location_countries c
                     WHERE c.id = il.country_id
-                      AND c.latitude IS NOT NULL
+                      AND c.coordinates IS NOT NULL
                       AND il.coordinates IS NULL", _connection))
                 {
                     result.CountryUpdated = await cmd.ExecuteNonQueryAsync(ct);
@@ -504,7 +502,6 @@ namespace AdminPanelAPI.Controllers
         private async Task<(double lat, double lng)?> GeocodeWithNominatim(
             string name, string? region, string? country, CancellationToken ct)
         {
-            // Build structured query for better accuracy
             var queryParts = new List<string> { name };
             if (!string.IsNullOrEmpty(region)) queryParts.Add(region);
             if (!string.IsNullOrEmpty(country)) queryParts.Add(country);
