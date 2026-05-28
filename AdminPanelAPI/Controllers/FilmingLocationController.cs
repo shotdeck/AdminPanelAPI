@@ -211,7 +211,7 @@ LIMIT @limit;";
                     var pendingInserts = new List<ParsedRow>();
                     var newCountries = new Dictionary<string, (string name, int? continentId)>(StringComparer.OrdinalIgnoreCase);
                     var newRegions = new Dictionary<string, (string name, int countryId)>(StringComparer.OrdinalIgnoreCase);
-                    var newCities = new Dictionary<string, (string name, int? regionId, int countryId)>(StringComparer.OrdinalIgnoreCase);
+                    var newCities = new Dictionary<string, (string name, string? regionKey, int countryId)>(StringComparer.OrdinalIgnoreCase);
 
                     foreach (var (imageId, rawLocation) in batch)
                     {
@@ -250,12 +250,13 @@ LIMIT @limit;";
                                 }
                             }
 
+                            string? regionKey = null;
                             var regionName = NullIfEmpty(parts.StateRegion);
                             if (regionName != null && !string.IsNullOrWhiteSpace(correctedCountry))
                             {
-                                var regionKey = $"{correctedCountry.ToLowerInvariant()}|{regionName.ToLowerInvariant()}";
+                                regionKey = $"{correctedCountry.ToLowerInvariant()}|{regionName.ToLowerInvariant()}";
                                 if (!regionCache.ContainsKey(regionKey) && !newRegions.ContainsKey(regionKey))
-                                    newRegions[regionKey] = (regionName, 0); // countryId resolved after bulk insert
+                                    newRegions[regionKey] = (regionName, 0);
                             }
 
                             var cityName = NullIfEmpty(parts.City);
@@ -263,7 +264,7 @@ LIMIT @limit;";
                             {
                                 var cityKey = $"{correctedCountry.ToLowerInvariant()}|{cityName.ToLowerInvariant()}";
                                 if (!cityCache.ContainsKey(cityKey) && !newCities.ContainsKey(cityKey))
-                                    newCities[cityKey] = (cityName, null, 0);
+                                    newCities[cityKey] = (cityName, regionKey, 0);
                             }
 
                             if (needsReview) flaggedForReview++;
@@ -273,7 +274,9 @@ LIMIT @limit;";
                                 ImageId = imageId,
                                 RawLocation = rawLocation.Trim(),
                                 ContinentId = continentId,
+                                CountryId = countryId,
                                 CorrectedCountry = correctedCountry,
+                                RegionKey = regionKey,
                                 RegionName = regionName,
                                 CityName = cityName,
                                 SpecificLocation = NullIfEmpty(parts.SpecificLocation),
@@ -289,47 +292,48 @@ LIMIT @limit;";
                     }
 
                     // Phase 2: Bulk-create any new countries, regions, cities
+                    // Accumulate new cache entries in temp dicts; merge only after commit
+                    var batchCountryCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    var batchRegionCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    var batchCityCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
                     await using var tx = await _connection.BeginTransactionAsync(ct);
                     try
                     {
                         foreach (var (key, (name, continentId)) in newCountries)
                         {
                             var id = await GetOrCreateCountryAsync(name, continentId, ct);
-                            countryCache[key] = id;
+                            batchCountryCache[key] = id;
                         }
 
                         // Resolve region countryIds and bulk-create
-                        var resolvedNewRegions = new Dictionary<string, (string name, int countryId)>(StringComparer.OrdinalIgnoreCase);
                         foreach (var (key, (name, _)) in newRegions)
                         {
                             var countryName = key.Split('|')[0];
-                            if (countryCache.TryGetValue(countryName, out var cid))
-                                resolvedNewRegions[key] = (name, cid);
-                        }
-                        foreach (var (key, (name, countryId)) in resolvedNewRegions)
-                        {
-                            var id = await GetOrCreateRegionAsync(name, countryId, ct);
-                            regionCache[key] = id;
+                            if (countryCache.TryGetValue(countryName, out var cid) ||
+                                batchCountryCache.TryGetValue(countryName, out cid))
+                            {
+                                var id = await GetOrCreateRegionAsync(name, cid, ct);
+                                batchRegionCache[key] = id;
+                            }
                         }
 
                         // Resolve city countryIds/regionIds and bulk-create
-                        foreach (var (key, (name, _, _)) in newCities)
+                        foreach (var (key, (name, storedRegionKey, _)) in newCities)
                         {
-                            var keyParts = key.Split('|');
-                            var countryName = keyParts[0];
-                            if (!countryCache.TryGetValue(countryName, out var cid)) continue;
+                            var countryName = key.Split('|')[0];
+                            if (!countryCache.TryGetValue(countryName, out var cid) &&
+                                !batchCountryCache.TryGetValue(countryName, out cid))
+                                continue;
                             int? rid = null;
-                            // Try to find the region for this city's country (best effort)
-                            foreach (var (rk, rId) in regionCache)
+                            if (storedRegionKey != null)
                             {
-                                if (rk.StartsWith(countryName + "|", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    rid = rId;
-                                    break;
-                                }
+                                if (!regionCache.TryGetValue(storedRegionKey, out var resolvedRid))
+                                    batchRegionCache.TryGetValue(storedRegionKey, out resolvedRid);
+                                if (resolvedRid != 0) rid = resolvedRid;
                             }
                             var id = await GetOrCreateCityAsync(name, rid, cid, ct);
-                            cityCache[key] = id;
+                            batchCityCache[key] = id;
                         }
 
                         // Phase 3: Bulk INSERT all parsed rows
@@ -341,24 +345,31 @@ LIMIT @limit;";
 
                             foreach (var row in pendingInserts)
                             {
-                                int? countryId = null;
-                                if (!string.IsNullOrWhiteSpace(row.CorrectedCountry) &&
-                                    countryCache.TryGetValue(row.CorrectedCountry.ToLowerInvariant(), out var resolvedCountryId))
-                                    countryId = resolvedCountryId;
+                                // Use stored CountryId from Phase 1 (handles fuzzy matches);
+                                // fall back to cache lookup for newly-created countries
+                                var countryId = row.CountryId;
+                                if (countryId == null && !string.IsNullOrWhiteSpace(row.CorrectedCountry))
+                                {
+                                    var ck = row.CorrectedCountry.ToLowerInvariant();
+                                    if (countryCache.TryGetValue(ck, out var resolvedCid) ||
+                                        batchCountryCache.TryGetValue(ck, out resolvedCid))
+                                        countryId = resolvedCid;
+                                }
 
                                 int? regionId = null;
-                                if (row.RegionName != null && countryId.HasValue)
+                                if (row.RegionKey != null)
                                 {
-                                    var regionKey = $"{row.CorrectedCountry!.ToLowerInvariant()}|{row.RegionName.ToLowerInvariant()}";
-                                    if (regionCache.TryGetValue(regionKey, out var rid))
+                                    if (regionCache.TryGetValue(row.RegionKey, out var rid) ||
+                                        batchRegionCache.TryGetValue(row.RegionKey, out rid))
                                         regionId = rid;
                                 }
 
                                 int? cityId = null;
-                                if (row.CityName != null && countryId.HasValue)
+                                if (row.CityName != null && countryId.HasValue && row.CorrectedCountry != null)
                                 {
-                                    var cityKey = $"{row.CorrectedCountry!.ToLowerInvariant()}|{row.CityName.ToLowerInvariant()}";
-                                    if (cityCache.TryGetValue(cityKey, out var cid))
+                                    var cityKey = $"{row.CorrectedCountry.ToLowerInvariant()}|{row.CityName.ToLowerInvariant()}";
+                                    if (cityCache.TryGetValue(cityKey, out var cid) ||
+                                        batchCityCache.TryGetValue(cityKey, out cid))
                                         cityId = cid;
                                 }
 
@@ -383,6 +394,11 @@ LIMIT @limit;";
                         }
 
                         await tx.CommitAsync(ct);
+
+                        // Merge batch caches into main caches only after successful commit
+                        foreach (var (k, v) in batchCountryCache) countryCache[k] = v;
+                        foreach (var (k, v) in batchRegionCache) regionCache[k] = v;
+                        foreach (var (k, v) in batchCityCache) cityCache[k] = v;
                     }
                     catch (Exception ex)
                     {
@@ -967,7 +983,9 @@ ORDER BY ci.name;";
             public int ImageId { get; set; }
             public string RawLocation { get; set; } = string.Empty;
             public int? ContinentId { get; set; }
+            public int? CountryId { get; set; }
             public string? CorrectedCountry { get; set; }
+            public string? RegionKey { get; set; }
             public string? RegionName { get; set; }
             public string? CityName { get; set; }
             public string? SpecificLocation { get; set; }
