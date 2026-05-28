@@ -25,6 +25,119 @@ namespace AdminPanelAPI.Controllers
             _logger = logger;
         }
 
+        // ── Inline correction dictionaries ──────────────────────────
+        // Key = lowercase input, Value = corrected canonical name.
+        // Applied before any DB lookup so the stored data is always clean.
+
+        private static readonly Dictionary<string, string> ContinentCorrections = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Aisa"] = "Asia",
+            ["Asias"] = "Asia",
+            ["asia"] = "Asia",
+            ["South Asia"] = "Asia",
+            ["West Asia"] = "Asia",
+            ["Western Asia"] = "Asia",
+            ["Eruope"] = "Europe",
+            ["Europ"] = "Europe",
+            ["North AMerica"] = "North America",
+            ["North Amaerica"] = "North America",
+            ["North Ameerica"] = "North America",
+            ["North Amerca"] = "North America",
+            ["North Amercia"] = "North America",
+            ["North American"] = "North America",
+            ["North Amerifca"] = "North America",
+            ["North Ameriica"] = "North America",
+            ["north america"] = "North America",
+            ["North America of America"] = "North America",
+            ["Central America"] = "North America",
+            ["Latin America"] = "South America",
+            ["Caribbean"] = "North America",
+            ["Carribean"] = "North America",
+            ["Middle East"] = "Asia",
+            ["Middle-East"] = "Asia",
+            ["Oceana"] = "Oceania",
+            ["Australia"] = "Oceania",
+            ["Arctic Circle"] = "Antarctica",
+            ["The Arctic"] = "Antarctica",
+            ["Scandinavia"] = "Europe",
+            ["America"] = "North America",
+        };
+
+        private static readonly Dictionary<string, string> CountryCorrections = new(StringComparer.OrdinalIgnoreCase)
+        {
+            // United States variants
+            ["USA"] = "United States",
+            ["United States of America"] = "United States",
+            ["The United States of America"] = "United States",
+            ["United States Of America"] = "United States",
+            ["United States of AMerica"] = "United States",
+            ["United States of Ameirca"] = "United States",
+            ["United States of Amerca"] = "United States",
+            ["United States of Amerifca"] = "United States",
+            ["United States od America"] = "United States",
+            ["United  States of America"] = "United States",
+            ["United Sates"] = "United States",
+            ["United Sates of America"] = "United States",
+            ["United Startes"] = "United States",
+            ["United State of America"] = "United States",
+            ["United Stated"] = "United States",
+            ["United Stated of America"] = "United States",
+            ["United Statess"] = "United States",
+            ["United Statse"] = "United States",
+            ["United of America"] = "United States",
+            ["united states"] = "United States",
+            ["Untied States"] = "United States",
+            ["Untied States of America"] = "United States",
+            ["US/Mexico"] = "United States",
+            // United Kingdom variants
+            ["UK"] = "United Kingdom",
+            ["United Kindom"] = "United Kingdom",
+            ["united kingdom"] = "United Kingdom",
+            ["England"] = "United Kingdom",
+            ["Scotland"] = "United Kingdom",
+            ["Wales"] = "United Kingdom",
+            ["Northern Ireland"] = "United Kingdom",
+            // Czech Republic
+            ["Czech Repubic"] = "Czech Republic",
+            ["Czechia"] = "Czech Republic",
+            ["Czechoslovakia"] = "Czech Republic",
+            // Philippines
+            ["The Phillipines"] = "Philippines",
+            // Colombia (not Columbia)
+            ["Columbia"] = "Colombia",
+            // Romania
+            ["Romani"] = "Romania",
+            // UAE
+            ["United Arab Emerates"] = "United Arab Emirates",
+            // Falkland Islands
+            ["Falkland Island"] = "Falkland Islands",
+            // Congo variants
+            ["Congo"] = "Democratic Republic of the Congo",
+            ["Republic of Congo"] = "Republic of the Congo",
+            ["Republic of Democratic Congo"] = "Democratic Republic of the Congo",
+            ["Democratic Republic of Congo"] = "Democratic Republic of the Congo",
+            ["Republic of Zaire"] = "Democratic Republic of the Congo",
+            // Korea
+            ["Korea"] = "South Korea",
+            // Mexico
+            ["Mexic"] = "Mexico",
+            // Seychelles
+            ["The Seychelles"] = "Seychelles",
+            // The Caribbean (not a country but often used as one)
+            ["The Caribbean"] = "Caribbean",
+            // States incorrectly placed as countries
+            ["California"] = "United States",
+            ["Florida"] = "United States",
+            ["Texas"] = "United States",
+            // Other
+            ["Soviet Union"] = "Russia",
+            ["South West Africa"] = "Namibia",
+            ["Republic of China"] = "Taiwan",
+            [" Republic of China"] = "Taiwan",
+            ["Borneo"] = "Indonesia",
+            ["Bosnia"] = "Bosnia and Herzegovina",
+        };
+
         // ═══════════════════════════════════════════════════════════
         //  PARSE – read frl_images.filming_location → normalised rows
         // ═══════════════════════════════════════════════════════════
@@ -40,11 +153,8 @@ namespace AdminPanelAPI.Controllers
 
             try
             {
-                // Pre-load lookup caches
                 var continentCache = await LoadLookupCacheAsync("frl_location_continents", ct);
-                var continentAliasCache = await LoadAliasCacheAsync("frl_location_continent_aliases", "continent_id", ct);
                 var countryCache = await LoadLookupCacheAsync("frl_location_countries", ct);
-                var countryAliasCache = await LoadAliasCacheAsync("frl_location_country_aliases", "country_id", ct);
 
                 var countSql = @"
 SELECT COUNT(*)
@@ -105,57 +215,43 @@ LIMIT @limit;";
                             var minConfidence = 1.0f;
                             var needsReview = false;
 
-                            // Resolve continent
+                            // Correct and resolve continent
+                            var correctedContinent = CorrectValue(parts.Continent, ContinentCorrections);
                             int? continentId = null;
-                            if (!string.IsNullOrWhiteSpace(parts.Continent))
+                            if (!string.IsNullOrWhiteSpace(correctedContinent))
                             {
-                                var (id, conf) = ResolveWithFuzzy(
-                                    parts.Continent, continentCache, continentAliasCache);
+                                var (id, conf) = ResolveWithFuzzy(correctedContinent, continentCache);
                                 continentId = id;
                                 if (conf < minConfidence) minConfidence = conf;
-                                if (id == null && conf < 1.0f) needsReview = true;
                                 if (conf < 1.0f && id != null) fuzzyMatched++;
+                                if (id == null) needsReview = true;
                             }
 
-                            // Resolve country
+                            // Correct and resolve country
+                            var correctedCountry = CorrectValue(parts.Country, CountryCorrections);
                             int? countryId = null;
-                            if (!string.IsNullOrWhiteSpace(parts.Country))
+                            if (!string.IsNullOrWhiteSpace(correctedCountry))
                             {
-                                var (id, conf) = ResolveWithFuzzy(
-                                    parts.Country, countryCache, countryAliasCache);
+                                var (id, conf) = ResolveWithFuzzy(correctedCountry, countryCache);
                                 countryId = id;
                                 if (conf < minConfidence) minConfidence = conf;
-                                if (id == null && conf < 1.0f) needsReview = true;
                                 if (conf < 1.0f && id != null) fuzzyMatched++;
-                            }
-
-                            // Create continent if not resolved and text is present
-                            if (continentId == null && !string.IsNullOrWhiteSpace(parts.Continent))
-                            {
-                                needsReview = true;
-                            }
-
-                            // Create country if not resolved and text is present
-                            if (countryId == null && !string.IsNullOrWhiteSpace(parts.Country))
-                            {
-                                countryId = await GetOrCreateCountryAsync(parts.Country, continentId, ct);
-                                countryCache[parts.Country.ToLowerInvariant()] = countryId.Value;
-                                needsReview = true;
+                                if (id == null)
+                                {
+                                    countryId = await GetOrCreateCountryAsync(correctedCountry, continentId, ct);
+                                    countryCache[correctedCountry.ToLowerInvariant()] = countryId.Value;
+                                }
                             }
 
                             // Resolve/create region
                             int? regionId = null;
                             if (!string.IsNullOrWhiteSpace(parts.StateRegion) && countryId.HasValue)
-                            {
-                                regionId = await GetOrCreateRegionAsync(parts.StateRegion, countryId.Value, ct);
-                            }
+                                regionId = await GetOrCreateRegionAsync(parts.StateRegion.Trim(), countryId.Value, ct);
 
                             // Resolve/create city
                             int? cityId = null;
                             if (!string.IsNullOrWhiteSpace(parts.City) && countryId.HasValue)
-                            {
-                                cityId = await GetOrCreateCityAsync(parts.City, regionId, countryId.Value, ct);
-                            }
+                                cityId = await GetOrCreateCityAsync(parts.City.Trim(), regionId, countryId.Value, ct);
 
                             if (needsReview) flaggedForReview++;
 
@@ -279,17 +375,15 @@ LIMIT @limit OFFSET @offset;";
 UPDATE frl.frl_images_location
 SET needs_review = FALSE, confidence = 1.0, updated_at = NOW()
 WHERE id = @id
-RETURNING id, image_id, raw_location, continent_id, country_id, region_id, city_id,
-          specific_location, coordinates, confidence, needs_review, created_at, updated_at;";
+RETURNING id;";
 
                 await using var cmd = new NpgsqlCommand(sql, _connection);
                 cmd.Parameters.AddWithValue("@id", id);
-                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                var result = await cmd.ExecuteScalarAsync(ct);
 
-                if (!await reader.ReadAsync(ct))
+                if (result == null)
                     return NotFound(new { Message = $"Location {id} not found." });
 
-                // Need to re-query to get joined names
                 return Ok(await GetLocationByIdInternalAsync(id, ct));
             }
             finally { await _connection.CloseAsync(); }
@@ -607,7 +701,7 @@ FROM frl.frl_images_location;";
         }
 
         // ═══════════════════════════════════════════════════════════
-        //  LOOKUP CRUD – continents, countries, regions, cities
+        //  LOOKUP endpoints – continents, countries, regions, cities
         // ═══════════════════════════════════════════════════════════
 
         [HttpGet("continents")]
@@ -748,110 +842,6 @@ ORDER BY ci.name;";
         }
 
         // ═══════════════════════════════════════════════════════════
-        //  ALIAS management
-        // ═══════════════════════════════════════════════════════════
-
-        [HttpGet("aliases/{level}")]
-        [ProducesResponseType(typeof(List<AliasDto>), StatusCodes.Status200OK)]
-        public async Task<ActionResult<List<AliasDto>>> GetAliases(
-            string level, CancellationToken ct = default)
-        {
-            var (tableName, fkColumn, canonicalTable) = ResolveAliasTable(level);
-            if (tableName == null)
-                return BadRequest(new { Message = "Level must be: continent, country, region, or city" });
-
-            await EnsureOpenAsync(ct);
-            try
-            {
-                var sql = $@"
-SELECT a.id, a.alias, a.{fkColumn}, c.name
-FROM frl.{tableName} a
-JOIN frl.{canonicalTable} c ON c.id = a.{fkColumn}
-ORDER BY a.alias;";
-
-                await using var cmd = new NpgsqlCommand(sql, _connection);
-                await using var reader = await cmd.ExecuteReaderAsync(ct);
-                var list = new List<AliasDto>();
-                while (await reader.ReadAsync(ct))
-                    list.Add(new AliasDto
-                    {
-                        Id = reader.GetInt32(0),
-                        Alias = reader.GetString(1),
-                        CanonicalId = reader.GetInt32(2),
-                        CanonicalName = reader.GetString(3)
-                    });
-                return Ok(list);
-            }
-            finally { await _connection.CloseAsync(); }
-        }
-
-        [HttpPost("aliases/{level}")]
-        [ProducesResponseType(typeof(AliasDto), StatusCodes.Status201Created)]
-        public async Task<ActionResult<AliasDto>> CreateAlias(
-            string level, [FromBody] CreateAliasDto dto, CancellationToken ct = default)
-        {
-            var (tableName, fkColumn, canonicalTable) = ResolveAliasTable(level);
-            if (tableName == null)
-                return BadRequest(new { Message = "Level must be: continent, country, region, or city" });
-
-            if (string.IsNullOrWhiteSpace(dto.Alias))
-                return BadRequest(new { Message = "Alias text is required." });
-
-            await EnsureOpenAsync(ct);
-            try
-            {
-                var sql = $@"
-INSERT INTO frl.{tableName} (alias, {fkColumn})
-VALUES (@alias, @canonicalId)
-RETURNING id;";
-
-                await using var cmd = new NpgsqlCommand(sql, _connection);
-                cmd.Parameters.AddWithValue("@alias", dto.Alias.Trim());
-                cmd.Parameters.AddWithValue("@canonicalId", dto.CanonicalId);
-
-                var newId = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
-
-                // Fetch the canonical name
-                var nameSql = $"SELECT name FROM frl.{canonicalTable} WHERE id = @id;";
-                await using var nameCmd = new NpgsqlCommand(nameSql, _connection);
-                nameCmd.Parameters.AddWithValue("@id", dto.CanonicalId);
-                var canonicalName = (string?)await nameCmd.ExecuteScalarAsync(ct) ?? "";
-
-                return Created("", new AliasDto
-                {
-                    Id = newId,
-                    Alias = dto.Alias.Trim(),
-                    CanonicalId = dto.CanonicalId,
-                    CanonicalName = canonicalName
-                });
-            }
-            finally { await _connection.CloseAsync(); }
-        }
-
-        [HttpDelete("aliases/{level}/{id:int}")]
-        [ProducesResponseType(StatusCodes.Status204NoContent)]
-        public async Task<IActionResult> DeleteAlias(
-            string level, int id, CancellationToken ct = default)
-        {
-            var (tableName, _, _) = ResolveAliasTable(level);
-            if (tableName == null)
-                return BadRequest(new { Message = "Level must be: continent, country, region, or city" });
-
-            await EnsureOpenAsync(ct);
-            try
-            {
-                var sql = $"DELETE FROM frl.{tableName} WHERE id = @id;";
-                await using var cmd = new NpgsqlCommand(sql, _connection);
-                cmd.Parameters.AddWithValue("@id", id);
-                var affected = await cmd.ExecuteNonQueryAsync(ct);
-                if (affected == 0)
-                    return NotFound(new { Message = $"Alias {id} not found." });
-                return NoContent();
-            }
-            finally { await _connection.CloseAsync(); }
-        }
-
-        // ═══════════════════════════════════════════════════════════
         //  HELPERS
         // ═══════════════════════════════════════════════════════════
 
@@ -881,47 +871,30 @@ RETURNING id;";
             };
         }
 
-        /// <summary>
-        /// Try exact match → alias match → fuzzy match against canonical names.
-        /// Returns (resolvedId, confidence). confidence = 1.0 for exact/alias,
-        /// ratio/100 for fuzzy, 0 if no match.
-        /// </summary>
+        private static string CorrectValue(string? input, Dictionary<string, string> corrections)
+        {
+            if (string.IsNullOrWhiteSpace(input)) return string.Empty;
+            var trimmed = input.Trim();
+            return corrections.TryGetValue(trimmed, out var corrected) ? corrected : trimmed;
+        }
+
         private static (int? id, float confidence) ResolveWithFuzzy(
-            string input,
-            Dictionary<string, int> canonicalCache,
-            Dictionary<string, int> aliasCache)
+            string input, Dictionary<string, int> canonicalCache)
         {
             if (string.IsNullOrWhiteSpace(input))
                 return (null, 1.0f);
 
             var key = input.Trim().ToLowerInvariant();
 
-            // Exact canonical match
             if (canonicalCache.TryGetValue(key, out var exactId))
                 return (exactId, 1.0f);
 
-            // Exact alias match
-            if (aliasCache.TryGetValue(key, out var aliasId))
-                return (aliasId, 1.0f);
-
-            // Fuzzy match against canonical names
             var bestScore = 0;
             var bestId = (int?)null;
 
             foreach (var (name, id) in canonicalCache)
             {
                 var score = Fuzz.Ratio(key, name);
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestId = id;
-                }
-            }
-
-            // Also check aliases
-            foreach (var (alias, id) in aliasCache)
-            {
-                var score = Fuzz.Ratio(key, alias);
                 if (score > bestScore)
                 {
                     bestScore = score;
@@ -949,21 +922,6 @@ RETURNING id;";
             {
                 var name = reader.GetString(1).Trim().ToLowerInvariant();
                 cache.TryAdd(name, reader.GetInt32(0));
-            }
-            return cache;
-        }
-
-        private async Task<Dictionary<string, int>> LoadAliasCacheAsync(
-            string tableName, string fkColumn, CancellationToken ct)
-        {
-            var sql = $"SELECT alias, {fkColumn} FROM frl.{tableName};";
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            var cache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            while (await reader.ReadAsync(ct))
-            {
-                var alias = reader.GetString(0).Trim().ToLowerInvariant();
-                cache.TryAdd(alias, reader.GetInt32(1));
             }
             return cache;
         }
@@ -1070,16 +1028,6 @@ WHERE l.id = @id;";
                 UpdatedAt = reader.GetDateTime(reader.GetOrdinal("updated_at"))
             };
         }
-
-        private static (string? tableName, string? fkColumn, string? canonicalTable)
-            ResolveAliasTable(string level) => level.ToLowerInvariant() switch
-        {
-            "continent" => ("frl_location_continent_aliases", "continent_id", "frl_location_continents"),
-            "country" => ("frl_location_country_aliases", "country_id", "frl_location_countries"),
-            "region" => ("frl_location_region_aliases", "region_id", "frl_location_regions"),
-            "city" => ("frl_location_city_aliases", "city_id", "frl_location_cities"),
-            _ => (null, null, null)
-        };
 
         private static string? NullIfEmpty(string? value)
             => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
