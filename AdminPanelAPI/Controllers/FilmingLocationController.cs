@@ -148,6 +148,11 @@ namespace AdminPanelAPI.Controllers
             ["Bosnia"] = "Bosnia and Herzegovina",
         };
 
+        // Canonical country names derived from CountryCorrections values — used by
+        // IsLikelyCountry to detect countries even before the country cache is populated.
+        private static readonly HashSet<string> CanonicalCountryNames = new(
+            CountryCorrections.Values.Distinct(), StringComparer.OrdinalIgnoreCase);
+
         // ═══════════════════════════════════════════════════════════
         //  PARSE – read frl_images.filming_location → normalised rows
         // ═══════════════════════════════════════════════════════════
@@ -1252,6 +1257,7 @@ ORDER BY ci.name;";
         {
             var trimmed = value.Trim();
             if (CountryCorrections.ContainsKey(trimmed)) return true;
+            if (CanonicalCountryNames.Contains(trimmed)) return true;
             var corrected = CorrectValue(trimmed, CountryCorrections);
             return !string.IsNullOrWhiteSpace(corrected) &&
                 countryCache.ContainsKey(corrected.ToLowerInvariant());
