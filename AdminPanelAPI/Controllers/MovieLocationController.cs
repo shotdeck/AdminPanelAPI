@@ -233,8 +233,8 @@ SELECT
     ci.name AS city_name,
     r.name AS region_name,
     co.name AS country_name,
-    COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[0] AS lng,
-    COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[1] AS lat,
+    (COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates))[0] AS lng,
+    (COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates))[1] AS lat,
     i.filename
 FROM frl.frl_images_location il
 INNER JOIN frl.frl_images i ON i.idnum = il.image_id
@@ -302,8 +302,8 @@ SELECT
     ci.name AS city_name,
     r.name AS region_name,
     co.name AS country_name,
-    AVG(COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[0]) AS lng,
-    AVG(COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[1]) AS lat,
+    AVG((COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates))[0]) AS lng,
+    AVG((COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates))[1]) AS lat,
     COUNT(*) AS image_count,
     (ARRAY_AGG(i.filename ORDER BY i.idnum) FILTER (WHERE i.filename IS NOT NULL))[1:30] AS sample_filenames
 FROM frl.frl_images_location il
