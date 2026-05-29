@@ -216,6 +216,115 @@ ORDER BY m.title;";
             return Ok(points);
         }
 
+        // ── GET image locations for a movie (from frl_images_location) ─
+
+        [HttpGet("image-locations/{movieId:int}")]
+        [ProducesResponseType(typeof(List<ImageLocationDto>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<List<ImageLocationDto>>> GetImageLocations(int movieId, CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+
+            const string sql = @"
+SELECT
+    il.id,
+    il.specific_location,
+    ci.name AS city_name,
+    r.name AS region_name,
+    co.name AS country_name,
+    il.coordinates[0] AS lng,
+    il.coordinates[1] AS lat
+FROM frl.frl_images_location il
+INNER JOIN frl.frl_images i ON i.idnum = il.image_id
+LEFT JOIN frl.frl_location_cities ci ON ci.id = il.city_id
+LEFT JOIN frl.frl_location_regions r ON r.id = il.region_id
+LEFT JOIN frl.frl_location_countries co ON co.id = il.country_id
+WHERE i.movieid = @movieId
+  AND il.coordinates IS NOT NULL
+ORDER BY co.name, r.name, ci.name, il.specific_location;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            var items = new List<ImageLocationDto>();
+            while (await reader.ReadAsync(ct))
+            {
+                var specific = reader.IsDBNull(reader.GetOrdinal("specific_location"))
+                    ? null : reader.GetString(reader.GetOrdinal("specific_location"));
+                var city = reader.IsDBNull(reader.GetOrdinal("city_name"))
+                    ? null : reader.GetString(reader.GetOrdinal("city_name"));
+                var region = reader.IsDBNull(reader.GetOrdinal("region_name"))
+                    ? null : reader.GetString(reader.GetOrdinal("region_name"));
+                var country = reader.IsDBNull(reader.GetOrdinal("country_name"))
+                    ? null : reader.GetString(reader.GetOrdinal("country_name"));
+
+                var locationName = specific ?? city ?? region ?? country ?? "Unknown";
+
+                items.Add(new ImageLocationDto
+                {
+                    Id = reader.GetInt64(reader.GetOrdinal("id")),
+                    LocationName = locationName,
+                    City = city,
+                    Region = region,
+                    Country = country,
+                    Latitude = reader.GetDouble(reader.GetOrdinal("lat")),
+                    Longitude = reader.GetDouble(reader.GetOrdinal("lng"))
+                });
+            }
+
+            return Ok(items);
+        }
+
+        // ── GET image locations for a movie (grouped/deduplicated) ────
+
+        [HttpGet("image-locations/{movieId:int}/grouped")]
+        [ProducesResponseType(typeof(List<GroupedImageLocationDto>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<List<GroupedImageLocationDto>>> GetImageLocationsGrouped(int movieId, CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+
+            const string sql = @"
+SELECT
+    COALESCE(il.specific_location, ci.name, r.name, co.name, 'Unknown') AS location_name,
+    ci.name AS city_name,
+    r.name AS region_name,
+    co.name AS country_name,
+    AVG(il.coordinates[0]) AS lng,
+    AVG(il.coordinates[1]) AS lat,
+    COUNT(*) AS image_count
+FROM frl.frl_images_location il
+INNER JOIN frl.frl_images i ON i.idnum = il.image_id
+LEFT JOIN frl.frl_location_cities ci ON ci.id = il.city_id
+LEFT JOIN frl.frl_location_regions r ON r.id = il.region_id
+LEFT JOIN frl.frl_location_countries co ON co.id = il.country_id
+WHERE i.movieid = @movieId
+  AND il.coordinates IS NOT NULL
+GROUP BY COALESCE(il.specific_location, ci.name, r.name, co.name, 'Unknown'),
+         ci.name, r.name, co.name
+ORDER BY image_count DESC;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            var items = new List<GroupedImageLocationDto>();
+            while (await reader.ReadAsync(ct))
+            {
+                items.Add(new GroupedImageLocationDto
+                {
+                    LocationName = reader.GetString(reader.GetOrdinal("location_name")),
+                    City = reader.IsDBNull(reader.GetOrdinal("city_name")) ? null : reader.GetString(reader.GetOrdinal("city_name")),
+                    Region = reader.IsDBNull(reader.GetOrdinal("region_name")) ? null : reader.GetString(reader.GetOrdinal("region_name")),
+                    Country = reader.IsDBNull(reader.GetOrdinal("country_name")) ? null : reader.GetString(reader.GetOrdinal("country_name")),
+                    Latitude = reader.GetDouble(reader.GetOrdinal("lat")),
+                    Longitude = reader.GetDouble(reader.GetOrdinal("lng")),
+                    ImageCount = reader.GetInt32(reader.GetOrdinal("image_count"))
+                });
+            }
+
+            return Ok(items);
+        }
+
         // ── GET stats ───────────────────────────────────────────────
 
         [HttpGet("stats")]
@@ -663,5 +772,27 @@ WHERE m.media_type = 'movie'
         public int NoResults { get; set; }
         public int Failed { get; set; }
         public int RemainingMovies { get; set; }
+    }
+
+    public sealed class ImageLocationDto
+    {
+        public long Id { get; set; }
+        public string LocationName { get; set; } = "";
+        public string? City { get; set; }
+        public string? Region { get; set; }
+        public string? Country { get; set; }
+        public double Latitude { get; set; }
+        public double Longitude { get; set; }
+    }
+
+    public sealed class GroupedImageLocationDto
+    {
+        public string LocationName { get; set; } = "";
+        public string? City { get; set; }
+        public string? Region { get; set; }
+        public string? Country { get; set; }
+        public double Latitude { get; set; }
+        public double Longitude { get; set; }
+        public int ImageCount { get; set; }
     }
 }
