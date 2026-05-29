@@ -232,13 +232,15 @@ SELECT
     r.name AS region_name,
     co.name AS country_name,
     COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[0] AS lng,
-    COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[1] AS lat
+    COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[1] AS lat,
+    i.filename
 FROM frl.frl_images_location il
 INNER JOIN frl.frl_images i ON i.idnum = il.image_id
 LEFT JOIN frl.frl_location_cities ci ON ci.id = il.city_id
 LEFT JOIN frl.frl_location_regions r ON r.id = il.region_id
 LEFT JOIN frl.frl_location_countries co ON co.id = il.country_id
 WHERE i.movieid = @movieId
+  AND i.status = 'live'
   AND COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates) IS NOT NULL
 ORDER BY co.name, r.name, ci.name, il.specific_location;";
 
@@ -268,7 +270,8 @@ ORDER BY co.name, r.name, ci.name, il.specific_location;";
                     Region = region,
                     Country = country,
                     Latitude = reader.GetDouble(reader.GetOrdinal("lat")),
-                    Longitude = reader.GetDouble(reader.GetOrdinal("lng"))
+                    Longitude = reader.GetDouble(reader.GetOrdinal("lng")),
+                    Filename = reader.IsDBNull(reader.GetOrdinal("filename")) ? null : reader.GetString(reader.GetOrdinal("filename"))
                 });
             }
 
@@ -860,6 +863,7 @@ WHERE m.media_type = 'movie'
         public string? Country { get; set; }
         public double Latitude { get; set; }
         public double Longitude { get; set; }
+        public string? Filename { get; set; }
     }
 
     public sealed class GroupedImageLocationDto
