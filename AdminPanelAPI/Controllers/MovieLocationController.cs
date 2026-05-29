@@ -222,9 +222,11 @@ ORDER BY m.title;";
         [ProducesResponseType(typeof(List<ImageLocationDto>), StatusCodes.Status200OK)]
         public async Task<ActionResult<List<ImageLocationDto>>> GetImageLocations(int movieId, CancellationToken ct = default)
         {
-            await EnsureOpenAsync(ct);
+            try
+            {
+                await EnsureOpenAsync(ct);
 
-            const string sql = @"
+                const string sql = @"
 SELECT
     il.id,
     il.specific_location,
@@ -242,40 +244,46 @@ LEFT JOIN frl.frl_location_countries co ON co.id = il.country_id
 WHERE i.movieid = @movieId
   AND i.status = 'live'
   AND COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates) IS NOT NULL
-ORDER BY co.name, r.name, ci.name, il.specific_location;";
+ORDER BY co.name, r.name, ci.name, il.specific_location
+LIMIT 5000;";
 
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@movieId", movieId);
+                await using var cmd = new NpgsqlCommand(sql, _connection);
+                cmd.Parameters.AddWithValue("@movieId", movieId);
 
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            var items = new List<ImageLocationDto>();
-            while (await reader.ReadAsync(ct))
-            {
-                var specific = reader.IsDBNull(reader.GetOrdinal("specific_location"))
-                    ? null : reader.GetString(reader.GetOrdinal("specific_location"));
-                var city = reader.IsDBNull(reader.GetOrdinal("city_name"))
-                    ? null : reader.GetString(reader.GetOrdinal("city_name"));
-                var region = reader.IsDBNull(reader.GetOrdinal("region_name"))
-                    ? null : reader.GetString(reader.GetOrdinal("region_name"));
-                var country = reader.IsDBNull(reader.GetOrdinal("country_name"))
-                    ? null : reader.GetString(reader.GetOrdinal("country_name"));
-
-                var locationName = specific ?? city ?? region ?? country ?? "Unknown";
-
-                items.Add(new ImageLocationDto
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                var items = new List<ImageLocationDto>();
+                while (await reader.ReadAsync(ct))
                 {
-                    Id = reader.GetInt64(reader.GetOrdinal("id")),
-                    LocationName = locationName,
-                    City = city,
-                    Region = region,
-                    Country = country,
-                    Latitude = reader.GetDouble(reader.GetOrdinal("lat")),
-                    Longitude = reader.GetDouble(reader.GetOrdinal("lng")),
-                    Filename = reader.IsDBNull(reader.GetOrdinal("filename")) ? null : reader.GetString(reader.GetOrdinal("filename"))
-                });
-            }
+                    var specific = reader.IsDBNull(reader.GetOrdinal("specific_location"))
+                        ? null : reader.GetString(reader.GetOrdinal("specific_location"));
+                    var city = reader.IsDBNull(reader.GetOrdinal("city_name"))
+                        ? null : reader.GetString(reader.GetOrdinal("city_name"));
+                    var region = reader.IsDBNull(reader.GetOrdinal("region_name"))
+                        ? null : reader.GetString(reader.GetOrdinal("region_name"));
+                    var country = reader.IsDBNull(reader.GetOrdinal("country_name"))
+                        ? null : reader.GetString(reader.GetOrdinal("country_name"));
 
-            return Ok(items);
+                    var locationName = specific ?? city ?? region ?? country ?? "Unknown";
+
+                    items.Add(new ImageLocationDto
+                    {
+                        Id = reader.GetInt64(reader.GetOrdinal("id")),
+                        LocationName = locationName,
+                        City = city,
+                        Region = region,
+                        Country = country,
+                        Latitude = reader.GetDouble(reader.GetOrdinal("lat")),
+                        Longitude = reader.GetDouble(reader.GetOrdinal("lng")),
+                        Filename = reader.IsDBNull(reader.GetOrdinal("filename")) ? null : reader.GetString(reader.GetOrdinal("filename"))
+                    });
+                }
+
+                return Ok(items);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { error = ex.Message, detail = ex.InnerException?.Message });
+            }
         }
 
         // ── GET image locations for a movie (grouped/deduplicated) ────
@@ -284,6 +292,8 @@ ORDER BY co.name, r.name, ci.name, il.specific_location;";
         [ProducesResponseType(typeof(List<GroupedImageLocationDto>), StatusCodes.Status200OK)]
         public async Task<ActionResult<List<GroupedImageLocationDto>>> GetImageLocationsGrouped(int movieId, CancellationToken ct = default)
         {
+            try
+            {
             await EnsureOpenAsync(ct);
 
             const string sql = @"
@@ -302,10 +312,12 @@ LEFT JOIN frl.frl_location_cities ci ON ci.id = il.city_id
 LEFT JOIN frl.frl_location_regions r ON r.id = il.region_id
 LEFT JOIN frl.frl_location_countries co ON co.id = il.country_id
 WHERE i.movieid = @movieId
+  AND i.status = 'live'
   AND COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates) IS NOT NULL
 GROUP BY COALESCE(il.specific_location, ci.name, r.name, co.name, 'Unknown'),
          ci.name, r.name, co.name
-ORDER BY image_count DESC;";
+ORDER BY image_count DESC
+LIMIT 200;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
@@ -336,6 +348,11 @@ ORDER BY image_count DESC;";
             }
 
             return Ok(items);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { error = ex.Message, detail = ex.InnerException?.Message });
+            }
         }
 
         // ── GET image thumbnail (proxy to image server) ──────────────
