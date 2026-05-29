@@ -187,7 +187,8 @@ ORDER BY ml.location_name;";
 
             cmd.CommandText = $@"
 SELECT ml.id, ml.movie_id, m.title AS movie_title, m.year AS movie_year,
-       m.poster, ml.location_name, ml.latitude, ml.longitude
+       m.poster, ml.location_name, ml.latitude, ml.longitude,
+       (SELECT COUNT(*) FROM frl.frl_images img WHERE img.movieid = ml.movie_id AND img.status = 'live') AS live_image_count
 FROM frl.frl_movie_location ml
 INNER JOIN frl.frl_movies m ON m.idnum = ml.movie_id
 {where}
@@ -209,7 +210,8 @@ ORDER BY m.title;";
                     Poster = posterVal != null ? "https://image.tmdb.org/t/p/w154" + posterVal : null,
                     LocationName = reader.GetString(reader.GetOrdinal("location_name")),
                     Latitude = reader.GetDouble(reader.GetOrdinal("latitude")),
-                    Longitude = reader.GetDouble(reader.GetOrdinal("longitude"))
+                    Longitude = reader.GetDouble(reader.GetOrdinal("longitude")),
+                    LiveImageCount = reader.GetInt64(reader.GetOrdinal("live_image_count"))
                 });
             }
 
@@ -383,6 +385,7 @@ ORDER BY image_count DESC;";
 SELECT i.filename
 FROM frl.frl_images i
 WHERE i.movieid = @movieId
+  AND i.status = 'live'
   AND i.filename IS NOT NULL
   AND i.filename <> ''
 ORDER BY i.idnum
@@ -832,6 +835,7 @@ WHERE m.media_type = 'movie'
         public string LocationName { get; set; } = "";
         public double Latitude { get; set; }
         public double Longitude { get; set; }
+        public long LiveImageCount { get; set; }
     }
 
     public sealed class MovieLocationPageResponse
