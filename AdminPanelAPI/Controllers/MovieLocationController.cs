@@ -291,7 +291,8 @@ SELECT
     co.name AS country_name,
     AVG(il.coordinates[0]) AS lng,
     AVG(il.coordinates[1]) AS lat,
-    COUNT(*) AS image_count
+    COUNT(*) AS image_count,
+    (ARRAY_AGG(i.filename ORDER BY i.idnum) FILTER (WHERE i.filename IS NOT NULL))[1:6] AS sample_filenames
 FROM frl.frl_images_location il
 INNER JOIN frl.frl_images i ON i.idnum = il.image_id
 LEFT JOIN frl.frl_location_cities ci ON ci.id = il.city_id
@@ -310,6 +311,14 @@ ORDER BY image_count DESC;";
             var items = new List<GroupedImageLocationDto>();
             while (await reader.ReadAsync(ct))
             {
+                var filenames = new List<string>();
+                var filenameOrdinal = reader.GetOrdinal("sample_filenames");
+                if (!reader.IsDBNull(filenameOrdinal))
+                {
+                    var arr = reader.GetFieldValue<string[]>(filenameOrdinal);
+                    filenames.AddRange(arr);
+                }
+
                 items.Add(new GroupedImageLocationDto
                 {
                     LocationName = reader.GetString(reader.GetOrdinal("location_name")),
@@ -318,11 +327,45 @@ ORDER BY image_count DESC;";
                     Country = reader.IsDBNull(reader.GetOrdinal("country_name")) ? null : reader.GetString(reader.GetOrdinal("country_name")),
                     Latitude = reader.GetDouble(reader.GetOrdinal("lat")),
                     Longitude = reader.GetDouble(reader.GetOrdinal("lng")),
-                    ImageCount = reader.GetInt32(reader.GetOrdinal("image_count"))
+                    ImageCount = reader.GetInt32(reader.GetOrdinal("image_count")),
+                    SampleFilenames = filenames
                 });
             }
 
             return Ok(items);
+        }
+
+        // ── GET image thumbnail (proxy to image server) ──────────────
+
+        [HttpGet("image-thumb/{filename}")]
+        [ProducesResponseType(typeof(FileContentResult), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        [ResponseCache(Duration = 86400, Location = ResponseCacheLocation.Any)]
+        public async Task<IActionResult> GetImageThumb(string filename, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(filename) || filename.Contains("..") || filename.Contains("/"))
+                return BadRequest("Invalid filename");
+
+            var url = $"http://35.89.51.60:8889/file/small_{filename}";
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            var credentials = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes("shotdeck:Q9EN6W27"));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", credentials);
+
+            try
+            {
+                using var response = await Http.SendAsync(request, ct);
+                if (!response.IsSuccessStatusCode)
+                    return NotFound();
+
+                var content = await response.Content.ReadAsByteArrayAsync(ct);
+                var contentType = response.Content.Headers.ContentType?.MediaType ?? "image/jpeg";
+                return File(content, contentType);
+            }
+            catch
+            {
+                return NotFound();
+            }
         }
 
         // ── GET stats ───────────────────────────────────────────────
@@ -794,5 +837,6 @@ WHERE m.media_type = 'movie'
         public double Latitude { get; set; }
         public double Longitude { get; set; }
         public int ImageCount { get; set; }
+        public List<string> SampleFilenames { get; set; } = new();
     }
 }
