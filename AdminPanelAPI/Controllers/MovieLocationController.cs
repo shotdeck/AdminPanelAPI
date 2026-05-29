@@ -231,15 +231,15 @@ SELECT
     ci.name AS city_name,
     r.name AS region_name,
     co.name AS country_name,
-    il.coordinates[0] AS lng,
-    il.coordinates[1] AS lat
+    COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[0] AS lng,
+    COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[1] AS lat
 FROM frl.frl_images_location il
 INNER JOIN frl.frl_images i ON i.idnum = il.image_id
 LEFT JOIN frl.frl_location_cities ci ON ci.id = il.city_id
 LEFT JOIN frl.frl_location_regions r ON r.id = il.region_id
 LEFT JOIN frl.frl_location_countries co ON co.id = il.country_id
 WHERE i.movieid = @movieId
-  AND il.coordinates IS NOT NULL
+  AND COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates) IS NOT NULL
 ORDER BY co.name, r.name, ci.name, il.specific_location;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -289,8 +289,8 @@ SELECT
     ci.name AS city_name,
     r.name AS region_name,
     co.name AS country_name,
-    AVG(il.coordinates[0]) AS lng,
-    AVG(il.coordinates[1]) AS lat,
+    AVG(COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[0]) AS lng,
+    AVG(COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[1]) AS lat,
     COUNT(*) AS image_count,
     (ARRAY_AGG(i.filename ORDER BY i.idnum) FILTER (WHERE i.filename IS NOT NULL))[1:6] AS sample_filenames
 FROM frl.frl_images_location il
@@ -299,7 +299,7 @@ LEFT JOIN frl.frl_location_cities ci ON ci.id = il.city_id
 LEFT JOIN frl.frl_location_regions r ON r.id = il.region_id
 LEFT JOIN frl.frl_location_countries co ON co.id = il.country_id
 WHERE i.movieid = @movieId
-  AND il.coordinates IS NOT NULL
+  AND COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates) IS NOT NULL
 GROUP BY COALESCE(il.specific_location, ci.name, r.name, co.name, 'Unknown'),
          ci.name, r.name, co.name
 ORDER BY image_count DESC;";
