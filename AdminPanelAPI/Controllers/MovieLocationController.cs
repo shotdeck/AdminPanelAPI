@@ -292,7 +292,7 @@ SELECT
     AVG(COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[0]) AS lng,
     AVG(COALESCE(il.coordinates, ci.coordinates, r.coordinates, co.coordinates)[1]) AS lat,
     COUNT(*) AS image_count,
-    (ARRAY_AGG(i.filename ORDER BY i.idnum) FILTER (WHERE i.filename IS NOT NULL))[1:6] AS sample_filenames
+    (ARRAY_AGG(i.filename ORDER BY i.idnum) FILTER (WHERE i.filename IS NOT NULL))[1:30] AS sample_filenames
 FROM frl.frl_images_location il
 INNER JOIN frl.frl_images i ON i.idnum = il.image_id
 LEFT JOIN frl.frl_location_cities ci ON ci.id = il.city_id
