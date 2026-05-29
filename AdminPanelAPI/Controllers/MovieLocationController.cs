@@ -368,6 +368,40 @@ ORDER BY image_count DESC;";
             }
         }
 
+        // ── GET sample images for a movie (no coordinate dependency) ─
+
+        [HttpGet("movie-images/{movieId:int}")]
+        [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetMovieImages(int movieId, [FromQuery] int limit = 30, CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+
+            if (limit < 1) limit = 1;
+            if (limit > 100) limit = 100;
+
+            const string sql = @"
+SELECT i.filename
+FROM frl.frl_images i
+WHERE i.movieid = @movieId
+  AND i.filename IS NOT NULL
+  AND i.filename <> ''
+ORDER BY i.idnum
+LIMIT @limit;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@limit", limit);
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            var filenames = new List<string>();
+            while (await reader.ReadAsync(ct))
+            {
+                filenames.Add(reader.GetString(0));
+            }
+
+            return Ok(new { movieId, filenames });
+        }
+
         // ── GET stats ───────────────────────────────────────────────
 
         [HttpGet("stats")]
