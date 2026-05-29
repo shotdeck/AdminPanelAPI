@@ -102,6 +102,28 @@ namespace AdminPanelAPI.Controllers
             finally { await _connection.CloseAsync(); }
         }
 
+        // ─── POST /api/admin/geocode/run-all ───────────────────────────
+        // Kicks off background geocoding of all tiers (countries → regions → cities → specific → propagate)
+        // Returns immediately. Poll GET /status for progress.
+        [HttpPost("run-all")]
+        [ProducesResponseType(StatusCodes.Status202Accepted)]
+        [ProducesResponseType(StatusCodes.Status409Conflict)]
+        public ActionResult RunAll()
+        {
+            if (!Services.GeocodeBackgroundService.TryStart())
+                return Conflict(new { error = "Geocoding is already running", progress = Services.GeocodeBackgroundService.GetProgress() });
+
+            return Accepted(new { message = "Geocoding started. Poll GET /api/admin/geocode/status for progress." });
+        }
+
+        // ─── GET /api/admin/geocode/status ─────────────────────────────
+        [HttpGet("status")]
+        [ProducesResponseType(typeof(Services.GeocodeProgress), StatusCodes.Status200OK)]
+        public ActionResult<Services.GeocodeProgress> GetStatus()
+        {
+            return Ok(Services.GeocodeBackgroundService.GetProgress());
+        }
+
         // ─── POST /api/admin/geocode/countries ─────────────────────────
         [HttpPost("countries")]
         [ProducesResponseType(typeof(GeocodeResultResponse), StatusCodes.Status200OK)]

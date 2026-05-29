@@ -59,6 +59,9 @@ builder.Services.AddHostedService<CaptionEmbeddingWorker>();
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
 
+// Background geocoding service
+builder.Services.AddHostedService<GeocodeBackgroundService>();
+
 builder.Services.AddCors(opt =>
 {
     opt.AddPolicy("AllowAll", p =>
