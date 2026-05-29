@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
 using NpgsqlTypes;
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text.Json;
 
@@ -13,6 +14,7 @@ namespace AdminPanelAPI.Controllers
         private readonly NpgsqlConnection _connection;
         private readonly ILogger<GeocodeController> _logger;
         private static readonly HttpClient _http = CreateHttpClient();
+        private const int MaxRequestSeconds = 180; // Stop before Azure's 230s timeout
 
         public GeocodeController(
             NpgsqlConnection connection,
@@ -127,9 +129,10 @@ namespace AdminPanelAPI.Controllers
                 }
 
                 int geocoded = 0, failed = 0;
+                var sw = Stopwatch.StartNew();
                 foreach (var (id, name) in items)
                 {
-                    if (ct.IsCancellationRequested) break;
+                    if (ct.IsCancellationRequested || sw.Elapsed.TotalSeconds > MaxRequestSeconds) break;
 
                     var coords = await GeocodeWithNominatim(name, null, null, ct);
                     if (coords.HasValue)
@@ -158,10 +161,11 @@ namespace AdminPanelAPI.Controllers
 
                 return Ok(new GeocodeResultResponse
                 {
-                    Processed = items.Count,
+                    Processed = geocoded + failed,
                     Geocoded = geocoded,
                     Failed = failed,
-                    Remaining = remaining
+                    Remaining = remaining,
+                    ElapsedSeconds = (int)sw.Elapsed.TotalSeconds
                 });
             }
             finally { await _connection.CloseAsync(); }
@@ -200,9 +204,10 @@ namespace AdminPanelAPI.Controllers
                 }
 
                 int geocoded = 0, failed = 0;
+                var sw = Stopwatch.StartNew();
                 foreach (var (id, name, country) in items)
                 {
-                    if (ct.IsCancellationRequested) break;
+                    if (ct.IsCancellationRequested || sw.Elapsed.TotalSeconds > MaxRequestSeconds) break;
 
                     var coords = await GeocodeWithNominatim(name, null, country, ct);
                     if (coords.HasValue)
@@ -231,10 +236,11 @@ namespace AdminPanelAPI.Controllers
 
                 return Ok(new GeocodeResultResponse
                 {
-                    Processed = items.Count,
+                    Processed = geocoded + failed,
                     Geocoded = geocoded,
                     Failed = failed,
-                    Remaining = remaining
+                    Remaining = remaining,
+                    ElapsedSeconds = (int)sw.Elapsed.TotalSeconds
                 });
             }
             finally { await _connection.CloseAsync(); }
@@ -275,9 +281,10 @@ namespace AdminPanelAPI.Controllers
                 }
 
                 int geocoded = 0, failed = 0;
+                var sw = Stopwatch.StartNew();
                 foreach (var (id, name, region, country) in items)
                 {
-                    if (ct.IsCancellationRequested) break;
+                    if (ct.IsCancellationRequested || sw.Elapsed.TotalSeconds > MaxRequestSeconds) break;
 
                     var coords = await GeocodeWithNominatim(name, region, country, ct);
                     if (coords.HasValue)
@@ -306,10 +313,11 @@ namespace AdminPanelAPI.Controllers
 
                 return Ok(new GeocodeResultResponse
                 {
-                    Processed = items.Count,
+                    Processed = geocoded + failed,
                     Geocoded = geocoded,
                     Failed = failed,
-                    Remaining = remaining
+                    Remaining = remaining,
+                    ElapsedSeconds = (int)sw.Elapsed.TotalSeconds
                 });
             }
             finally { await _connection.CloseAsync(); }
@@ -357,9 +365,10 @@ namespace AdminPanelAPI.Controllers
                 }
 
                 int geocoded = 0, failed = 0;
+                var sw = Stopwatch.StartNew();
                 foreach (var (location, city, region, country) in items)
                 {
-                    if (ct.IsCancellationRequested) break;
+                    if (ct.IsCancellationRequested || sw.Elapsed.TotalSeconds > MaxRequestSeconds) break;
 
                     var queryParts = new List<string> { location };
                     if (!string.IsNullOrEmpty(city)) queryParts.Add(city);
@@ -411,10 +420,11 @@ namespace AdminPanelAPI.Controllers
 
                 return Ok(new GeocodeResultResponse
                 {
-                    Processed = items.Count,
+                    Processed = geocoded + failed,
                     Geocoded = geocoded,
                     Failed = failed,
-                    Remaining = remaining
+                    Remaining = remaining,
+                    ElapsedSeconds = (int)sw.Elapsed.TotalSeconds
                 });
             }
             finally { await _connection.CloseAsync(); }
@@ -560,6 +570,7 @@ namespace AdminPanelAPI.Controllers
             public int Geocoded { get; set; }
             public int Failed { get; set; }
             public int Remaining { get; set; }
+            public int ElapsedSeconds { get; set; }
         }
 
         public sealed class PropagateResponse
