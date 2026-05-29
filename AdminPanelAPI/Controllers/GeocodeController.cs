@@ -559,8 +559,8 @@ namespace AdminPanelAPI.Controllers
                 if (arr.GetArrayLength() == 0) return null;
 
                 var first = arr[0];
-                var lat = double.Parse(first.GetProperty("lat").GetString()!);
-                var lng = double.Parse(first.GetProperty("lon").GetString()!);
+                var lat = double.Parse(first.GetProperty("lat").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+                var lng = double.Parse(first.GetProperty("lon").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
                 return (lat, lng);
             }
             catch (Exception ex)
