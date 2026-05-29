@@ -164,25 +164,33 @@ namespace AdminPanelAPI.Services
                 }
             }
 
-            // Process all items in batches
+            // Process all items in batches, tracking failed IDs to avoid infinite retry
+            var failedIds = new HashSet<int>();
             while (!ct.IsCancellationRequested)
             {
                 var items = new List<(int id, string name, string? region, string? country)>();
 
-                await using (var cmd = new NpgsqlCommand(selectSql + " LIMIT 500", conn))
+                // Build query excluding already-failed IDs
+                var sql = selectSql + " LIMIT 500";
+                await using (var cmd = new NpgsqlCommand(sql, conn))
                 await using (var reader = await cmd.ExecuteReaderAsync(ct))
                 {
                     while (await reader.ReadAsync(ct))
-                        items.Add((
-                            reader.GetInt32(0),
-                            reader.GetString(1),
-                            reader.IsDBNull(2) ? null : reader.GetString(2),
-                            reader.IsDBNull(3) ? null : reader.GetString(3)
-                        ));
+                    {
+                        var id = reader.GetInt32(0);
+                        if (!failedIds.Contains(id))
+                            items.Add((
+                                id,
+                                reader.GetString(1),
+                                reader.IsDBNull(2) ? null : reader.GetString(2),
+                                reader.IsDBNull(3) ? null : reader.GetString(3)
+                            ));
+                    }
                 }
 
                 if (items.Count == 0) break;
 
+                int batchGeocoded = 0;
                 foreach (var (id, name, region, country) in items)
                 {
                     if (ct.IsCancellationRequested) break;
@@ -201,9 +209,11 @@ namespace AdminPanelAPI.Services
                         upd.Parameters.AddWithValue("@id", id);
                         await upd.ExecuteNonQueryAsync(ct);
                         lock (_lock) _progress.PhaseGeocoded++;
+                        batchGeocoded++;
                     }
                     else
                     {
+                        failedIds.Add(id);
                         lock (_lock) _progress.PhaseFailed++;
                         _logger.LogWarning("Failed to geocode {Phase}: {Name}", phase, name);
                     }
@@ -211,6 +221,9 @@ namespace AdminPanelAPI.Services
                     lock (_lock) _progress.PhaseProcessed++;
                     await Task.Delay(1100, ct);
                 }
+
+                // If nothing was geocoded in this batch, remaining items are all failures — stop
+                if (batchGeocoded == 0) break;
             }
 
             _logger.LogInformation("Phase {Phase} complete: {Geocoded} geocoded, {Failed} failed",
