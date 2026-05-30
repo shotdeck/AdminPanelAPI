@@ -411,6 +411,7 @@ LIMIT 200;";
 SELECT i.filename
 FROM frl.frl_images i
 WHERE i.movieid = @movieId
+  AND i.status = 'live'
   AND i.filename IS NOT NULL
   AND i.filename <> ''
 ORDER BY i.idnum
