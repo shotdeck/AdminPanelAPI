@@ -308,7 +308,7 @@ LIMIT @limit;";
 
                             // Hierarchy inference: backfill missing parent levels
                             // from existing DB data when a child level is known
-                            if (cityName != null && countryId == null)
+                            if (cityName != null && countryId == null && correctedCountry == null)
                             {
                                 var cityLower = cityName.ToLowerInvariant();
                                 if (cityHierarchy.TryGetValue(cityLower, out var ch))
@@ -326,7 +326,7 @@ LIMIT @limit;";
                                     }
                                 }
                             }
-                            else if (regionName != null && countryId == null)
+                            else if (regionName != null && countryId == null && correctedCountry == null)
                             {
                                 var regionLower = regionName.ToLowerInvariant();
                                 if (regionHierarchy.TryGetValue(regionLower, out var rh))
@@ -549,6 +549,170 @@ RETURNING id;";
             {
                 await _connection.CloseAsync();
             }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        //  DIAGNOSTICS – find city/country mismatches
+        // ═══════════════════════════════════════════════════════════
+
+        [HttpGet("city-mismatches")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<ActionResult> GetCityMismatches(CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            try
+            {
+                // Find cities where the assigned country doesn't match
+                // the country found in the raw_location strings that reference them.
+                var sql = @"
+WITH city_raw AS (
+    SELECT DISTINCT ci.id AS city_id, ci.name AS city_name,
+           c.name AS assigned_country,
+           ci.coordinates IS NULL AS missing_coords,
+           split_part(l.raw_location, ':', 3) AS raw_country
+    FROM frl.frl_location_cities ci
+    JOIN frl.frl_location_countries c ON c.id = ci.country_id
+    JOIN frl.frl_images_location l ON l.city_id = ci.id
+    WHERE l.raw_location IS NOT NULL
+      AND split_part(l.raw_location, ':', 3) <> ''
+)
+SELECT city_id, city_name, assigned_country, missing_coords,
+       array_agg(DISTINCT raw_country) AS raw_countries
+FROM city_raw
+WHERE lower(trim(raw_country)) <> lower(trim(assigned_country))
+GROUP BY city_id, city_name, assigned_country, missing_coords
+ORDER BY missing_coords DESC, city_name;";
+
+                await using var cmd = new NpgsqlCommand(sql, _connection);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                var results = new List<object>();
+                while (await reader.ReadAsync(ct))
+                {
+                    var rawCountries = reader.GetFieldValue<string[]>(4);
+                    results.Add(new
+                    {
+                        cityId = reader.GetInt32(0),
+                        cityName = reader.GetString(1),
+                        assignedCountry = reader.GetString(2),
+                        missingCoords = reader.GetBoolean(3),
+                        rawCountries = rawCountries
+                    });
+                }
+                return Ok(new { total = results.Count, mismatches = results });
+            }
+            finally { await _connection.CloseAsync(); }
+        }
+
+        [HttpPost("fix-city-countries")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<ActionResult> FixCityCountries(CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            try
+            {
+                // For each mismatched city, determine the correct country from raw_location,
+                // then update or merge the city record.
+                var findSql = @"
+WITH city_raw AS (
+    SELECT ci.id AS city_id, ci.name AS city_name,
+           ci.country_id AS old_country_id,
+           ci.region_id,
+           split_part(l.raw_location, ':', 3) AS raw_country,
+           COUNT(*) AS ref_count
+    FROM frl.frl_location_cities ci
+    JOIN frl.frl_location_countries c ON c.id = ci.country_id
+    JOIN frl.frl_images_location l ON l.city_id = ci.id
+    WHERE l.raw_location IS NOT NULL
+      AND split_part(l.raw_location, ':', 3) <> ''
+      AND lower(trim(split_part(l.raw_location, ':', 3))) <> lower(trim(c.name))
+    GROUP BY ci.id, ci.name, ci.country_id, ci.region_id,
+             split_part(l.raw_location, ':', 3)
+)
+SELECT city_id, city_name, old_country_id, region_id,
+       raw_country, ref_count
+FROM city_raw
+ORDER BY ref_count DESC;";
+
+                await using var findCmd = new NpgsqlCommand(findSql, _connection);
+                await using var reader = await findCmd.ExecuteReaderAsync(ct);
+                var fixes = new List<(int cityId, string cityName, int oldCountryId,
+                    int? regionId, string rawCountry)>();
+                while (await reader.ReadAsync(ct))
+                {
+                    fixes.Add((
+                        reader.GetInt32(0), reader.GetString(1), reader.GetInt32(2),
+                        reader.IsDBNull(3) ? null : reader.GetInt32(3),
+                        reader.GetString(4)));
+                }
+                await reader.CloseAsync();
+
+                int updated = 0, merged = 0, skipped = 0;
+                var details = new List<object>();
+
+                foreach (var (cityId, cityName, oldCountryId, regionId, rawCountry) in fixes)
+                {
+                    // Find the correct country_id
+                    var lookupSql = "SELECT id FROM frl.frl_location_countries WHERE lower(name) = @name LIMIT 1;";
+                    await using var lookupCmd = new NpgsqlCommand(lookupSql, _connection);
+                    lookupCmd.Parameters.AddWithValue("@name", rawCountry.Trim().ToLowerInvariant());
+                    var result = await lookupCmd.ExecuteScalarAsync(ct);
+                    if (result == null)
+                    {
+                        skipped++;
+                        details.Add(new { cityId, cityName, rawCountry, action = "skipped", reason = "country not found" });
+                        continue;
+                    }
+                    var correctCountryId = Convert.ToInt32(result);
+                    if (correctCountryId == oldCountryId)
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    // Check if city already exists under the correct country
+                    var existsSql = "SELECT id FROM frl.frl_location_cities WHERE lower(name) = @name AND country_id = @cid LIMIT 1;";
+                    await using var existsCmd = new NpgsqlCommand(existsSql, _connection);
+                    existsCmd.Parameters.AddWithValue("@name", cityName.Trim().ToLowerInvariant());
+                    existsCmd.Parameters.AddWithValue("@cid", correctCountryId);
+                    var existsResult = await existsCmd.ExecuteScalarAsync(ct);
+
+                    if (existsResult != null)
+                    {
+                        // Merge: reassign all references to the existing correct city
+                        var targetCityId = Convert.ToInt32(existsResult);
+                        var mergeSql = "UPDATE frl.frl_images_location SET city_id = @target WHERE city_id = @source;";
+                        await using var mergeCmd = new NpgsqlCommand(mergeSql, _connection);
+                        mergeCmd.Parameters.AddWithValue("@target", targetCityId);
+                        mergeCmd.Parameters.AddWithValue("@source", cityId);
+                        await mergeCmd.ExecuteNonQueryAsync(ct);
+
+                        // Delete the orphaned city if no more references
+                        var delSql = @"DELETE FROM frl.frl_location_cities WHERE id = @id
+                                       AND NOT EXISTS (SELECT 1 FROM frl.frl_images_location WHERE city_id = @id);";
+                        await using var delCmd = new NpgsqlCommand(delSql, _connection);
+                        delCmd.Parameters.AddWithValue("@id", cityId);
+                        await delCmd.ExecuteNonQueryAsync(ct);
+
+                        merged++;
+                        details.Add(new { cityId, cityName, rawCountry, action = "merged", targetCityId });
+                    }
+                    else
+                    {
+                        // No duplicate: just update the country_id
+                        var updateSql = "UPDATE frl.frl_location_cities SET country_id = @cid WHERE id = @id;";
+                        await using var updateCmd = new NpgsqlCommand(updateSql, _connection);
+                        updateCmd.Parameters.AddWithValue("@cid", correctCountryId);
+                        updateCmd.Parameters.AddWithValue("@id", cityId);
+                        await updateCmd.ExecuteNonQueryAsync(ct);
+
+                        updated++;
+                        details.Add(new { cityId, cityName, rawCountry, action = "updated", correctCountryId });
+                    }
+                }
+
+                return Ok(new { updated, merged, skipped, details });
+            }
+            finally { await _connection.CloseAsync(); }
         }
 
         // ═══════════════════════════════════════════════════════════
