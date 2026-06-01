@@ -715,6 +715,8 @@ WHERE l.raw_location IS NOT NULL
                 }
 
                 // ── Step 2: Fix city-country mismatches ──
+                // Use DISTINCT ON to pick one row per (city_id, raw_country),
+                // choosing the raw_region with the most image references.
                 var findSql = @"
 WITH city_raw AS (
     SELECT ci.id AS city_id, ci.name AS city_name,
@@ -733,10 +735,11 @@ WITH city_raw AS (
              split_part(l.raw_location, ':', 3),
              split_part(l.raw_location, ':', 4)
 )
-SELECT city_id, city_name, old_country_id, region_id,
+SELECT DISTINCT ON (city_id, raw_country)
+       city_id, city_name, old_country_id, region_id,
        raw_country, raw_region, ref_count
 FROM city_raw
-ORDER BY ref_count DESC;";
+ORDER BY city_id, raw_country, ref_count DESC;";
 
                 await using var findCmd = new NpgsqlCommand(findSql, _connection);
                 await using var reader = await findCmd.ExecuteReaderAsync(ct);
