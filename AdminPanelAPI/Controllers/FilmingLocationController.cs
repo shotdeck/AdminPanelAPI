@@ -308,7 +308,7 @@ LIMIT @limit;";
 
                             // Hierarchy inference: backfill missing parent levels
                             // from existing DB data when a child level is known
-                            if (cityName != null && countryId == null && correctedCountry == null)
+                            if (cityName != null && countryId == null && string.IsNullOrWhiteSpace(correctedCountry))
                             {
                                 var cityLower = cityName.ToLowerInvariant();
                                 if (cityHierarchy.TryGetValue(cityLower, out var ch))
@@ -326,7 +326,7 @@ LIMIT @limit;";
                                     }
                                 }
                             }
-                            else if (regionName != null && countryId == null && correctedCountry == null)
+                            else if (regionName != null && countryId == null && string.IsNullOrWhiteSpace(correctedCountry))
                             {
                                 var regionLower = regionName.ToLowerInvariant();
                                 if (regionHierarchy.TryGetValue(regionLower, out var rh))
