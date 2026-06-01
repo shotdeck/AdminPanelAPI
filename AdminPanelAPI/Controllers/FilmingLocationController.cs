@@ -99,6 +99,17 @@ namespace AdminPanelAPI.Controllers
             ["Untied States"] = "United States",
             ["Untied States of America"] = "United States",
             ["US/Mexico"] = "United States",
+            ["United States of Ameica"] = "United States",
+            ["United States of Amercia"] = "United States",
+            ["United States of Ameriac"] = "United States",
+            ["United States of American"] = "United States",
+            ["United States of Americaq"] = "United States",
+            ["United States of Amrica"] = "United States",
+            ["United States'"] = "United States",
+            ["United Sttates"] = "United States",
+            ["Unitied States"] = "United States",
+            ["Unted States"] = "United States",
+            ["America"] = "United States",
             // United Kingdom variants
             ["UK"] = "United Kingdom",
             ["United Kindom"] = "United Kingdom",
@@ -107,12 +118,18 @@ namespace AdminPanelAPI.Controllers
             ["Scotland"] = "United Kingdom",
             ["Wales"] = "United Kingdom",
             ["Northern Ireland"] = "United Kingdom",
+            ["United Kindgom"] = "United Kingdom",
+            ["United Kingdo"] = "United Kingdom",
+            ["United Kingdowm"] = "United Kingdom",
+            ["United Kingsom"] = "United Kingdom",
             // Czech Republic
             ["Czech Repubic"] = "Czech Republic",
             ["Czechia"] = "Czech Republic",
             ["Czechoslovakia"] = "Czech Republic",
             // Philippines
             ["The Phillipines"] = "Philippines",
+            ["Phillipines"] = "Philippines",
+            ["Phillippines"] = "Philippines",
             // Colombia (not Columbia)
             ["Columbia"] = "Colombia",
             // Romania
@@ -141,11 +158,33 @@ namespace AdminPanelAPI.Controllers
             ["Texas"] = "United States",
             // Other
             ["Soviet Union"] = "Russia",
+            ["USSR"] = "Russia",
             ["South West Africa"] = "Namibia",
             ["Republic of China"] = "Taiwan",
             [" Republic of China"] = "Taiwan",
+            ["The Republic of China"] = "Taiwan",
             ["Borneo"] = "Indonesia",
             ["Bosnia"] = "Bosnia and Herzegovina",
+            // Canada
+            ["Canda"] = "Canada",
+            // France
+            ["Franch"] = "France",
+            // Hungary
+            ["Hungar"] = "Hungary",
+            // Austria
+            ["Austri"] = "Austria",
+            // India
+            ["Inida"] = "India",
+            // Ukraine
+            ["Ikraine"] = "Ukraine",
+            // Papua New Guinea
+            ["New Guinea"] = "Papua New Guinea",
+            // Australia
+            ["South Australia"] = "Australia",
+            // Kosovo
+            ["Republic of Kosovo"] = "Kosovo",
+            // Palau
+            ["Republic of Palau"] = "Palau",
         };
 
         // Canonical country names derived from CountryCorrections values — used by
@@ -563,41 +602,60 @@ RETURNING id;";
             try
             {
                 // Section A: cities where the assigned country doesn't match raw_location
+                // Fetch all city/raw-country pairs, then apply CountryCorrections in C#
+                // so aliases like "USA" → "United States" are resolved before comparing.
                 var mismatchSql = @"
-WITH city_raw AS (
-    SELECT DISTINCT ci.id AS city_id, ci.name AS city_name,
-           c.name AS assigned_country,
-           ci.coordinates IS NULL AS missing_coords,
-           split_part(l.raw_location, ':', 3) AS raw_country
-    FROM frl.frl_location_cities ci
-    JOIN frl.frl_location_countries c ON c.id = ci.country_id
-    JOIN frl.frl_images_location l ON l.city_id = ci.id
-    WHERE l.raw_location IS NOT NULL
-      AND split_part(l.raw_location, ':', 3) <> ''
-)
-SELECT city_id, city_name, assigned_country, missing_coords,
-       array_agg(DISTINCT raw_country) AS raw_countries
-FROM city_raw
-WHERE lower(trim(raw_country)) <> lower(trim(assigned_country))
-GROUP BY city_id, city_name, assigned_country, missing_coords
-ORDER BY missing_coords DESC, city_name;";
+SELECT ci.id AS city_id, ci.name AS city_name,
+       c.name AS assigned_country,
+       ci.coordinates IS NULL AS missing_coords,
+       split_part(l.raw_location, ':', 3) AS raw_country
+FROM frl.frl_location_cities ci
+JOIN frl.frl_location_countries c ON c.id = ci.country_id
+JOIN frl.frl_images_location l ON l.city_id = ci.id
+WHERE l.raw_location IS NOT NULL
+  AND split_part(l.raw_location, ':', 3) <> '';";
 
                 await using var mismatchCmd = new NpgsqlCommand(mismatchSql, _connection);
                 await using var mismatchReader = await mismatchCmd.ExecuteReaderAsync(ct);
-                var mismatches = new List<object>();
+                var rawRows = new List<(int cityId, string cityName, string assignedCountry,
+                    bool missingCoords, string rawCountry)>();
                 while (await mismatchReader.ReadAsync(ct))
                 {
-                    var rawCountries = mismatchReader.GetFieldValue<string[]>(4);
-                    mismatches.Add(new
-                    {
-                        cityId = mismatchReader.GetInt32(0),
-                        cityName = mismatchReader.GetString(1),
-                        assignedCountry = mismatchReader.GetString(2),
-                        missingCoords = mismatchReader.GetBoolean(3),
-                        rawCountries = rawCountries
-                    });
+                    rawRows.Add((
+                        mismatchReader.GetInt32(0), mismatchReader.GetString(1),
+                        mismatchReader.GetString(2), mismatchReader.GetBoolean(3),
+                        mismatchReader.GetString(4)));
                 }
                 await mismatchReader.CloseAsync();
+
+                var mismatches = rawRows
+                    .GroupBy(r => (r.cityId, r.cityName, r.assignedCountry, r.missingCoords))
+                    .Select(g =>
+                    {
+                        var rawCountries = g.Select(r => r.rawCountry.Trim()).Distinct().ToArray();
+                        var correctedCountries = rawCountries
+                            .Select(rc => CorrectValue(rc, CountryCorrections))
+                            .Where(c => !string.IsNullOrWhiteSpace(c))
+                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                            .ToArray();
+                        var assigned = g.Key.assignedCountry.Trim();
+                        var allMatch = correctedCountries.All(c =>
+                            string.Equals(c, assigned, StringComparison.OrdinalIgnoreCase));
+                        return new { g.Key, rawCountries, correctedCountries, allMatch };
+                    })
+                    .Where(x => !x.allMatch)
+                    .OrderByDescending(x => x.Key.missingCoords)
+                    .ThenBy(x => x.Key.cityName)
+                    .Select(x => new
+                    {
+                        cityId = x.Key.cityId,
+                        cityName = x.Key.cityName,
+                        assignedCountry = x.Key.assignedCountry,
+                        missingCoords = x.Key.missingCoords,
+                        rawCountries = x.rawCountries,
+                        correctedCountries = x.correctedCountries
+                    })
+                    .ToList<object>();
 
                 // Section B: orphan cities with zero image references
                 var orphanSql = @"
@@ -626,27 +684,40 @@ ORDER BY ci.name;";
                 await orphanReader.CloseAsync();
 
                 // Section C: countries referenced in raw_location but missing from the DB
+                // Apply CountryCorrections so aliases are resolved before checking existence.
                 var missingCountriesSql = @"
 SELECT DISTINCT trim(split_part(l.raw_location, ':', 3)) AS raw_country,
        trim(split_part(l.raw_location, ':', 2)) AS raw_continent
 FROM frl.frl_images_location l
 WHERE l.raw_location IS NOT NULL
-  AND trim(split_part(l.raw_location, ':', 3)) <> ''
-  AND NOT EXISTS (
-    SELECT 1 FROM frl.frl_location_countries c
-    WHERE lower(trim(c.name)) = lower(trim(split_part(l.raw_location, ':', 3)))
-  )
-ORDER BY raw_country;";
+  AND trim(split_part(l.raw_location, ':', 3)) <> '';";
+
+                // Fetch all existing country names for comparison
+                var existingCountrySql = "SELECT DISTINCT lower(name) FROM frl.frl_location_countries;";
+                await using var ecCmd = new NpgsqlCommand(existingCountrySql, _connection);
+                await using var ecReader = await ecCmd.ExecuteReaderAsync(ct);
+                var existingCountryNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                while (await ecReader.ReadAsync(ct))
+                    existingCountryNames.Add(ecReader.GetString(0));
+                await ecReader.CloseAsync();
 
                 await using var mcCmd = new NpgsqlCommand(missingCountriesSql, _connection);
                 await using var mcReader = await mcCmd.ExecuteReaderAsync(ct);
                 var missingCountries = new List<object>();
+                var seenCorrected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 while (await mcReader.ReadAsync(ct))
                 {
+                    var rawCountry = mcReader.GetString(0);
+                    var rawContinent = mcReader.IsDBNull(1) ? null : mcReader.GetString(1);
+                    var corrected = CorrectValue(rawCountry, CountryCorrections);
+                    if (string.IsNullOrWhiteSpace(corrected)) continue;
+                    if (existingCountryNames.Contains(corrected)) continue;
+                    if (!seenCorrected.Add(corrected)) continue;
                     missingCountries.Add(new
                     {
-                        rawCountry = mcReader.GetString(0),
-                        rawContinent = mcReader.IsDBNull(1) ? null : mcReader.GetString(1)
+                        rawCountry,
+                        correctedName = corrected,
+                        rawContinent
                     });
                 }
 
@@ -673,27 +744,44 @@ ORDER BY raw_country;";
                 var details = new List<object>();
 
                 // ── Step 1: Create missing countries referenced in raw_location ──
+                // Apply CountryCorrections so aliases resolve to canonical names first.
                 var missingCountriesSql = @"
 SELECT DISTINCT trim(split_part(l.raw_location, ':', 3)) AS raw_country,
        trim(split_part(l.raw_location, ':', 2)) AS raw_continent
 FROM frl.frl_images_location l
 WHERE l.raw_location IS NOT NULL
-  AND trim(split_part(l.raw_location, ':', 3)) <> ''
-  AND NOT EXISTS (
-    SELECT 1 FROM frl.frl_location_countries c
-    WHERE lower(trim(c.name)) = lower(trim(split_part(l.raw_location, ':', 3)))
-  );";
+  AND trim(split_part(l.raw_location, ':', 3)) <> '';";
                 await using var mcCmd = new NpgsqlCommand(missingCountriesSql, _connection);
                 await using var mcReader = await mcCmd.ExecuteReaderAsync(ct);
-                var missingCountries = new List<(string name, string? rawContinent)>();
+                var rawCountryPairs = new List<(string rawCountry, string? rawContinent)>();
                 while (await mcReader.ReadAsync(ct))
-                    missingCountries.Add((
+                    rawCountryPairs.Add((
                         mcReader.GetString(0),
                         mcReader.IsDBNull(1) ? null : mcReader.GetString(1)));
                 await mcReader.CloseAsync();
 
+                // Build set of existing country names
+                var existCountrySql = "SELECT DISTINCT lower(name) FROM frl.frl_location_countries;";
+                await using var ecCmd2 = new NpgsqlCommand(existCountrySql, _connection);
+                await using var ecReader2 = await ecCmd2.ExecuteReaderAsync(ct);
+                var existingNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                while (await ecReader2.ReadAsync(ct))
+                    existingNames.Add(ecReader2.GetString(0));
+                await ecReader2.CloseAsync();
+
+                // Deduplicate by corrected name, keeping first continent seen
+                var toCreate = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (rawCountry, rawContinent) in rawCountryPairs)
+                {
+                    var corrected = CorrectValue(rawCountry, CountryCorrections);
+                    if (string.IsNullOrWhiteSpace(corrected)) continue;
+                    if (existingNames.Contains(corrected)) continue;
+                    if (!toCreate.ContainsKey(corrected))
+                        toCreate[corrected] = rawContinent;
+                }
+
                 int countriesCreated = 0;
-                foreach (var (countryName, rawContinent) in missingCountries)
+                foreach (var (countryName, rawContinent) in toCreate)
                 {
                     int? continentId = null;
                     if (!string.IsNullOrWhiteSpace(rawContinent))
@@ -709,14 +797,15 @@ WHERE l.raw_location IS NOT NULL
                         }
                     }
                     var id = await GetOrCreateCountryAsync(countryName, continentId, ct);
+                    existingNames.Add(countryName);
                     countriesCreated++;
                     details.Add(new { action = "country_created", countryName, countryId = id,
                                       continent = rawContinent });
                 }
 
                 // ── Step 2: Fix city-country mismatches ──
-                // Use DISTINCT ON to pick one row per (city_id, raw_country),
-                // choosing the raw_region with the most image references.
+                // Fetch all city/raw-country pairs, apply CountryCorrections in C#,
+                // then fix only genuine mismatches.
                 var findSql = @"
 WITH city_raw AS (
     SELECT ci.id AS city_id, ci.name AS city_name,
@@ -730,7 +819,6 @@ WITH city_raw AS (
     JOIN frl.frl_images_location l ON l.city_id = ci.id
     WHERE l.raw_location IS NOT NULL
       AND split_part(l.raw_location, ':', 3) <> ''
-      AND lower(trim(split_part(l.raw_location, ':', 3))) <> lower(trim(c.name))
     GROUP BY ci.id, ci.name, ci.country_id, ci.region_id,
              split_part(l.raw_location, ':', 3),
              split_part(l.raw_location, ':', 4)
@@ -760,15 +848,22 @@ ORDER BY city_id, raw_country, ref_count DESC;";
 
                 foreach (var (cityId, cityName, oldCountryId, regionId, rawCountry, rawRegion) in fixes)
                 {
+                    var correctedCountryName = CorrectValue(rawCountry, CountryCorrections);
+                    if (string.IsNullOrWhiteSpace(correctedCountryName))
+                    {
+                        skipped++;
+                        continue;
+                    }
                     var lookupSql = "SELECT id FROM frl.frl_location_countries WHERE lower(name) = @name LIMIT 1;";
                     await using var lookupCmd = new NpgsqlCommand(lookupSql, _connection);
-                    lookupCmd.Parameters.AddWithValue("@name", rawCountry.Trim().ToLowerInvariant());
+                    lookupCmd.Parameters.AddWithValue("@name", correctedCountryName.Trim().ToLowerInvariant());
                     var result = await lookupCmd.ExecuteScalarAsync(ct);
                     if (result == null)
                     {
                         skipped++;
-                        details.Add(new { cityId, cityName, rawCountry, action = "skipped",
-                                          reason = "country not found after creation attempt" });
+                        details.Add(new { cityId, cityName, rawCountry, correctedCountryName,
+                                          action = "skipped",
+                                          reason = "corrected country not found in DB" });
                         continue;
                     }
                     var correctCountryId = Convert.ToInt32(result);
