@@ -314,7 +314,7 @@ LIMIT @limit;";
                                 if (cityHierarchy.TryGetValue(cityLower, out var ch))
                                 {
                                     countryId ??= ch.CountryId;
-                                    correctedCountry ??= ch.CountryName;
+                                    if (string.IsNullOrWhiteSpace(correctedCountry)) correctedCountry = ch.CountryName;
                                     continentId ??= ch.ContinentId;
                                     planetId ??= ch.PlanetId;
                                     if (regionName == null && ch.RegionId.HasValue)
@@ -332,7 +332,7 @@ LIMIT @limit;";
                                 if (regionHierarchy.TryGetValue(regionLower, out var rh))
                                 {
                                     countryId ??= rh.CountryId;
-                                    correctedCountry ??= rh.CountryName;
+                                    if (string.IsNullOrWhiteSpace(correctedCountry)) correctedCountry = rh.CountryName;
                                     continentId ??= rh.ContinentId;
                                     planetId ??= rh.PlanetId;
                                 }
