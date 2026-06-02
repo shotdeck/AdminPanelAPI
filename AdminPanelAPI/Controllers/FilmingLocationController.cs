@@ -768,7 +768,7 @@ ORDER BY COUNT(*) DESC;";
                 int totalUnresolvedCountryImages = 0;
                 while (await ucReader.ReadAsync(ct))
                 {
-                    var count = ucReader.GetInt32(2);
+                    var count = (int)ucReader.GetInt64(2);
                     totalUnresolvedCountryImages += count;
                     unresolvedCountries.Add(new
                     {
@@ -802,7 +802,7 @@ ORDER BY COUNT(*) DESC;";
                 int totalUnresolvedCityImages = 0;
                 while (await uciReader.ReadAsync(ct))
                 {
-                    var count = uciReader.GetInt32(4);
+                    var count = (int)uciReader.GetInt64(4);
                     totalUnresolvedCityImages += count;
                     unresolvedCities.Add(new
                     {
@@ -836,7 +836,7 @@ ORDER BY COUNT(*) DESC;";
                 int totalUnresolvedRegionImages = 0;
                 while (await urReader.ReadAsync(ct))
                 {
-                    var count = urReader.GetInt32(3);
+                    var count = (int)urReader.GetInt64(3);
                     totalUnresolvedRegionImages += count;
                     unresolvedRegions.Add(new
                     {
@@ -878,7 +878,7 @@ ORDER BY COUNT(*) DESC;";
                     var correctedRawCountry = CorrectValue(rawCountry, CountryCorrections);
                     if (string.Equals(correctedRawCountry, assignedCountry, StringComparison.OrdinalIgnoreCase))
                         continue;
-                    var count = wcReader.GetInt32(4);
+                    var count = (int)wcReader.GetInt64(4);
                     totalWrongCountry += count;
                     wrongCountryAssignments.Add(new
                     {
