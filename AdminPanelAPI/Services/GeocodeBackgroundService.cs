@@ -212,11 +212,12 @@ namespace AdminPanelAPI.Services
                     var queries = BuildFallbackQueries(name, region, country);
                     (double lat, double lng)? coords = null;
 
-                    foreach (var query in queries)
+                    for (int qi = 0; qi < queries.Count; qi++)
                     {
-                        coords = await GeocodeWithNominatimRaw(query, ct);
+                        coords = await GeocodeWithNominatimRaw(queries[qi], ct);
                         if (coords.HasValue) break;
-                        await Task.Delay(1100, ct);
+                        if (qi < queries.Count - 1)
+                            await Task.Delay(1100, ct);
                     }
 
                     if (coords.HasValue)
