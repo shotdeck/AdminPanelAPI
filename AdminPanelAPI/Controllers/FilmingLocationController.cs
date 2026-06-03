@@ -734,6 +734,271 @@ WHERE l.raw_location IS NOT NULL
             finally { await _connection.CloseAsync(); }
         }
 
+        // ═══════════════════════════════════════════════════════════
+        //  DIAGNOSTICS – find unresolved frl_images_location records
+        // ═══════════════════════════════════════════════════════════
+
+        [HttpGet("unresolved-locations")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<ActionResult> GetUnresolvedLocations(CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            try
+            {
+                // Find frl_images_location records where a hierarchy level is NULL
+                // but the raw_location contains data for that level.
+                // raw_location format: "Earth:Continent:Country:Region:City:SpecificLocation"
+                //                       pos 1    pos 2    pos 3   pos 4  pos 5       pos 6
+
+                // Section A: NULL country_id but raw_location has a country (position 3)
+                var unresolvedCountrySql = @"
+SELECT split_part(raw_location, ':', 3) AS raw_country,
+       split_part(raw_location, ':', 2) AS raw_continent,
+       COUNT(*) AS image_count
+FROM frl.frl_images_location
+WHERE country_id IS NULL
+  AND raw_location IS NOT NULL
+  AND trim(split_part(raw_location, ':', 3)) <> ''
+GROUP BY split_part(raw_location, ':', 3), split_part(raw_location, ':', 2)
+ORDER BY COUNT(*) DESC;";
+
+                await using var ucCmd = new NpgsqlCommand(unresolvedCountrySql, _connection);
+                await using var ucReader = await ucCmd.ExecuteReaderAsync(ct);
+                var unresolvedCountries = new List<object>();
+                int totalUnresolvedCountryImages = 0;
+                while (await ucReader.ReadAsync(ct))
+                {
+                    var count = (int)ucReader.GetInt64(2);
+                    totalUnresolvedCountryImages += count;
+                    unresolvedCountries.Add(new
+                    {
+                        rawCountry = ucReader.GetString(0),
+                        rawContinent = ucReader.IsDBNull(1) ? "" : ucReader.GetString(1),
+                        imageCount = count
+                    });
+                }
+                await ucReader.CloseAsync();
+
+                // Section B: NULL city_id but raw_location has a city (position 5)
+                var unresolvedCitySql = @"
+SELECT split_part(raw_location, ':', 5) AS raw_city,
+       split_part(raw_location, ':', 3) AS raw_country,
+       split_part(raw_location, ':', 4) AS raw_region,
+       country_id,
+       COUNT(*) AS image_count
+FROM frl.frl_images_location
+WHERE city_id IS NULL
+  AND raw_location IS NOT NULL
+  AND trim(split_part(raw_location, ':', 5)) <> ''
+GROUP BY split_part(raw_location, ':', 5),
+         split_part(raw_location, ':', 3),
+         split_part(raw_location, ':', 4),
+         country_id
+ORDER BY COUNT(*) DESC;";
+
+                await using var uciCmd = new NpgsqlCommand(unresolvedCitySql, _connection);
+                await using var uciReader = await uciCmd.ExecuteReaderAsync(ct);
+                var unresolvedCities = new List<object>();
+                int totalUnresolvedCityImages = 0;
+                while (await uciReader.ReadAsync(ct))
+                {
+                    var count = (int)uciReader.GetInt64(4);
+                    totalUnresolvedCityImages += count;
+                    unresolvedCities.Add(new
+                    {
+                        rawCity = uciReader.GetString(0),
+                        rawCountry = uciReader.IsDBNull(1) ? "" : uciReader.GetString(1),
+                        rawRegion = uciReader.IsDBNull(2) ? "" : uciReader.GetString(2),
+                        countryId = uciReader.IsDBNull(3) ? (int?)null : uciReader.GetInt32(3),
+                        imageCount = count
+                    });
+                }
+                await uciReader.CloseAsync();
+
+                // Section C: NULL region_id but raw_location has a region (position 4)
+                var unresolvedRegionSql = @"
+SELECT split_part(raw_location, ':', 4) AS raw_region,
+       split_part(raw_location, ':', 3) AS raw_country,
+       country_id,
+       COUNT(*) AS image_count
+FROM frl.frl_images_location
+WHERE region_id IS NULL
+  AND raw_location IS NOT NULL
+  AND trim(split_part(raw_location, ':', 4)) <> ''
+GROUP BY split_part(raw_location, ':', 4),
+         split_part(raw_location, ':', 3),
+         country_id
+ORDER BY COUNT(*) DESC;";
+
+                await using var urCmd = new NpgsqlCommand(unresolvedRegionSql, _connection);
+                await using var urReader = await urCmd.ExecuteReaderAsync(ct);
+                var unresolvedRegions = new List<object>();
+                int totalUnresolvedRegionImages = 0;
+                while (await urReader.ReadAsync(ct))
+                {
+                    var count = (int)urReader.GetInt64(3);
+                    totalUnresolvedRegionImages += count;
+                    unresolvedRegions.Add(new
+                    {
+                        rawRegion = urReader.GetString(0),
+                        rawCountry = urReader.IsDBNull(1) ? "" : urReader.GetString(1),
+                        countryId = urReader.IsDBNull(2) ? (int?)null : urReader.GetInt32(2),
+                        imageCount = count
+                    });
+                }
+                await urReader.CloseAsync();
+
+                // Section D: Wrong country_id — city_id is NULL, country_id is set,
+                // but country doesn't match raw_location
+                var wrongCountrySql = @"
+SELECT l.country_id AS assigned_country_id,
+       c.name AS assigned_country,
+       split_part(l.raw_location, ':', 3) AS raw_country,
+       split_part(l.raw_location, ':', 5) AS raw_city,
+       COUNT(*) AS image_count
+FROM frl.frl_images_location l
+LEFT JOIN frl.frl_location_countries c ON c.id = l.country_id
+WHERE l.city_id IS NULL
+  AND l.country_id IS NOT NULL
+  AND l.raw_location IS NOT NULL
+  AND trim(split_part(l.raw_location, ':', 3)) <> ''
+GROUP BY l.country_id, c.name,
+         split_part(l.raw_location, ':', 3),
+         split_part(l.raw_location, ':', 5)
+ORDER BY COUNT(*) DESC;";
+
+                await using var wcCmd = new NpgsqlCommand(wrongCountrySql, _connection);
+                await using var wcReader = await wcCmd.ExecuteReaderAsync(ct);
+                var wrongCountryAssignments = new List<object>();
+                int totalWrongCountry = 0;
+                while (await wcReader.ReadAsync(ct))
+                {
+                    var assignedCountry = wcReader.IsDBNull(1) ? "" : wcReader.GetString(1);
+                    var rawCountry = wcReader.GetString(2);
+                    var correctedRawCountry = CorrectValue(rawCountry, CountryCorrections);
+                    if (string.Equals(correctedRawCountry, assignedCountry, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    var count = (int)wcReader.GetInt64(4);
+                    totalWrongCountry += count;
+                    wrongCountryAssignments.Add(new
+                    {
+                        assignedCountryId = wcReader.GetInt32(0),
+                        assignedCountry,
+                        rawCountry,
+                        correctedRawCountry,
+                        rawCity = wcReader.IsDBNull(3) ? "" : wcReader.GetString(3),
+                        imageCount = count
+                    });
+                }
+                await wcReader.CloseAsync();
+
+                return Ok(new
+                {
+                    summary = new
+                    {
+                        totalUnresolvedCountryImages,
+                        totalUnresolvedCityImages,
+                        totalUnresolvedRegionImages,
+                        totalWrongCountryImages = totalWrongCountry
+                    },
+                    unresolvedCountries,
+                    unresolvedCities,
+                    unresolvedRegions,
+                    wrongCountryAssignments
+                });
+            }
+            finally { await _connection.CloseAsync(); }
+        }
+
+        [HttpPost("fix-unresolved")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<ActionResult> FixUnresolvedLocations(CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            try
+            {
+                // Delete frl_images_location records that have unresolved hierarchy levels
+                // (NULL city_id/country_id despite raw_location having data for them).
+                // After deletion, re-running POST /parse will recreate them correctly
+                // since the missing countries now exist.
+
+                // Delete records with NULL city_id where raw_location has a city (position 5)
+                var deleteCitySql = @"
+DELETE FROM frl.frl_images_location
+WHERE city_id IS NULL
+  AND raw_location IS NOT NULL
+  AND trim(split_part(raw_location, ':', 5)) <> ''
+RETURNING id;";
+                await using var dcCmd = new NpgsqlCommand(deleteCitySql, _connection);
+                var deletedCityCount = 0;
+                await using (var dcReader = await dcCmd.ExecuteReaderAsync(ct))
+                {
+                    while (await dcReader.ReadAsync(ct)) deletedCityCount++;
+                }
+
+                // Delete records with NULL country_id where raw_location has a country (position 3)
+                var deleteCountrySql = @"
+DELETE FROM frl.frl_images_location
+WHERE country_id IS NULL
+  AND raw_location IS NOT NULL
+  AND trim(split_part(raw_location, ':', 3)) <> ''
+RETURNING id;";
+                await using var dcoCmd = new NpgsqlCommand(deleteCountrySql, _connection);
+                var deletedCountryCount = 0;
+                await using (var dcoReader = await dcoCmd.ExecuteReaderAsync(ct))
+                {
+                    while (await dcoReader.ReadAsync(ct)) deletedCountryCount++;
+                }
+
+                // Delete records with wrong country_id (country doesn't match raw_location)
+                // Fetch, check in C# with CountryCorrections, then delete matching IDs.
+                var wrongCountrySql = @"
+SELECT l.id, l.country_id, c.name AS assigned_country,
+       split_part(l.raw_location, ':', 3) AS raw_country
+FROM frl.frl_images_location l
+LEFT JOIN frl.frl_location_countries c ON c.id = l.country_id
+WHERE l.city_id IS NULL
+  AND l.country_id IS NOT NULL
+  AND l.raw_location IS NOT NULL
+  AND trim(split_part(l.raw_location, ':', 3)) <> '';";
+
+                await using var wcCmd = new NpgsqlCommand(wrongCountrySql, _connection);
+                await using var wcReader = await wcCmd.ExecuteReaderAsync(ct);
+                var idsToDelete = new List<long>();
+                while (await wcReader.ReadAsync(ct))
+                {
+                    var assignedCountry = wcReader.IsDBNull(2) ? "" : wcReader.GetString(2);
+                    var rawCountry = wcReader.GetString(3);
+                    var corrected = CorrectValue(rawCountry, CountryCorrections);
+                    if (!string.Equals(corrected, assignedCountry, StringComparison.OrdinalIgnoreCase))
+                        idsToDelete.Add(wcReader.GetInt64(0));
+                }
+                await wcReader.CloseAsync();
+
+                int deletedWrongCountry = 0;
+                if (idsToDelete.Count > 0)
+                {
+                    var deleteWcSql = $"DELETE FROM frl.frl_images_location WHERE id = ANY(@ids);";
+                    await using var delWcCmd = new NpgsqlCommand(deleteWcSql, _connection);
+                    delWcCmd.Parameters.AddWithValue("@ids", idsToDelete.ToArray());
+                    deletedWrongCountry = await delWcCmd.ExecuteNonQueryAsync(ct);
+                }
+
+                var totalDeleted = deletedCityCount + deletedCountryCount + deletedWrongCountry;
+                return Ok(new
+                {
+                    totalDeleted,
+                    deletedNullCity = deletedCityCount,
+                    deletedNullCountry = deletedCountryCount,
+                    deletedWrongCountry,
+                    nextStep = totalDeleted > 0
+                        ? "Run POST /api/admin/filming-locations/parse to recreate these records with correct hierarchy, then POST /api/admin/geocode/run-all to fill coordinates."
+                        : "No unresolved records found — nothing to fix."
+                });
+            }
+            finally { await _connection.CloseAsync(); }
+        }
+
         [HttpPost("fix-city-countries")]
         [ProducesResponseType(StatusCodes.Status200OK)]
         public async Task<ActionResult> FixCityCountries(CancellationToken ct = default)
