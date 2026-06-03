@@ -1,4 +1,5 @@
 using Npgsql;
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text.Json;
 
@@ -208,12 +209,16 @@ namespace AdminPanelAPI.Services
                 {
                     if (ct.IsCancellationRequested) break;
 
-                    var queryParts = new List<string> { name };
-                    if (!string.IsNullOrEmpty(region)) queryParts.Add(region);
-                    if (!string.IsNullOrEmpty(country)) queryParts.Add(country);
-                    var query = string.Join(", ", queryParts);
+                    var queries = BuildFallbackQueries(name, region, country);
+                    (double lat, double lng)? coords = null;
 
-                    var coords = await GeocodeWithNominatimRaw(query, ct);
+                    foreach (var query in queries)
+                    {
+                        coords = await GeocodeWithNominatimRaw(query, ct);
+                        if (coords.HasValue) break;
+                        await Task.Delay(1100, ct);
+                    }
+
                     if (coords.HasValue)
                     {
                         await using var upd = new NpgsqlCommand(updateSql, conn);
@@ -227,7 +232,8 @@ namespace AdminPanelAPI.Services
                     {
                         failedIds.Add(id);
                         lock (_lock) _progress.PhaseFailed++;
-                        _logger.LogWarning("Failed to geocode {Phase}: {Name}", phase, name);
+                        _logger.LogWarning("Failed to geocode {Phase}: {Name} (tried: {Queries})",
+                            phase, name, string.Join(" | ", queries));
                     }
 
                     lock (_lock) _progress.PhaseProcessed++;
@@ -401,30 +407,74 @@ namespace AdminPanelAPI.Services
             _logger.LogInformation("Propagation complete");
         }
 
+        private static List<string> BuildFallbackQueries(string name, string? region, string? country)
+        {
+            var queries = new List<string>();
+
+            // Most specific: city, region, country
+            var full = new List<string> { name };
+            if (!string.IsNullOrEmpty(region)) full.Add(region);
+            if (!string.IsNullOrEmpty(country)) full.Add(country);
+            queries.Add(string.Join(", ", full));
+
+            // Fallback: city, country (skip region which may have unusual names)
+            if (!string.IsNullOrEmpty(region) && !string.IsNullOrEmpty(country))
+                queries.Add($"{name}, {country}");
+
+            // Last resort: city alone (only if we had additional context before)
+            if (!string.IsNullOrEmpty(region) || !string.IsNullOrEmpty(country))
+                queries.Add(name);
+
+            return queries;
+        }
+
         private async Task<(double lat, double lng)?> GeocodeWithNominatimRaw(
             string query, CancellationToken ct)
         {
-            try
+            const int maxRetries = 2;
+            for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
-                var url = $"https://nominatim.openstreetmap.org/search?q={Uri.EscapeDataString(query)}&format=json&limit=1";
-                var response = await _http.GetAsync(url, ct);
-                if (!response.IsSuccessStatusCode) return null;
+                try
+                {
+                    var url = $"https://nominatim.openstreetmap.org/search?q={Uri.EscapeDataString(query)}&format=json&limit=1";
+                    var response = await _http.GetAsync(url, ct);
 
-                var json = await response.Content.ReadAsStringAsync(ct);
-                using var doc = JsonDocument.Parse(json);
-                var arr = doc.RootElement;
-                if (arr.GetArrayLength() == 0) return null;
+                    if ((int)response.StatusCode == 429 || (int)response.StatusCode >= 500)
+                    {
+                        if (attempt < maxRetries)
+                        {
+                            _logger.LogWarning("Nominatim returned {Status} for {Query}, retrying in {Delay}s",
+                                (int)response.StatusCode, query, (attempt + 1) * 2);
+                            await Task.Delay((attempt + 1) * 2000, ct);
+                            continue;
+                        }
+                        return null;
+                    }
 
-                var first = arr[0];
-                var lat = double.Parse(first.GetProperty("lat").GetString()!);
-                var lng = double.Parse(first.GetProperty("lon").GetString()!);
-                return (lat, lng);
+                    if (!response.IsSuccessStatusCode) return null;
+
+                    var json = await response.Content.ReadAsStringAsync(ct);
+                    using var doc = JsonDocument.Parse(json);
+                    var arr = doc.RootElement;
+                    if (arr.GetArrayLength() == 0) return null;
+
+                    var first = arr[0];
+                    var lat = double.Parse(first.GetProperty("lat").GetString()!, CultureInfo.InvariantCulture);
+                    var lng = double.Parse(first.GetProperty("lon").GetString()!, CultureInfo.InvariantCulture);
+                    return (lat, lng);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Nominatim geocode failed for: {Query} (attempt {Attempt})", query, attempt + 1);
+                    if (attempt < maxRetries)
+                    {
+                        await Task.Delay((attempt + 1) * 2000, ct);
+                        continue;
+                    }
+                    return null;
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Nominatim geocode failed for: {Query}", query);
-                return null;
-            }
+            return null;
         }
     }
 

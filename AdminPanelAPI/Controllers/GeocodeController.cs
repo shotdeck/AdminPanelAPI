@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Npgsql;
 using NpgsqlTypes;
 using System.Diagnostics;
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text.Json;
 
@@ -559,8 +560,8 @@ namespace AdminPanelAPI.Controllers
                 if (arr.GetArrayLength() == 0) return null;
 
                 var first = arr[0];
-                var lat = double.Parse(first.GetProperty("lat").GetString()!);
-                var lng = double.Parse(first.GetProperty("lon").GetString()!);
+                var lat = double.Parse(first.GetProperty("lat").GetString()!, CultureInfo.InvariantCulture);
+                var lng = double.Parse(first.GetProperty("lon").GetString()!, CultureInfo.InvariantCulture);
                 return (lat, lng);
             }
             catch (Exception ex)
