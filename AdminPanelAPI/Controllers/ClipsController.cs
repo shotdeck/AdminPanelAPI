@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
 using System.Data;
+using System.Text.Json;
 
 namespace ShotDeckSearch.Controllers
 {
@@ -29,6 +30,248 @@ namespace ShotDeckSearch.Controllers
             _configuration = configuration;
             _logger = logger;
         }
+
+        [HttpPost("/api/admin/clips/fix-two-second-boundaries")]
+        [ProducesResponseType(typeof(FixSceneBoundaryResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<FixSceneBoundaryResponse>> FixTwoSecondSceneBoundariesAsync(
+    [FromQuery] bool dryRun = true,
+    [FromQuery] int resultLimit = 100,
+    [FromQuery] string? filename = null,
+    CancellationToken ct = default)
+        {
+            if (resultLimit < 0)
+                resultLimit = 0;
+
+            var mustClose = false;
+
+            if (_connection.State != ConnectionState.Open)
+            {
+                await _connection.OpenAsync(ct);
+                mustClose = true;
+            }
+
+            var results = new List<FixSceneBoundaryResult>();
+
+            void AddResult(FixSceneBoundaryResult result)
+            {
+                if (results.Count < resultLimit)
+                {
+                    results.Add(result);
+                }
+            }
+
+            var totalUpdated = 0;
+            var totalSkipped = 0;
+
+            try
+            {
+                var records = new List<SceneBoundaryRecord>();
+
+                const string selectSql = @"
+SELECT
+    movieid,
+    filename,
+    start_time,
+    end_time,
+    duration,
+    fps,
+    frame_count,
+    target_frame,
+    cut_times::text AS cut_times
+FROM frl.frl_image_scene_boundaries
+WHERE ABS((end_time - start_time) - 2.0) < 0.000001
+  AND fps IS NOT NULL
+  AND fps > 0
+  AND target_frame IS NOT NULL
+  AND cut_times IS NOT NULL
+  AND (
+        @filename IS NULL
+        OR filename = @filename
+      );
+";
+
+                await using (var cmd = new NpgsqlCommand(selectSql, _connection))
+                {
+                    cmd.Parameters.AddWithValue(
+                        "@filename",
+                        string.IsNullOrWhiteSpace(filename)
+                            ? DBNull.Value
+                            : filename.Trim()
+                    );
+
+                    await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+                    while (await reader.ReadAsync(ct))
+                    {
+                        records.Add(new SceneBoundaryRecord
+                        {
+                            MovieId = reader.GetInt32(reader.GetOrdinal("movieid")),
+                            Filename = reader.GetString(reader.GetOrdinal("filename")),
+                            StartTime = reader.GetDouble(reader.GetOrdinal("start_time")),
+                            EndTime = reader.GetDouble(reader.GetOrdinal("end_time")),
+                            Duration = reader.GetDouble(reader.GetOrdinal("duration")),
+                            Fps = reader.GetDouble(reader.GetOrdinal("fps")),
+                            FrameCount = reader.GetInt32(reader.GetOrdinal("frame_count")),
+                            TargetFrame = reader.GetInt32(reader.GetOrdinal("target_frame")),
+                            CutTimesJson = reader.GetString(reader.GetOrdinal("cut_times"))
+                        });
+                    }
+                }
+
+                await using var tx = await _connection.BeginTransactionAsync(ct);
+
+                try
+                {
+                    foreach (var record in records)
+                    {
+                        List<double>? cutTimes;
+
+                        try
+                        {
+                            cutTimes = JsonSerializer.Deserialize<List<double>>(record.CutTimesJson);
+                        }
+                        catch (Exception ex)
+                        {
+                            totalSkipped++;
+
+                            AddResult(new FixSceneBoundaryResult
+                            {
+                                MovieId = record.MovieId,
+                                Filename = record.Filename,
+                                Updated = false,
+                                Message = $"Invalid cut_times JSON: {ex.Message}"
+                            });
+
+                            continue;
+                        }
+
+                        if (cutTimes == null || cutTimes.Count == 0)
+                        {
+                            totalSkipped++;
+
+                            AddResult(new FixSceneBoundaryResult
+                            {
+                                MovieId = record.MovieId,
+                                Filename = record.Filename,
+                                Updated = false,
+                                Message = "No cut times found."
+                            });
+
+                            continue;
+                        }
+
+                        cutTimes.Sort();
+
+                        var imageTime = record.TargetFrame / record.Fps;
+
+                        var clipStart = 0.0;
+                        var clipEnd = record.Duration;
+
+                        foreach (var cut in cutTimes)
+                        {
+                            if (cut <= imageTime)
+                            {
+                                clipStart = cut;
+                            }
+                            else
+                            {
+                                clipEnd = cut;
+                                break;
+                            }
+                        }
+
+                        var newStartTime = Math.Max(0.0, clipStart - 2.0);
+                        var newEndTime = Math.Min(record.Duration, clipEnd + 2.0);
+
+                        var result = new FixSceneBoundaryResult
+                        {
+                            MovieId = record.MovieId,
+                            Filename = record.Filename,
+
+                            OldStartTime = record.StartTime,
+                            OldEndTime = record.EndTime,
+
+                            ImageTime = imageTime,
+                            ClipStart = clipStart,
+                            ClipEnd = clipEnd,
+
+                            NewStartTime = newStartTime,
+                            NewEndTime = newEndTime,
+
+                            Updated = false,
+                            RowsUpdated = 0,
+                            Message = dryRun ? "Dry run only." : "Ready to update."
+                        };
+
+                        if (newEndTime <= newStartTime)
+                        {
+                            totalSkipped++;
+
+                            result.Message = "Invalid calculated range.";
+                            AddResult(result);
+
+                            continue;
+                        }
+
+                        if (!dryRun)
+                        {
+                            const string updateSql = @"
+UPDATE frl.frl_image_scene_boundaries
+SET
+    start_time = @start_time,
+    end_time = @end_time
+WHERE movieid = @movieid
+  AND filename = @filename;
+";
+
+                            await using var updateCmd = new NpgsqlCommand(updateSql, _connection, tx);
+
+                            updateCmd.Parameters.AddWithValue("@start_time", newStartTime);
+                            updateCmd.Parameters.AddWithValue("@end_time", newEndTime);
+                            updateCmd.Parameters.AddWithValue("@movieid", record.MovieId);
+                            updateCmd.Parameters.AddWithValue("@filename", record.Filename);
+
+                            var rowsUpdated = await updateCmd.ExecuteNonQueryAsync(ct);
+
+                            result.Updated = rowsUpdated > 0;
+                            result.RowsUpdated = rowsUpdated;
+                            result.Message = rowsUpdated > 0 ? "Updated." : "No matching row updated.";
+
+                            totalUpdated += rowsUpdated;
+                        }
+
+                        AddResult(result);
+                    }
+
+                    await tx.CommitAsync(ct);
+                }
+                catch
+                {
+                    await tx.RollbackAsync(ct);
+                    throw;
+                }
+
+                return Ok(new FixSceneBoundaryResponse
+                {
+                    DryRun = dryRun,
+                    Filename = string.IsNullOrWhiteSpace(filename) ? null : filename.Trim(),
+                    TotalChecked = records.Count,
+                    TotalUpdated = totalUpdated,
+                    TotalSkipped = totalSkipped,
+                    ReturnedResults = results.Count,
+                    MaxResultsReturned = resultLimit,
+                    Results = results
+                });
+            }
+            finally
+            {
+                if (mustClose)
+                {
+                    await _connection.CloseAsync();
+                }
+            }
+        }
+
 
         [HttpGet]
         [ProducesResponseType(typeof(ClipPageResponse), StatusCodes.Status200OK)]
@@ -246,6 +489,55 @@ LIMIT @limit OFFSET @offset;";
             {
                 if (mustClose) await _connection.CloseAsync();
             }
+        }
+
+        private class SceneBoundaryRecord
+        {
+            public int MovieId { get; set; }
+            public string Filename { get; set; } = "";
+            public double StartTime { get; set; }
+            public double EndTime { get; set; }
+            public double Duration { get; set; }
+            public double Fps { get; set; }
+            public int FrameCount { get; set; }
+            public int TargetFrame { get; set; }
+            public string CutTimesJson { get; set; } = "";
+        }
+
+        public sealed class FixSceneBoundaryResponse
+        {
+            public bool DryRun { get; set; }
+
+            public string? Filename { get; set; }
+
+            public int TotalChecked { get; set; }
+            public int TotalUpdated { get; set; }
+            public int TotalSkipped { get; set; }
+
+            public int ReturnedResults { get; set; }
+            public int MaxResultsReturned { get; set; }
+
+            public List<FixSceneBoundaryResult> Results { get; set; } = new();
+        }
+
+        public sealed class FixSceneBoundaryResult
+        {
+            public int MovieId { get; set; }
+            public string Filename { get; set; } = "";
+
+            public double? OldStartTime { get; set; }
+            public double? OldEndTime { get; set; }
+
+            public double? ImageTime { get; set; }
+            public double? ClipStart { get; set; }
+            public double? ClipEnd { get; set; }
+
+            public double? NewStartTime { get; set; }
+            public double? NewEndTime { get; set; }
+
+            public bool Updated { get; set; }
+            public int RowsUpdated { get; set; }
+            public string Message { get; set; } = "";
         }
 
         private sealed class ClipRow
