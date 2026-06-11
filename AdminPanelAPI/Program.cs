@@ -62,6 +62,9 @@ builder.Services.AddHostedService<KeywordWarmupService>();
 // Background geocoding service
 builder.Services.AddHostedService<GeocodeBackgroundService>();
 
+// Background movie location populate service
+builder.Services.AddHostedService<MovieLocationBackgroundService>();
+
 builder.Services.AddCors(opt =>
 {
     opt.AddPolicy("AllowAll", p =>
