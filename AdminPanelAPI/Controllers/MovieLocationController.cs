@@ -596,6 +596,28 @@ LIMIT @limit;";
             }
         }
 
+        // ── POST populate-all — background run to completion ──────────
+
+        [HttpPost("populate-all")]
+        [ProducesResponseType(StatusCodes.Status202Accepted)]
+        [ProducesResponseType(StatusCodes.Status409Conflict)]
+        public ActionResult PopulateAll()
+        {
+            if (!Services.MovieLocationBackgroundService.TryStart())
+                return Conflict(new { error = "Movie location populate is already running", progress = Services.MovieLocationBackgroundService.GetProgress() });
+
+            return Accepted(new { message = "Movie location populate started. Poll GET /api/admin/movie-locations/populate-status for progress." });
+        }
+
+        // ── GET populate-status ─────────────────────────────────────
+
+        [HttpGet("populate-status")]
+        [ProducesResponseType(typeof(Services.MovieLocationProgress), StatusCodes.Status200OK)]
+        public ActionResult<Services.MovieLocationProgress> GetPopulateStatus()
+        {
+            return Ok(Services.MovieLocationBackgroundService.GetProgress());
+        }
+
         // ── Wikidata SPARQL query ───────────────────────────────────
 
         private async Task<List<LocationResult>> FetchLocationsFromWikidata(string imdbId, CancellationToken ct)
