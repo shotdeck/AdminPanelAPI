@@ -560,6 +560,38 @@ LIMIT @limit;";
             });
         }
 
+        // ── POST repopulate — clear and re-run all movies ────────────
+
+        [HttpPost("repopulate")]
+        [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
+        public async Task<ActionResult> Repopulate(
+            [FromQuery] int? movieId = null,
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+
+            if (movieId.HasValue)
+            {
+                // Clear locations for a specific movie
+                await using var delCmd = new NpgsqlCommand(
+                    "DELETE FROM frl.frl_movie_location WHERE movie_id = @mid;", _connection);
+                delCmd.Parameters.AddWithValue("@mid", movieId.Value);
+                var deleted = await delCmd.ExecuteNonQueryAsync(ct);
+
+                return Ok(new { cleared = deleted, movieId = movieId.Value, message = "Movie cleared. Call POST /populate to re-fetch." });
+            }
+            else
+            {
+                // Clear ALL movie locations so populate can re-run from scratch
+                await using var truncCmd = new NpgsqlCommand(
+                    "TRUNCATE frl.frl_movie_location RESTART IDENTITY;", _connection);
+                await truncCmd.ExecuteNonQueryAsync(ct);
+
+                var remaining = await CountRemainingMovies(ct);
+                return Ok(new { message = "All movie locations cleared.", moviesToProcess = remaining });
+            }
+        }
+
         // ── Wikidata SPARQL query ───────────────────────────────────
 
         private async Task<List<LocationResult>> FetchLocationsFromWikidata(string imdbId, CancellationToken ct)
@@ -707,7 +739,7 @@ SELECT ?locationLabel ?coord WHERE {{
                 foreach (Match match in Regex.Matches(sectionText, pattern, RegexOptions.IgnoreCase))
                 {
                     var loc = match.Groups[1].Value.Trim();
-                    if (loc.Length > 2 && loc.Length < 100 && !IsCommonWord(loc))
+                    if (loc.Length > 2 && loc.Length < 100 && !IsCommonWord(loc) && !IsLikelyNonPlace(loc))
                     {
                         locations.Add(loc);
                     }
@@ -739,20 +771,86 @@ SELECT ?locationLabel ?coord WHERE {{
             return common.Contains(text);
         }
 
+        private static bool IsLikelyNonPlace(string text)
+        {
+            var organizationKeywords = new[]
+            {
+                "Pictures", "Entertainment", "Corporation", "Company", "Department",
+                "Defense", "Defence", "Agency", "Association", "Foundation",
+                "Institute", "University", "College", "Museum", "Theater", "Theatre",
+                "Orchestra", "Network", "Broadcasting", "Television", "Records",
+                "Productions", "International", "Committee", "Commission",
+                "Council", "Society", "Ministry", "Bureau", "Service",
+                "Academy", "Award"
+            };
+
+            if (organizationKeywords.Any(kw => text.Contains(kw, StringComparison.OrdinalIgnoreCase)))
+                return true;
+
+            // Detect person names: exactly 2-3 capitalized words, no commas, no geographic terms
+            var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (words.Length >= 2 && words.Length <= 3 && !text.Contains(','))
+            {
+                var allCapitalizedShort = words.All(w =>
+                    w.Length >= 2 && w.Length <= 15 &&
+                    char.IsUpper(w[0]) && w.Skip(1).All(c => char.IsLower(c) || c == '\'' || c == '-'));
+
+                if (allCapitalizedShort)
+                {
+                    var placeSignals = new[]
+                    {
+                        "City", "County", "State", "Island", "Beach", "Park", "Mountain",
+                        "River", "Lake", "Forest", "Desert", "Valley", "Bay", "Harbor",
+                        "Street", "Avenue", "Boulevard", "Ranch", "Station", "Base",
+                        "Fort", "Port", "Cape", "Point", "Hill", "Hills", "Springs",
+                        "Falls", "Creek", "Bridge", "Airport", "North", "South", "East",
+                        "West", "New", "San", "Santa", "Los", "Las", "Saint", "Upper",
+                        "Lower", "Mount", "Old", "Key", "El"
+                    };
+                    if (!words.Any(w => placeSignals.Contains(w, StringComparer.OrdinalIgnoreCase)))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
         private static bool IsLikelyPlace(string text)
         {
+            if (IsLikelyNonPlace(text))
+                return false;
+
             var placeIndicators = new[]
             {
                 "City", "County", "State", "Island", "Beach", "Park", "Mountain",
                 "River", "Lake", "Forest", "Desert", "Valley", "Bay", "Harbor",
-                "Street", "Avenue", "Boulevard", "Studio", "Ranch"
+                "Street", "Avenue", "Boulevard", "Ranch", "Station", "Base",
+                "Fort", "Port", "Cape", "Point", "Hill", "Hills", "Springs",
+                "Falls", "Creek", "Bridge", "Airport", "Territory", "Province",
+                "District"
             };
 
-            var stateCountryPattern = new Regex(
-                @"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:,\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)?$");
+            // Contains a geographic indicator word
+            if (placeIndicators.Any(p => text.Contains(p, StringComparison.OrdinalIgnoreCase)))
+                return true;
 
-            return stateCountryPattern.IsMatch(text) ||
-                placeIndicators.Any(p => text.Contains(p, StringComparison.OrdinalIgnoreCase));
+            // Contains a comma (city, state/country format)
+            if (text.Contains(','))
+            {
+                var commaPattern = new Regex(
+                    @"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$");
+                if (commaPattern.IsMatch(text))
+                    return true;
+            }
+
+            // Starts with a geographic prefix
+            var geoPrefix = new Regex(
+                @"^(?:San|Santa|Los|Las|Saint|Mount|Fort|Port|Cape|Key|El|New|North|South|East|West)\s",
+                RegexOptions.IgnoreCase);
+            if (geoPrefix.IsMatch(text))
+                return true;
+
+            return false;
         }
 
         // ── Nominatim geocoding ─────────────────────────────────────
