@@ -566,8 +566,12 @@ LIMIT @limit;";
         [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
         public async Task<ActionResult> Repopulate(
             [FromQuery] int? movieId = null,
+            [FromQuery] bool confirm = false,
             CancellationToken ct = default)
         {
+            if (!confirm)
+                return BadRequest(new { error = "This is a destructive operation. Pass ?confirm=true to proceed." });
+
             await EnsureOpenAsync(ct);
 
             if (movieId.HasValue)
@@ -739,7 +743,7 @@ SELECT ?locationLabel ?coord WHERE {{
                 foreach (Match match in Regex.Matches(sectionText, pattern, RegexOptions.IgnoreCase))
                 {
                     var loc = match.Groups[1].Value.Trim();
-                    if (loc.Length > 2 && loc.Length < 100 && !IsCommonWord(loc) && !IsLikelyNonPlace(loc))
+                    if (loc.Length > 2 && loc.Length < 100 && !IsCommonWord(loc))
                     {
                         locations.Add(loc);
                     }
