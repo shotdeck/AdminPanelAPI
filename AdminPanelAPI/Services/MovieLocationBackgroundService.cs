@@ -360,7 +360,9 @@ SELECT ?locationLabel ?coord WHERE {{
             {
                 @"(?:filmed|shot|filming|shooting|principal photography)\s+(?:in|at|on location in|took place in|began in|continued in|moved to)\s+\[\[([^\]|]+?)(?:\|[^\]]+)?\]\]",
                 @"(?:filmed|shot|filming|shooting)\s+(?:in|at|on location in)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:,\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*)",
-                @"\[\[([^\]|]+?)(?:\|[^\]]+)?\]\](?=.*?(?:served as|was used|doubled for|stood in))"
+                @"\[\[([^\]|]+?)(?:\|[^\]]+)?\]\](?=.*?(?:served as|was used|doubled for|stood in))",
+                @"(?:interior|stage|soundstage|studio)\s+(?:scenes?|shooting|work|filming|sequences?)\s+(?:at|in|on)\s+\[\[([^\]|]+?)(?:\|[^\]]+)?\]\]",
+                @"\[\[([^\]|]*?(?:Studios?|Soundstage|Pinewood|Shepperton|Cinecitt[aà])(?:[^\]|]*?))(?:\|[^\]]+)?\]\]"
             };
 
             foreach (var pattern in locationPatterns)
@@ -432,7 +434,7 @@ SELECT ?locationLabel ?coord WHERE {{
                         "Fort", "Port", "Cape", "Point", "Hill", "Hills", "Springs",
                         "Falls", "Creek", "Bridge", "Airport", "North", "South", "East",
                         "West", "New", "San", "Santa", "Los", "Las", "Saint", "Upper",
-                        "Lower", "Mount", "Old", "Key", "El"
+                        "Lower", "Mount", "Old", "Key", "El", "Studio", "Studios"
                     };
                     if (!words.Any(w => placeSignals.Contains(w, StringComparer.OrdinalIgnoreCase)))
                         return true;
@@ -454,7 +456,7 @@ SELECT ?locationLabel ?coord WHERE {{
                 "Street", "Avenue", "Boulevard", "Ranch", "Station", "Base",
                 "Fort", "Port", "Cape", "Point", "Hill", "Hills", "Springs",
                 "Falls", "Creek", "Bridge", "Airport", "Territory", "Province",
-                "District"
+                "District", "Studio", "Studios", "Soundstage", "Lot"
             };
 
             if (placeIndicators.Any(p => text.Contains(p, StringComparison.OrdinalIgnoreCase)))
