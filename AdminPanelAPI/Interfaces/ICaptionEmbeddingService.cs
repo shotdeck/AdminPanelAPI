@@ -7,6 +7,11 @@ public interface ICaptionEmbeddingService
         int batchSize,
         CancellationToken cancellationToken);
 
+    Task ProcessAllAsync(
+        long jobId,
+        int concurrency,
+        CancellationToken cancellationToken);
+
     Task<CaptionEmbeddingResult> ProcessSingleImageAsync(
         int imageId,
         CancellationToken cancellationToken);

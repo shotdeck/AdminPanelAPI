@@ -43,11 +43,23 @@ namespace AdminPanelAPI.Services
 
                     await repo.MarkRunningAsync(jobId, stoppingToken);
 
-                    _logger.LogInformation(
-                        "CaptionEmbeddingWorker: Processing job {JobId}, batchSize={BatchSize}",
-                        jobId, job.BatchSize);
+                    if (job.BatchSize < 0)
+                    {
+                        var concurrency = Math.Abs(job.BatchSize);
+                        _logger.LogInformation(
+                            "CaptionEmbeddingWorker: Processing job {JobId} (process-all, concurrency={Concurrency})",
+                            jobId, concurrency);
 
-                    await service.ProcessBatchAsync(jobId, job.BatchSize, stoppingToken);
+                        await service.ProcessAllAsync(jobId, concurrency, stoppingToken);
+                    }
+                    else
+                    {
+                        _logger.LogInformation(
+                            "CaptionEmbeddingWorker: Processing job {JobId}, batchSize={BatchSize}",
+                            jobId, job.BatchSize);
+
+                        await service.ProcessBatchAsync(jobId, job.BatchSize, stoppingToken);
+                    }
 
                     await repo.MarkCompletedAsync(jobId, stoppingToken);
 
