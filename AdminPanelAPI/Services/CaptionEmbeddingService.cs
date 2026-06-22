@@ -309,7 +309,7 @@ namespace AdminPanelAPI.Services
             CancellationToken cancellationToken)
         {
             const string sql = @"
-INSERT INTO frl.frl_caption_embeddings (idnum, randid, captions, vectorized_embeddings, fused_embeddings, keyword_vectorized_metadata, status)
+INSERT INTO frl.frl_caption_embeddings_qwen3 (idnum, randid, captions, vectorized_embeddings, fused_embeddings, keyword_vectorized_metadata, status)
 VALUES (@idnum, @randid, @captions, @embeddings::halfvec, @fused::halfvec, @metadata, 'completed')
 ON CONFLICT (idnum) DO UPDATE SET
     captions = EXCLUDED.captions,
