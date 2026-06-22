@@ -177,20 +177,18 @@ namespace AdminPanelAPI.Services
 
             await _repo.UpdateProgressAsync(jobId, "Processing images", 0, grandTotal, cancellationToken);
 
-            // Pipeline: fetch the first chunk's data, then overlap fetching with processing
-            var currentChunk = await FetchChunkWithMetadataAsync(chunkSize, cancellationToken);
-
             using var semaphore = new SemaphoreSlim(concurrency);
-            var activeTasks = new List<Task>();
 
-            while (currentChunk != null && !cancellationToken.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                // Start fetching next chunk in background while we process current chunk
-                var nextChunkTask = Task.Run(
-                    () => FetchChunkWithMetadataAsync(chunkSize, cancellationToken),
-                    cancellationToken);
+                // Fetch chunk with all metadata queries in parallel
+                var currentChunk = await FetchChunkWithMetadataAsync(chunkSize, cancellationToken);
 
-                // Process current chunk
+                if (currentChunk == null)
+                    break;
+
+                var tasks = new List<Task>();
+
                 foreach (var rec in currentChunk.Images)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -204,7 +202,7 @@ namespace AdminPanelAPI.Services
                     await semaphore.WaitAsync(cancellationToken);
 
                     var chunk = currentChunk; // capture for closure
-                    activeTasks.Add(Task.Run(async () =>
+                    tasks.Add(Task.Run(async () =>
                     {
                         try
                         {
@@ -248,18 +246,8 @@ namespace AdminPanelAPI.Services
                     }, cancellationToken));
                 }
 
-                // Wait for next chunk to be ready (should already be done by now)
-                currentChunk = await nextChunkTask;
-
-                // Clean up completed tasks periodically to avoid memory buildup
-                if (activeTasks.Count > concurrency * 4)
-                {
-                    activeTasks.RemoveAll(t => t.IsCompleted);
-                }
+                await Task.WhenAll(tasks);
             }
-
-            // Wait for all remaining tasks to complete
-            await Task.WhenAll(activeTasks);
 
             await _repo.UpdateProgressAsync(
                 jobId,
