@@ -45,12 +45,15 @@ namespace AdminPanelAPI.Services
 
                     if (job.BatchSize < 0)
                     {
-                        var concurrency = Math.Abs(job.BatchSize);
-                        _logger.LogInformation(
-                            "CaptionEmbeddingWorker: Processing job {JobId} (process-all, concurrency={Concurrency})",
-                            jobId, concurrency);
+                        var absBatchSize = Math.Abs(job.BatchSize);
+                        var skipCaption = absBatchSize > 1000;
+                        var concurrency = skipCaption ? absBatchSize - 1000 : absBatchSize;
 
-                        await service.ProcessAllAsync(jobId, concurrency, stoppingToken);
+                        _logger.LogInformation(
+                            "CaptionEmbeddingWorker: Processing job {JobId} (process-all, concurrency={Concurrency}, skipCaption={SkipCaption})",
+                            jobId, concurrency, skipCaption);
+
+                        await service.ProcessAllAsync(jobId, concurrency, stoppingToken, skipCaption);
                     }
                     else
                     {

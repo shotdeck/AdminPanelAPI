@@ -56,12 +56,14 @@ namespace AdminPanelAPI.Controllers
         [HttpPost("process-all")]
         public async Task<IActionResult> ProcessAll(
             [FromQuery] int concurrency = 20,
+            [FromQuery] bool skipCaption = false,
             CancellationToken cancellationToken = default)
         {
             if (concurrency <= 0 || concurrency > 100)
                 return BadRequest(new { error = "concurrency must be between 1 and 100" });
 
-            var jobId = await _jobRepository.CreateJobAsync(-concurrency, cancellationToken);
+            var encodedBatchSize = skipCaption ? -(concurrency + 1000) : -concurrency;
+            var jobId = await _jobRepository.CreateJobAsync(encodedBatchSize, cancellationToken);
 
             await _jobQueue.QueueJobAsync(jobId, cancellationToken);
 
@@ -69,6 +71,7 @@ namespace AdminPanelAPI.Controllers
             {
                 jobId,
                 concurrency,
+                skipCaption,
                 mode = "process-all",
                 status = "Queued",
                 checkProgressUrl = $"/api/CaptionEmbedding/status/{jobId}"

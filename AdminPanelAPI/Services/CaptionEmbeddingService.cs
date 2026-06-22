@@ -113,7 +113,7 @@ namespace AdminPanelAPI.Services
                         rec, gender, subjectAge, subjectEth,
                         frameSize, tags, timeOfDay, movieFields);
 
-                    var result = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, cancellationToken);
+                    var result = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, false, cancellationToken);
 
                     await InsertCaptionEmbeddingAsync(
                         rec.Id, rec.Randid, result.Caption, result.Embeddings, result.FusedEmbeddings, metadata, cancellationToken);
@@ -149,7 +149,8 @@ namespace AdminPanelAPI.Services
         public async Task ProcessAllAsync(
             long jobId,
             int concurrency,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            bool skipCaption = false)
         {
             const int chunkSize = 500;
 
@@ -213,7 +214,7 @@ namespace AdminPanelAPI.Services
                     {
                         try
                         {
-                            var httpClient = _httpClientFactory.CreateClient();
+                            var httpClient = _httpClientFactory.CreateClient("HighConcurrency");
                             httpClient.Timeout = TimeSpan.FromMinutes(5);
 
                             var imageBytes = await DownloadImageAsync(httpClient, rec.Filename, cancellationToken);
@@ -222,7 +223,7 @@ namespace AdminPanelAPI.Services
                                 rec, gender, subjectAge, subjectEth,
                                 frameSize, tags, timeOfDay, movieFields);
 
-                            var result = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, cancellationToken);
+                            var result = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, skipCaption, cancellationToken);
 
                             await InsertCaptionEmbeddingAsync(
                                 rec.Id, rec.Randid, result.Caption, result.Embeddings, result.FusedEmbeddings, metadata, cancellationToken);
@@ -311,7 +312,7 @@ namespace AdminPanelAPI.Services
                     rec, gender, subjectAge, subjectEth,
                     frameSize, tags, timeOfDay, movieFields);
 
-                var apiResult = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, cancellationToken);
+                var apiResult = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, false, cancellationToken);
 
                 await InsertCaptionEmbeddingAsync(
                     rec.Id, rec.Randid, apiResult.Caption, apiResult.Embeddings, apiResult.FusedEmbeddings, metadata, cancellationToken);
@@ -361,6 +362,7 @@ namespace AdminPanelAPI.Services
             byte[] imageBytes,
             string filename,
             string? metadata,
+            bool skipCaption,
             CancellationToken cancellationToken)
         {
             var url = $"{_captionApiBaseUrl.TrimEnd('/')}/process_image";
@@ -375,14 +377,23 @@ namespace AdminPanelAPI.Services
                 content.Add(new StringContent(metadata), "metadata");
             }
 
+            if (skipCaption)
+            {
+                content.Add(new StringContent("true"), "skip_caption");
+            }
+
             var response = await httpClient.PostAsync(url, content, cancellationToken);
             response.EnsureSuccessStatusCode();
 
             var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
             using var doc = JsonDocument.Parse(responseBody);
 
-            var caption = doc.RootElement.GetProperty("caption").GetString()
-                          ?? throw new Exception("Response missing 'caption' field.");
+            string? caption = null;
+            if (doc.RootElement.TryGetProperty("caption", out var captionProp)
+                && captionProp.ValueKind == JsonValueKind.String)
+            {
+                caption = captionProp.GetString();
+            }
 
             var embeddingsArray = doc.RootElement.GetProperty("embeddings");
             var embeddings = new float[embeddingsArray.GetArrayLength()];
@@ -414,7 +425,7 @@ namespace AdminPanelAPI.Services
 
         private class ProcessImageResult
         {
-            public string Caption { get; set; } = "";
+            public string? Caption { get; set; }
             public float[] Embeddings { get; set; } = Array.Empty<float>();
             public float[]? FusedEmbeddings { get; set; }
         }
@@ -422,7 +433,7 @@ namespace AdminPanelAPI.Services
         private async Task InsertCaptionEmbeddingAsync(
             int idnum,
             string? randid,
-            string caption,
+            string? caption,
             float[] embeddings,
             float[]? fusedEmbeddings,
             string? keywordMetadata,
@@ -444,7 +455,7 @@ ON CONFLICT (idnum) DO UPDATE SET
             await using var cmd = new NpgsqlCommand(sql, conn);
             cmd.Parameters.AddWithValue("idnum", idnum);
             cmd.Parameters.AddWithValue("randid", (object?)randid ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("captions", caption);
+            cmd.Parameters.AddWithValue("captions", (object?)caption ?? DBNull.Value);
 
             var embeddingString = "[" + string.Join(",", embeddings) + "]";
             cmd.Parameters.AddWithValue("embeddings", embeddingString);
