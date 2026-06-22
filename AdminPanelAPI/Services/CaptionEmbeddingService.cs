@@ -152,7 +152,7 @@ namespace AdminPanelAPI.Services
             CancellationToken cancellationToken,
             bool skipCaption = false)
         {
-            const int chunkSize = 500;
+            const int chunkSize = 2000;
 
             _logger.LogInformation(
                 "Starting process-all. JobId={JobId}, Concurrency={Concurrency}",
@@ -177,28 +177,21 @@ namespace AdminPanelAPI.Services
 
             await _repo.UpdateProgressAsync(jobId, "Processing images", 0, grandTotal, cancellationToken);
 
-            while (!cancellationToken.IsCancellationRequested)
+            // Pipeline: fetch the first chunk's data, then overlap fetching with processing
+            var currentChunk = await FetchChunkWithMetadataAsync(chunkSize, cancellationToken);
+
+            using var semaphore = new SemaphoreSlim(concurrency);
+            var activeTasks = new List<Task>();
+
+            while (currentChunk != null && !cancellationToken.IsCancellationRequested)
             {
-                var images = await _repo.GetUnprocessedImagesAsync(chunkSize, cancellationToken);
+                // Start fetching next chunk in background while we process current chunk
+                var nextChunkTask = Task.Run(
+                    () => FetchChunkWithMetadataAsync(chunkSize, cancellationToken),
+                    cancellationToken);
 
-                if (images.Count == 0)
-                    break;
-
-                var imageIds = images.Select(r => r.Id).ToList();
-                var movieIds = images.Where(r => r.MovieId.HasValue).Select(r => r.MovieId!.Value).Distinct().ToList();
-
-                var gender = await _repo.FetchTagsAsync("frl_join_images_gender", "gender", imageIds, cancellationToken);
-                var subjectAge = await _repo.FetchTagsAsync("frl_join_images_subject_age", "subject_age", imageIds, cancellationToken);
-                var subjectEth = await _repo.FetchTagsAsync("frl_join_images_subject_ethnicity", "subject_ethnicity", imageIds, cancellationToken);
-                var frameSize = await _repo.FetchTagsAsync("frl_join_images_frame_size", "frame_size", imageIds, cancellationToken);
-                var tags = await _repo.FetchTagsAsync("frl_join_images_tags", "tag", imageIds, cancellationToken);
-                var timeOfDay = await _repo.FetchTagsAsync("frl_join_images_time_of_day", "time_of_day", imageIds, cancellationToken);
-                var movieFields = await _repo.FetchMovieFieldsAsync(movieIds, cancellationToken);
-
-                using var semaphore = new SemaphoreSlim(concurrency);
-                var tasks = new List<Task>();
-
-                foreach (var rec in images)
+                // Process current chunk
+                foreach (var rec in currentChunk.Images)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
@@ -210,7 +203,8 @@ namespace AdminPanelAPI.Services
 
                     await semaphore.WaitAsync(cancellationToken);
 
-                    tasks.Add(Task.Run(async () =>
+                    var chunk = currentChunk; // capture for closure
+                    activeTasks.Add(Task.Run(async () =>
                     {
                         try
                         {
@@ -220,8 +214,8 @@ namespace AdminPanelAPI.Services
                             var imageBytes = await DownloadImageAsync(httpClient, rec.Filename, cancellationToken);
 
                             var metadata = KeywordMetadataBuilder.BuildMetadata(
-                                rec, gender, subjectAge, subjectEth,
-                                frameSize, tags, timeOfDay, movieFields);
+                                rec, chunk.Gender, chunk.SubjectAge, chunk.SubjectEth,
+                                chunk.FrameSize, chunk.Tags, chunk.TimeOfDay, chunk.MovieFields);
 
                             var result = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, skipCaption, cancellationToken);
 
@@ -230,7 +224,7 @@ namespace AdminPanelAPI.Services
 
                             var current = Interlocked.Increment(ref totalProcessed);
 
-                            if (current % 50 == 0)
+                            if (current % 100 == 0)
                             {
                                 _logger.LogInformation(
                                     "JobId={JobId}: Progress {Processed}/{Total} ({Failed} failed)",
@@ -254,8 +248,18 @@ namespace AdminPanelAPI.Services
                     }, cancellationToken));
                 }
 
-                await Task.WhenAll(tasks);
+                // Wait for next chunk to be ready (should already be done by now)
+                currentChunk = await nextChunkTask;
+
+                // Clean up completed tasks periodically to avoid memory buildup
+                if (activeTasks.Count > concurrency * 4)
+                {
+                    activeTasks.RemoveAll(t => t.IsCompleted);
+                }
             }
+
+            // Wait for all remaining tasks to complete
+            await Task.WhenAll(activeTasks);
 
             await _repo.UpdateProgressAsync(
                 jobId,
@@ -265,6 +269,52 @@ namespace AdminPanelAPI.Services
             _logger.LogInformation(
                 "JobId={JobId}: Process-all complete. Processed={Processed}, Failed={Failed}, Total={Total}",
                 jobId, totalProcessed, totalFailed, grandTotal);
+        }
+
+        private async Task<ChunkData?> FetchChunkWithMetadataAsync(int chunkSize, CancellationToken cancellationToken)
+        {
+            var images = await _repo.GetUnprocessedImagesAsync(chunkSize, cancellationToken);
+
+            if (images.Count == 0)
+                return null;
+
+            var imageIds = images.Select(r => r.Id).ToList();
+            var movieIds = images.Where(r => r.MovieId.HasValue).Select(r => r.MovieId!.Value).Distinct().ToList();
+
+            // Fetch all metadata in parallel
+            var genderTask = _repo.FetchTagsAsync("frl_join_images_gender", "gender", imageIds, cancellationToken);
+            var subjectAgeTask = _repo.FetchTagsAsync("frl_join_images_subject_age", "subject_age", imageIds, cancellationToken);
+            var subjectEthTask = _repo.FetchTagsAsync("frl_join_images_subject_ethnicity", "subject_ethnicity", imageIds, cancellationToken);
+            var frameSizeTask = _repo.FetchTagsAsync("frl_join_images_frame_size", "frame_size", imageIds, cancellationToken);
+            var tagsTask = _repo.FetchTagsAsync("frl_join_images_tags", "tag", imageIds, cancellationToken);
+            var timeOfDayTask = _repo.FetchTagsAsync("frl_join_images_time_of_day", "time_of_day", imageIds, cancellationToken);
+            var movieFieldsTask = _repo.FetchMovieFieldsAsync(movieIds, cancellationToken);
+
+            await Task.WhenAll(genderTask, subjectAgeTask, subjectEthTask, frameSizeTask, tagsTask, timeOfDayTask, movieFieldsTask);
+
+            return new ChunkData
+            {
+                Images = images,
+                Gender = await genderTask,
+                SubjectAge = await subjectAgeTask,
+                SubjectEth = await subjectEthTask,
+                FrameSize = await frameSizeTask,
+                Tags = await tagsTask,
+                TimeOfDay = await timeOfDayTask,
+                MovieFields = await movieFieldsTask,
+            };
+        }
+
+        private sealed class ChunkData
+        {
+            public required List<ImageRecord> Images { get; init; }
+            public required Dictionary<int, List<string>> Gender { get; init; }
+            public required Dictionary<int, List<string>> SubjectAge { get; init; }
+            public required Dictionary<int, List<string>> SubjectEth { get; init; }
+            public required Dictionary<int, List<string>> FrameSize { get; init; }
+            public required Dictionary<int, List<string>> Tags { get; init; }
+            public required Dictionary<int, List<string>> TimeOfDay { get; init; }
+            public required Dictionary<int, (string? Title, string? Year, string? Genre, string? Product, string? Brand, string? MediaType, string? Director, string? Cinematographer)> MovieFields { get; init; }
         }
 
         public async Task<CaptionEmbeddingResult> ProcessSingleImageAsync(
