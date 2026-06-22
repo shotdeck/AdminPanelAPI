@@ -24,6 +24,8 @@ public interface ICaptionEmbeddingJobRepository
         int imageId,
         CancellationToken cancellationToken);
 
+    Task<int> GetUnprocessedCountAsync(CancellationToken cancellationToken);
+
     Task<Dictionary<int, List<string>>> FetchTagsAsync(
         string tableName,
         string columnName,
@@ -315,6 +317,29 @@ WHERE i.idnum = @imageId;";
         }
 
         return null;
+    }
+
+    public async Task<int> GetUnprocessedCountAsync(CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT COUNT(*)
+FROM frl.frl_images i
+WHERE i.status = 'live'
+  AND i.filename IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM frl.frl_caption_embeddings_qwen3 ce
+      WHERE ce.idnum = i.idnum
+  );";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 180;
+
+        var result = await cmd.ExecuteScalarAsync(cancellationToken);
+        return Convert.ToInt32(result);
     }
 
     public async Task<Dictionary<int, List<string>>> FetchTagsAsync(

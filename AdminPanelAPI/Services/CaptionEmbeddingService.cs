@@ -146,6 +146,126 @@ namespace AdminPanelAPI.Services
                 jobId, processed, failed, total);
         }
 
+        public async Task ProcessAllAsync(
+            long jobId,
+            int concurrency,
+            CancellationToken cancellationToken)
+        {
+            const int chunkSize = 500;
+
+            _logger.LogInformation(
+                "Starting process-all. JobId={JobId}, Concurrency={Concurrency}",
+                jobId, concurrency);
+
+            await _repo.UpdateProgressAsync(jobId, "Counting unprocessed images", null, null, cancellationToken);
+
+            var totalRemaining = await _repo.GetUnprocessedCountAsync(cancellationToken);
+
+            if (totalRemaining == 0)
+            {
+                await _repo.UpdateProgressAsync(jobId, "No unprocessed images found", 0, 0, cancellationToken);
+                _logger.LogInformation("JobId={JobId}: No unprocessed images to process.", jobId);
+                return;
+            }
+
+            _logger.LogInformation("JobId={JobId}: {Total} unprocessed images found.", jobId, totalRemaining);
+
+            var totalProcessed = 0;
+            var totalFailed = 0;
+            var grandTotal = totalRemaining;
+
+            await _repo.UpdateProgressAsync(jobId, "Processing images", 0, grandTotal, cancellationToken);
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var images = await _repo.GetUnprocessedImagesAsync(chunkSize, cancellationToken);
+
+                if (images.Count == 0)
+                    break;
+
+                var imageIds = images.Select(r => r.Id).ToList();
+                var movieIds = images.Where(r => r.MovieId.HasValue).Select(r => r.MovieId!.Value).Distinct().ToList();
+
+                var gender = await _repo.FetchTagsAsync("frl_join_images_gender", "gender", imageIds, cancellationToken);
+                var subjectAge = await _repo.FetchTagsAsync("frl_join_images_subject_age", "subject_age", imageIds, cancellationToken);
+                var subjectEth = await _repo.FetchTagsAsync("frl_join_images_subject_ethnicity", "subject_ethnicity", imageIds, cancellationToken);
+                var frameSize = await _repo.FetchTagsAsync("frl_join_images_frame_size", "frame_size", imageIds, cancellationToken);
+                var tags = await _repo.FetchTagsAsync("frl_join_images_tags", "tag", imageIds, cancellationToken);
+                var timeOfDay = await _repo.FetchTagsAsync("frl_join_images_time_of_day", "time_of_day", imageIds, cancellationToken);
+                var movieFields = await _repo.FetchMovieFieldsAsync(movieIds, cancellationToken);
+
+                using var semaphore = new SemaphoreSlim(concurrency);
+                var tasks = new List<Task>();
+
+                foreach (var rec in images)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (rec.Filename == null)
+                    {
+                        Interlocked.Increment(ref totalFailed);
+                        continue;
+                    }
+
+                    await semaphore.WaitAsync(cancellationToken);
+
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var httpClient = _httpClientFactory.CreateClient();
+                            httpClient.Timeout = TimeSpan.FromMinutes(5);
+
+                            var imageBytes = await DownloadImageAsync(httpClient, rec.Filename, cancellationToken);
+
+                            var metadata = KeywordMetadataBuilder.BuildMetadata(
+                                rec, gender, subjectAge, subjectEth,
+                                frameSize, tags, timeOfDay, movieFields);
+
+                            var result = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, cancellationToken);
+
+                            await InsertCaptionEmbeddingAsync(
+                                rec.Id, rec.Randid, result.Caption, result.Embeddings, result.FusedEmbeddings, metadata, cancellationToken);
+
+                            var current = Interlocked.Increment(ref totalProcessed);
+
+                            if (current % 50 == 0)
+                            {
+                                _logger.LogInformation(
+                                    "JobId={JobId}: Progress {Processed}/{Total} ({Failed} failed)",
+                                    jobId, current, grandTotal, totalFailed);
+
+                                await _repo.UpdateProgressAsync(
+                                    jobId,
+                                    $"Processing: {current}/{grandTotal} ({totalFailed} failed)",
+                                    current, grandTotal, cancellationToken);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.Increment(ref totalFailed);
+                            _logger.LogError(ex, "JobId={JobId}: Failed to process image {Idnum}", jobId, rec.Id);
+                        }
+                        finally
+                        {
+                            semaphore.Release();
+                        }
+                    }, cancellationToken));
+                }
+
+                await Task.WhenAll(tasks);
+            }
+
+            await _repo.UpdateProgressAsync(
+                jobId,
+                $"Completed: {totalProcessed} processed, {totalFailed} failed out of {grandTotal}",
+                totalProcessed, grandTotal, cancellationToken);
+
+            _logger.LogInformation(
+                "JobId={JobId}: Process-all complete. Processed={Processed}, Failed={Failed}, Total={Total}",
+                jobId, totalProcessed, totalFailed, grandTotal);
+        }
+
         public async Task<CaptionEmbeddingResult> ProcessSingleImageAsync(
             int imageId,
             CancellationToken cancellationToken)

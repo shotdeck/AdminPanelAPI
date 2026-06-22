@@ -53,6 +53,28 @@ namespace AdminPanelAPI.Controllers
             });
         }
 
+        [HttpPost("process-all")]
+        public async Task<IActionResult> ProcessAll(
+            [FromQuery] int concurrency = 20,
+            CancellationToken cancellationToken = default)
+        {
+            if (concurrency <= 0 || concurrency > 100)
+                return BadRequest(new { error = "concurrency must be between 1 and 100" });
+
+            var jobId = await _jobRepository.CreateJobAsync(-concurrency, cancellationToken);
+
+            await _jobQueue.QueueJobAsync(jobId, cancellationToken);
+
+            return Ok(new
+            {
+                jobId,
+                concurrency,
+                mode = "process-all",
+                status = "Queued",
+                checkProgressUrl = $"/api/CaptionEmbedding/status/{jobId}"
+            });
+        }
+
         [HttpGet("status/{jobId:long}")]
         public async Task<IActionResult> GetStatus(
             long jobId,
