@@ -214,7 +214,7 @@ namespace AdminPanelAPI.Services
                     {
                         try
                         {
-                            var httpClient = _httpClientFactory.CreateClient();
+                            var httpClient = _httpClientFactory.CreateClient("HighConcurrency");
                             httpClient.Timeout = TimeSpan.FromMinutes(5);
 
                             var imageBytes = await DownloadImageAsync(httpClient, rec.Filename, cancellationToken);

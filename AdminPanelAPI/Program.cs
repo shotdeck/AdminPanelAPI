@@ -42,6 +42,12 @@ builder.Services.AddScoped<NpgsqlConnection>(sp => sp.GetRequiredService<Lazy<Np
 builder.Services.AddSingleton<IKeywordCacheService, KeywordCacheService>();
 
 builder.Services.AddHttpClient();
+builder.Services.AddHttpClient("HighConcurrency")
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    {
+        MaxConnectionsPerServer = 100,
+        PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+    });
 builder.Services.AddSingleton<IMovieJobQueue, MovieJobQueue>();
 
 builder.Services.AddScoped<IMovieProcessingJobRepository, MovieProcessingJobRepository>();
