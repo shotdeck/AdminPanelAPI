@@ -214,7 +214,7 @@ WHERE i.status = 'live'
   AND i.filename IS NOT NULL
   AND NOT EXISTS (
       SELECT 1
-      FROM frl.frl_caption_embeddings ce
+      FROM frl.frl_caption_embeddings_qwen3 ce
       WHERE ce.idnum = i.idnum
   )
 ORDER BY i.idnum

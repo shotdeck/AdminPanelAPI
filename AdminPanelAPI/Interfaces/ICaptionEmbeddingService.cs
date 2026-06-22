@@ -19,5 +19,6 @@ public class CaptionEmbeddingResult
     public string? Caption { get; set; }
     public string? KeywordMetadata { get; set; }
     public int? EmbeddingLength { get; set; }
+    public int? FusedEmbeddingLength { get; set; }
     public string? Error { get; set; }
 }

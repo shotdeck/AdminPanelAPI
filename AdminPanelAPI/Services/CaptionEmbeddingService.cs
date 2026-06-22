@@ -41,7 +41,7 @@ namespace AdminPanelAPI.Services
             _imageServerPassword = _configuration["CaptionEmbedding:ImageServerPassword"] ?? "";
 
             _captionApiBaseUrl = _configuration["CaptionEmbedding:CaptionApiBaseUrl"]
-                                 ?? "https://semanticsearch--ops-mm-embedding-embeddingservice-create-c9f1b2.modal.run";
+                                 ?? "https://semanticsearch--qwen3-vl-embedding-api-api.modal.run";
         }
 
         public async Task ProcessBatchAsync(
@@ -109,16 +109,14 @@ namespace AdminPanelAPI.Services
 
                     var imageBytes = await DownloadImageAsync(httpClient, rec.Filename, cancellationToken);
 
-                    var caption = await GetImageCaptionAsync(httpClient, imageBytes, rec.Filename, cancellationToken);
-
-                    var embeddings = await GetImageEmbeddingAsync(httpClient, imageBytes, rec.Filename, cancellationToken);
-
                     var metadata = KeywordMetadataBuilder.BuildMetadata(
                         rec, gender, subjectAge, subjectEth,
                         frameSize, tags, timeOfDay, movieFields);
 
+                    var result = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, cancellationToken);
+
                     await InsertCaptionEmbeddingAsync(
-                        rec.Id, rec.Randid, caption, embeddings, metadata, cancellationToken);
+                        rec.Id, rec.Randid, result.Caption, result.Embeddings, result.FusedEmbeddings, metadata, cancellationToken);
 
                     processed++;
 
@@ -188,20 +186,21 @@ namespace AdminPanelAPI.Services
                 httpClient.Timeout = TimeSpan.FromMinutes(5);
 
                 var imageBytes = await DownloadImageAsync(httpClient, rec.Filename, cancellationToken);
-                var caption = await GetImageCaptionAsync(httpClient, imageBytes, rec.Filename, cancellationToken);
-                var embeddings = await GetImageEmbeddingAsync(httpClient, imageBytes, rec.Filename, cancellationToken);
 
                 var metadata = KeywordMetadataBuilder.BuildMetadata(
                     rec, gender, subjectAge, subjectEth,
                     frameSize, tags, timeOfDay, movieFields);
 
+                var apiResult = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, cancellationToken);
+
                 await InsertCaptionEmbeddingAsync(
-                    rec.Id, rec.Randid, caption, embeddings, metadata, cancellationToken);
+                    rec.Id, rec.Randid, apiResult.Caption, apiResult.Embeddings, apiResult.FusedEmbeddings, metadata, cancellationToken);
 
                 result.Status = "Completed";
-                result.Caption = caption;
+                result.Caption = apiResult.Caption;
                 result.KeywordMetadata = metadata;
-                result.EmbeddingLength = embeddings.Length;
+                result.EmbeddingLength = apiResult.Embeddings.Length;
+                result.FusedEmbeddingLength = apiResult.FusedEmbeddings?.Length;
 
                 _logger.LogInformation("Processed single image {ImageId} successfully.", imageId);
             }
@@ -237,18 +236,24 @@ namespace AdminPanelAPI.Services
             return await response.Content.ReadAsByteArrayAsync(cancellationToken);
         }
 
-        private async Task<string> GetImageCaptionAsync(
+        private async Task<ProcessImageResult> ProcessImageAsync(
             HttpClient httpClient,
             byte[] imageBytes,
             string filename,
+            string? metadata,
             CancellationToken cancellationToken)
         {
-            var url = $"{_captionApiBaseUrl.TrimEnd('/')}/get_image_caption";
+            var url = $"{_captionApiBaseUrl.TrimEnd('/')}/process_image";
 
             using var content = new MultipartFormDataContent();
             var imageContent = new ByteArrayContent(imageBytes);
             imageContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
             content.Add(imageContent, "image", $"small_{filename}");
+
+            if (!string.IsNullOrWhiteSpace(metadata))
+            {
+                content.Add(new StringContent(metadata), "metadata");
+            }
 
             var response = await httpClient.PostAsync(url, content, cancellationToken);
             response.EnsureSuccessStatusCode();
@@ -256,39 +261,42 @@ namespace AdminPanelAPI.Services
             var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
             using var doc = JsonDocument.Parse(responseBody);
 
-            return doc.RootElement.GetProperty("caption").GetString()
-                   ?? throw new Exception("Caption response missing 'caption' field.");
-        }
-
-        private async Task<float[]> GetImageEmbeddingAsync(
-            HttpClient httpClient,
-            byte[] imageBytes,
-            string filename,
-            CancellationToken cancellationToken)
-        {
-            var url = $"{_captionApiBaseUrl.TrimEnd('/')}/get_image_embedding";
-
-            using var content = new MultipartFormDataContent();
-            var imageContent = new ByteArrayContent(imageBytes);
-            imageContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
-            content.Add(imageContent, "image", $"small_{filename}");
-
-            var response = await httpClient.PostAsync(url, content, cancellationToken);
-            response.EnsureSuccessStatusCode();
-
-            var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
-            using var doc = JsonDocument.Parse(responseBody);
+            var caption = doc.RootElement.GetProperty("caption").GetString()
+                          ?? throw new Exception("Response missing 'caption' field.");
 
             var embeddingsArray = doc.RootElement.GetProperty("embeddings");
             var embeddings = new float[embeddingsArray.GetArrayLength()];
-
             int i = 0;
             foreach (var element in embeddingsArray.EnumerateArray())
             {
                 embeddings[i++] = element.GetSingle();
             }
 
-            return embeddings;
+            float[]? fusedEmbeddings = null;
+            if (doc.RootElement.TryGetProperty("fused_embeddings", out var fusedProp)
+                && fusedProp.ValueKind == JsonValueKind.Array)
+            {
+                fusedEmbeddings = new float[fusedProp.GetArrayLength()];
+                int j = 0;
+                foreach (var element in fusedProp.EnumerateArray())
+                {
+                    fusedEmbeddings[j++] = element.GetSingle();
+                }
+            }
+
+            return new ProcessImageResult
+            {
+                Caption = caption,
+                Embeddings = embeddings,
+                FusedEmbeddings = fusedEmbeddings,
+            };
+        }
+
+        private class ProcessImageResult
+        {
+            public string Caption { get; set; } = "";
+            public float[] Embeddings { get; set; } = Array.Empty<float>();
+            public float[]? FusedEmbeddings { get; set; }
         }
 
         private async Task InsertCaptionEmbeddingAsync(
@@ -296,13 +304,19 @@ namespace AdminPanelAPI.Services
             string? randid,
             string caption,
             float[] embeddings,
+            float[]? fusedEmbeddings,
             string? keywordMetadata,
             CancellationToken cancellationToken)
         {
             const string sql = @"
-INSERT INTO frl.frl_caption_embeddings (idnum, randid, captions, vectorized_embeddings, keyword_vectorized_metadata, status)
-VALUES (@idnum, @randid, @captions, @embeddings::halfvec, @metadata, 'completed')
-ON CONFLICT (idnum) DO NOTHING;";
+INSERT INTO frl.frl_caption_embeddings_qwen3 (idnum, randid, captions, vectorized_embeddings, fused_embeddings, keyword_vectorized_metadata, status)
+VALUES (@idnum, @randid, @captions, @embeddings::halfvec, @fused::halfvec, @metadata, 'completed')
+ON CONFLICT (idnum) DO UPDATE SET
+    captions = EXCLUDED.captions,
+    vectorized_embeddings = EXCLUDED.vectorized_embeddings,
+    fused_embeddings = EXCLUDED.fused_embeddings,
+    keyword_vectorized_metadata = EXCLUDED.keyword_vectorized_metadata,
+    status = EXCLUDED.status;";
 
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync(cancellationToken);
@@ -314,6 +328,17 @@ ON CONFLICT (idnum) DO NOTHING;";
 
             var embeddingString = "[" + string.Join(",", embeddings) + "]";
             cmd.Parameters.AddWithValue("embeddings", embeddingString);
+
+            if (fusedEmbeddings != null)
+            {
+                var fusedString = "[" + string.Join(",", fusedEmbeddings) + "]";
+                cmd.Parameters.AddWithValue("fused", fusedString);
+            }
+            else
+            {
+                cmd.Parameters.AddWithValue("fused", DBNull.Value);
+            }
+
             cmd.Parameters.AddWithValue("metadata",
                 (object?)keywordMetadata ?? DBNull.Value);
 
