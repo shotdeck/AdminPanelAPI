@@ -14,5 +14,6 @@ namespace AdminPanelAPI.Models
         public string? FilmingLocation { get; set; }
         public string? Actors { get; set; }
         public string? IntExt { get; set; }
+        public string? CachedMetadata { get; set; }
     }
 }
