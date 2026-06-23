@@ -210,8 +210,10 @@ WHERE id = @id;";
 SELECT i.idnum, i.filename, i.randid, i.movieid,
        i.format, i.optical_format, i.time_period,
        i.setting, i.location, i.filming_location,
-       i.actors, i.int_ext
+       i.actors, i.int_ext,
+       old.keyword_vectorized_metadata AS cached_metadata
 FROM frl.frl_images i
+LEFT JOIN frl.frl_caption_embeddings old ON old.idnum = i.idnum
 WHERE i.status = 'live'
   AND i.filename IS NOT NULL
   AND NOT EXISTS (
@@ -260,6 +262,8 @@ LIMIT @limit;";
                     ? null : reader.GetValue(reader.GetOrdinal("actors"))?.ToString(),
                 IntExt = reader.IsDBNull(reader.GetOrdinal("int_ext"))
                     ? null : reader.GetValue(reader.GetOrdinal("int_ext"))?.ToString(),
+                CachedMetadata = reader.IsDBNull(reader.GetOrdinal("cached_metadata"))
+                    ? null : reader.GetString(reader.GetOrdinal("cached_metadata")),
             });
         }
 

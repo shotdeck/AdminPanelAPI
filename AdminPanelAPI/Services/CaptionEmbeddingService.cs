@@ -152,10 +152,10 @@ namespace AdminPanelAPI.Services
             CancellationToken cancellationToken,
             bool skipCaption = false)
         {
-            const int chunkSize = 2000;
+            const int fetchBatchSize = 500;
 
             _logger.LogInformation(
-                "Starting process-all. JobId={JobId}, Concurrency={Concurrency}",
+                "Starting process-all (streaming). JobId={JobId}, Concurrency={Concurrency}",
                 jobId, concurrency);
 
             await _repo.UpdateProgressAsync(jobId, "Counting unprocessed images", null, null, cancellationToken);
@@ -177,77 +177,111 @@ namespace AdminPanelAPI.Services
 
             await _repo.UpdateProgressAsync(jobId, "Processing images", 0, grandTotal, cancellationToken);
 
-            using var semaphore = new SemaphoreSlim(concurrency);
-
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                // Fetch chunk with all metadata queries in parallel
-                var currentChunk = await FetchChunkWithMetadataAsync(chunkSize, cancellationToken);
-
-                if (currentChunk == null)
-                    break;
-
-                var tasks = new List<Task>();
-
-                foreach (var rec in currentChunk.Images)
+            // Channel acts as a buffer between the producer (DB fetcher) and consumers (GPU workers)
+            var channel = System.Threading.Channels.Channel.CreateBounded<(ImageRecord Rec, ChunkData Chunk)>(
+                new System.Threading.Channels.BoundedChannelOptions(concurrency * 2)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
+                    FullMode = System.Threading.Channels.BoundedChannelFullMode.Wait,
+                    SingleWriter = true,
+                    SingleReader = false,
+                });
 
-                    if (rec.Filename == null)
+            // Producer: continuously fetches images + metadata and writes to channel
+            var producerTask = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!cancellationToken.IsCancellationRequested)
                     {
-                        Interlocked.Increment(ref totalFailed);
-                        continue;
-                    }
+                        var chunk = await FetchChunkWithMetadataAsync(fetchBatchSize, cancellationToken);
 
-                    await semaphore.WaitAsync(cancellationToken);
+                        if (chunk == null)
+                            break;
 
-                    var chunk = currentChunk; // capture for closure
-                    tasks.Add(Task.Run(async () =>
-                    {
-                        try
+                        foreach (var rec in chunk.Images)
                         {
-                            var httpClient = _httpClientFactory.CreateClient("HighConcurrency");
-                            httpClient.Timeout = TimeSpan.FromMinutes(5);
+                            cancellationToken.ThrowIfCancellationRequested();
+                            await channel.Writer.WriteAsync((rec, chunk), cancellationToken);
+                        }
+                    }
+                }
+                finally
+                {
+                    channel.Writer.Complete();
+                }
+            }, cancellationToken);
 
-                            var imageBytes = await DownloadImageAsync(httpClient, rec.Filename, cancellationToken);
+            // Consumer: reads from channel and processes with bounded concurrency
+            using var semaphore = new SemaphoreSlim(concurrency);
+            var activeTasks = new List<Task>();
 
-                            var metadata = KeywordMetadataBuilder.BuildMetadata(
+            await foreach (var (rec, chunk) in channel.Reader.ReadAllAsync(cancellationToken))
+            {
+                if (rec.Filename == null)
+                {
+                    Interlocked.Increment(ref totalFailed);
+                    continue;
+                }
+
+                await semaphore.WaitAsync(cancellationToken);
+
+                activeTasks.Add(Task.Run(async () =>
+                {
+                    try
+                    {
+                        var httpClient = _httpClientFactory.CreateClient("HighConcurrency");
+                        httpClient.Timeout = TimeSpan.FromMinutes(5);
+
+                        var imageBytes = await DownloadImageAsync(httpClient, rec.Filename, cancellationToken);
+
+                        // Use cached metadata from old table if available; otherwise build from tag queries
+                        var metadata = rec.CachedMetadata
+                            ?? KeywordMetadataBuilder.BuildMetadata(
                                 rec, chunk.Gender, chunk.SubjectAge, chunk.SubjectEth,
                                 chunk.FrameSize, chunk.Tags, chunk.TimeOfDay, chunk.MovieFields);
 
-                            var result = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, skipCaption, cancellationToken);
+                        var result = await ProcessImageAsync(httpClient, imageBytes, rec.Filename, metadata, skipCaption, cancellationToken);
 
-                            await InsertCaptionEmbeddingAsync(
-                                rec.Id, rec.Randid, result.Caption, result.Embeddings, result.FusedEmbeddings, metadata, cancellationToken);
+                        await InsertCaptionEmbeddingAsync(
+                            rec.Id, rec.Randid, result.Caption, result.Embeddings, result.FusedEmbeddings, metadata, cancellationToken);
 
-                            var current = Interlocked.Increment(ref totalProcessed);
+                        var current = Interlocked.Increment(ref totalProcessed);
 
-                            if (current % 100 == 0)
-                            {
-                                _logger.LogInformation(
-                                    "JobId={JobId}: Progress {Processed}/{Total} ({Failed} failed)",
-                                    jobId, current, grandTotal, totalFailed);
-
-                                await _repo.UpdateProgressAsync(
-                                    jobId,
-                                    $"Processing: {current}/{grandTotal} ({totalFailed} failed)",
-                                    current, grandTotal, cancellationToken);
-                            }
-                        }
-                        catch (Exception ex)
+                        if (current % 100 == 0)
                         {
-                            Interlocked.Increment(ref totalFailed);
-                            _logger.LogError(ex, "JobId={JobId}: Failed to process image {Idnum}", jobId, rec.Id);
+                            _logger.LogInformation(
+                                "JobId={JobId}: Progress {Processed}/{Total} ({Failed} failed)",
+                                jobId, current, grandTotal, totalFailed);
+
+                            await _repo.UpdateProgressAsync(
+                                jobId,
+                                $"Processing: {current}/{grandTotal} ({totalFailed} failed)",
+                                current, grandTotal, cancellationToken);
                         }
-                        finally
-                        {
-                            semaphore.Release();
-                        }
-                    }, cancellationToken));
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.Increment(ref totalFailed);
+                        _logger.LogError(ex, "JobId={JobId}: Failed to process image {Idnum}", jobId, rec.Id);
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                }, cancellationToken));
+
+                // Periodically clean up completed tasks to avoid memory buildup
+                if (activeTasks.Count > concurrency * 4)
+                {
+                    activeTasks.RemoveAll(t => t.IsCompleted);
                 }
-
-                await Task.WhenAll(tasks);
             }
+
+            // Wait for producer to finish (in case of exceptions)
+            await producerTask;
+
+            // Wait for all remaining processing tasks
+            await Task.WhenAll(activeTasks);
 
             await _repo.UpdateProgressAsync(
                 jobId,
@@ -266,30 +300,57 @@ namespace AdminPanelAPI.Services
             if (images.Count == 0)
                 return null;
 
-            var imageIds = images.Select(r => r.Id).ToList();
-            var movieIds = images.Where(r => r.MovieId.HasValue).Select(r => r.MovieId!.Value).Distinct().ToList();
+            // Only fetch tag metadata for images that don't have cached metadata
+            var uncachedImages = images.Where(r => r.CachedMetadata == null).ToList();
 
-            // Fetch all metadata in parallel
-            var genderTask = _repo.FetchTagsAsync("frl_join_images_gender", "gender", imageIds, cancellationToken);
-            var subjectAgeTask = _repo.FetchTagsAsync("frl_join_images_subject_age", "subject_age", imageIds, cancellationToken);
-            var subjectEthTask = _repo.FetchTagsAsync("frl_join_images_subject_ethnicity", "subject_ethnicity", imageIds, cancellationToken);
-            var frameSizeTask = _repo.FetchTagsAsync("frl_join_images_frame_size", "frame_size", imageIds, cancellationToken);
-            var tagsTask = _repo.FetchTagsAsync("frl_join_images_tags", "tag", imageIds, cancellationToken);
-            var timeOfDayTask = _repo.FetchTagsAsync("frl_join_images_time_of_day", "time_of_day", imageIds, cancellationToken);
-            var movieFieldsTask = _repo.FetchMovieFieldsAsync(movieIds, cancellationToken);
+            Dictionary<int, List<string>> gender, subjectAge, subjectEth, frameSize, tags, timeOfDay;
+            Dictionary<int, (string? Title, string? Year, string? Genre, string? Product, string? Brand, string? MediaType, string? Director, string? Cinematographer)> movieFields;
 
-            await Task.WhenAll(genderTask, subjectAgeTask, subjectEthTask, frameSizeTask, tagsTask, timeOfDayTask, movieFieldsTask);
+            if (uncachedImages.Count > 0)
+            {
+                var imageIds = uncachedImages.Select(r => r.Id).ToList();
+                var movieIds = uncachedImages.Where(r => r.MovieId.HasValue).Select(r => r.MovieId!.Value).Distinct().ToList();
+
+                var genderTask = _repo.FetchTagsAsync("frl_join_images_gender", "gender", imageIds, cancellationToken);
+                var subjectAgeTask = _repo.FetchTagsAsync("frl_join_images_subject_age", "subject_age", imageIds, cancellationToken);
+                var subjectEthTask = _repo.FetchTagsAsync("frl_join_images_subject_ethnicity", "subject_ethnicity", imageIds, cancellationToken);
+                var frameSizeTask = _repo.FetchTagsAsync("frl_join_images_frame_size", "frame_size", imageIds, cancellationToken);
+                var tagsTask = _repo.FetchTagsAsync("frl_join_images_tags", "tag", imageIds, cancellationToken);
+                var timeOfDayTask = _repo.FetchTagsAsync("frl_join_images_time_of_day", "time_of_day", imageIds, cancellationToken);
+                var movieFieldsTask = _repo.FetchMovieFieldsAsync(movieIds, cancellationToken);
+
+                await Task.WhenAll(genderTask, subjectAgeTask, subjectEthTask, frameSizeTask, tagsTask, timeOfDayTask, movieFieldsTask);
+
+                gender = await genderTask;
+                subjectAge = await subjectAgeTask;
+                subjectEth = await subjectEthTask;
+                frameSize = await frameSizeTask;
+                tags = await tagsTask;
+                timeOfDay = await timeOfDayTask;
+                movieFields = await movieFieldsTask;
+            }
+            else
+            {
+                // All images have cached metadata — skip all tag queries
+                gender = new();
+                subjectAge = new();
+                subjectEth = new();
+                frameSize = new();
+                tags = new();
+                timeOfDay = new();
+                movieFields = new();
+            }
 
             return new ChunkData
             {
                 Images = images,
-                Gender = await genderTask,
-                SubjectAge = await subjectAgeTask,
-                SubjectEth = await subjectEthTask,
-                FrameSize = await frameSizeTask,
-                Tags = await tagsTask,
-                TimeOfDay = await timeOfDayTask,
-                MovieFields = await movieFieldsTask,
+                Gender = gender,
+                SubjectAge = subjectAge,
+                SubjectEth = subjectEth,
+                FrameSize = frameSize,
+                Tags = tags,
+                TimeOfDay = timeOfDay,
+                MovieFields = movieFields,
             };
         }
 
