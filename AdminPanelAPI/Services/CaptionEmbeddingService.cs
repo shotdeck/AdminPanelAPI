@@ -173,9 +173,13 @@ namespace AdminPanelAPI.Services
 
             var totalProcessed = 0;
             var totalFailed = 0;
+            var totalSkipped = 0;
             var grandTotal = totalRemaining;
 
             await _repo.UpdateProgressAsync(jobId, "Processing images", 0, grandTotal, cancellationToken);
+
+            // Track IDs that have failed — skip them on subsequent fetches to prevent infinite loops
+            var failedIds = new System.Collections.Concurrent.ConcurrentDictionary<int, byte>();
 
             // Channel acts as a buffer between the producer (DB fetcher) and consumers (GPU workers)
             var channel = System.Threading.Channels.Channel.CreateBounded<(ImageRecord Rec, ChunkData Chunk)>(
@@ -198,7 +202,19 @@ namespace AdminPanelAPI.Services
                         if (chunk == null)
                             break;
 
-                        foreach (var rec in chunk.Images)
+                        // Filter out images that have already failed in this run
+                        var newImages = chunk.Images.Where(r => !failedIds.ContainsKey(r.Id)).ToList();
+
+                        if (newImages.Count == 0)
+                        {
+                            // All images in this batch already failed — no more progress possible
+                            _logger.LogInformation(
+                                "JobId={JobId}: All remaining images have failed. Stopping.",
+                                jobId);
+                            break;
+                        }
+
+                        foreach (var rec in newImages)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
                             await channel.Writer.WriteAsync((rec, chunk), cancellationToken);
@@ -220,6 +236,7 @@ namespace AdminPanelAPI.Services
                 if (rec.Filename == null)
                 {
                     Interlocked.Increment(ref totalFailed);
+                    failedIds.TryAdd(rec.Id, 0);
                     continue;
                 }
 
@@ -250,8 +267,8 @@ namespace AdminPanelAPI.Services
                         if (current % 100 == 0)
                         {
                             _logger.LogInformation(
-                                "JobId={JobId}: Progress {Processed}/{Total} ({Failed} failed)",
-                                jobId, current, grandTotal, totalFailed);
+                                "JobId={JobId}: Progress {Processed}/{Total} ({Failed} failed, {Skipped} skipped)",
+                                jobId, current, grandTotal, totalFailed, totalSkipped);
 
                             await _repo.UpdateProgressAsync(
                                 jobId,
@@ -262,6 +279,7 @@ namespace AdminPanelAPI.Services
                     catch (Exception ex)
                     {
                         Interlocked.Increment(ref totalFailed);
+                        failedIds.TryAdd(rec.Id, 0);
                         _logger.LogError(ex, "JobId={JobId}: Failed to process image {Idnum}", jobId, rec.Id);
                     }
                     finally
