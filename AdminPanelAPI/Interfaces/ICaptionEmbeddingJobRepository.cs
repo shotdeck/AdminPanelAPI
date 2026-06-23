@@ -18,10 +18,7 @@ public interface ICaptionEmbeddingJobRepository
 
     Task<List<ImageRecord>> GetUnprocessedImagesAsync(
         int limit,
-        int afterId,
         CancellationToken cancellationToken);
-
-    Task<int> GetMaxProcessedIdAsync(CancellationToken cancellationToken);
 
     Task<ImageRecord?> GetImageByIdAsync(
         int imageId,
@@ -204,7 +201,6 @@ WHERE id = @id;";
 
     public async Task<List<ImageRecord>> GetUnprocessedImagesAsync(
         int limit,
-        int afterId,
         CancellationToken cancellationToken)
     {
         if (limit <= 0)
@@ -220,7 +216,11 @@ FROM frl.frl_images i
 LEFT JOIN frl.frl_caption_embeddings old ON old.idnum = i.idnum
 WHERE i.status = 'live'
   AND i.filename IS NOT NULL
-  AND i.idnum > @afterId
+  AND NOT EXISTS (
+      SELECT 1
+      FROM frl.frl_caption_embeddings_qwen3 ce
+      WHERE ce.idnum = i.idnum
+  )
 ORDER BY i.idnum
 LIMIT @limit;";
 
@@ -232,7 +232,6 @@ LIMIT @limit;";
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.CommandTimeout = 180;
         cmd.Parameters.AddWithValue("limit", limit);
-        cmd.Parameters.AddWithValue("afterId", afterId);
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
 
@@ -343,18 +342,6 @@ WHERE i.status = 'live'
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.CommandTimeout = 180;
 
-        var result = await cmd.ExecuteScalarAsync(cancellationToken);
-        return Convert.ToInt32(result);
-    }
-
-    public async Task<int> GetMaxProcessedIdAsync(CancellationToken cancellationToken)
-    {
-        const string sql = "SELECT COALESCE(MAX(idnum), 0) FROM frl.frl_caption_embeddings_qwen3;";
-
-        await using var conn = new NpgsqlConnection(_connectionString);
-        await conn.OpenAsync(cancellationToken);
-
-        await using var cmd = new NpgsqlCommand(sql, conn);
         var result = await cmd.ExecuteScalarAsync(cancellationToken);
         return Convert.ToInt32(result);
     }
