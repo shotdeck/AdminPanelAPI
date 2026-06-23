@@ -152,7 +152,7 @@ namespace AdminPanelAPI.Services
             CancellationToken cancellationToken,
             bool skipCaption = false)
         {
-            const int fetchBatchSize = 500;
+            const int fetchBatchSize = 5000;
 
             _logger.LogInformation(
                 "Starting process-all (streaming). JobId={JobId}, Concurrency={Concurrency}",
@@ -182,8 +182,10 @@ namespace AdminPanelAPI.Services
             var failedIds = new System.Collections.Concurrent.ConcurrentDictionary<int, byte>();
 
             // Channel acts as a buffer between the producer (DB fetcher) and consumers (GPU workers)
+            // Large buffer ensures the producer can fill the pipeline ahead of consumers,
+            // allowing Modal to see enough concurrent requests to scale up containers
             var channel = System.Threading.Channels.Channel.CreateBounded<(ImageRecord Rec, ChunkData Chunk)>(
-                new System.Threading.Channels.BoundedChannelOptions(concurrency * 2)
+                new System.Threading.Channels.BoundedChannelOptions(Math.Max(concurrency * 4, fetchBatchSize))
                 {
                     FullMode = System.Threading.Channels.BoundedChannelFullMode.Wait,
                     SingleWriter = true,
