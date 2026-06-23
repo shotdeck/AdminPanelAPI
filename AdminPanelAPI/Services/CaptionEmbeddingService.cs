@@ -55,7 +55,7 @@ namespace AdminPanelAPI.Services
 
             await _repo.UpdateProgressAsync(jobId, "Fetching unprocessed images", null, null, cancellationToken);
 
-            var images = await _repo.GetUnprocessedImagesAsync(batchSize, cancellationToken);
+            var images = await _repo.GetUnprocessedImagesAsync(batchSize, 0, cancellationToken);
 
             if (images.Count == 0)
             {
@@ -189,11 +189,14 @@ namespace AdminPanelAPI.Services
             // Producer: continuously fetches images + metadata and writes to channel
             var producerTask = Task.Run(async () =>
             {
+                // Start cursor from max already-processed idnum (instant index scan)
+                var lastId = await _repo.GetMaxProcessedIdAsync(cancellationToken);
+                _logger.LogInformation("JobId={JobId}: Starting cursor from idnum={LastId}", jobId, lastId);
                 try
                 {
                     while (!cancellationToken.IsCancellationRequested)
                     {
-                        var chunk = await FetchChunkWithMetadataAsync(fetchBatchSize, cancellationToken);
+                        var chunk = await FetchChunkWithMetadataAsync(fetchBatchSize, lastId, cancellationToken);
 
                         if (chunk == null)
                             break;
@@ -203,6 +206,9 @@ namespace AdminPanelAPI.Services
                             cancellationToken.ThrowIfCancellationRequested();
                             await channel.Writer.WriteAsync((rec, chunk), cancellationToken);
                         }
+
+                        // Advance cursor to the last idnum in this batch
+                        lastId = chunk.Images[^1].Id;
                     }
                 }
                 finally
@@ -293,9 +299,9 @@ namespace AdminPanelAPI.Services
                 jobId, totalProcessed, totalFailed, grandTotal);
         }
 
-        private async Task<ChunkData?> FetchChunkWithMetadataAsync(int chunkSize, CancellationToken cancellationToken)
+        private async Task<ChunkData?> FetchChunkWithMetadataAsync(int chunkSize, int afterId, CancellationToken cancellationToken)
         {
-            var images = await _repo.GetUnprocessedImagesAsync(chunkSize, cancellationToken);
+            var images = await _repo.GetUnprocessedImagesAsync(chunkSize, afterId, cancellationToken);
 
             if (images.Count == 0)
                 return null;
