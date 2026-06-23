@@ -189,7 +189,9 @@ namespace AdminPanelAPI.Services
             // Producer: continuously fetches images + metadata and writes to channel
             var producerTask = Task.Run(async () =>
             {
-                var lastId = 0;
+                // Start cursor from max already-processed idnum (instant index scan)
+                var lastId = await _repo.GetMaxProcessedIdAsync(cancellationToken);
+                _logger.LogInformation("JobId={JobId}: Starting cursor from idnum={LastId}", jobId, lastId);
                 try
                 {
                     while (!cancellationToken.IsCancellationRequested)

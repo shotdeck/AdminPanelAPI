@@ -21,6 +21,8 @@ public interface ICaptionEmbeddingJobRepository
         int afterId,
         CancellationToken cancellationToken);
 
+    Task<int> GetMaxProcessedIdAsync(CancellationToken cancellationToken);
+
     Task<ImageRecord?> GetImageByIdAsync(
         int imageId,
         CancellationToken cancellationToken);
@@ -219,11 +221,6 @@ LEFT JOIN frl.frl_caption_embeddings old ON old.idnum = i.idnum
 WHERE i.status = 'live'
   AND i.filename IS NOT NULL
   AND i.idnum > @afterId
-  AND NOT EXISTS (
-      SELECT 1
-      FROM frl.frl_caption_embeddings_qwen3 ce
-      WHERE ce.idnum = i.idnum
-  )
 ORDER BY i.idnum
 LIMIT @limit;";
 
@@ -346,6 +343,18 @@ WHERE i.status = 'live'
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.CommandTimeout = 180;
 
+        var result = await cmd.ExecuteScalarAsync(cancellationToken);
+        return Convert.ToInt32(result);
+    }
+
+    public async Task<int> GetMaxProcessedIdAsync(CancellationToken cancellationToken)
+    {
+        const string sql = "SELECT COALESCE(MAX(idnum), 0) FROM frl.frl_caption_embeddings_qwen3;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
         var result = await cmd.ExecuteScalarAsync(cancellationToken);
         return Convert.ToInt32(result);
     }
