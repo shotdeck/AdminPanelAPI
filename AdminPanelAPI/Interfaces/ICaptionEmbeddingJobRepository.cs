@@ -18,6 +18,7 @@ public interface ICaptionEmbeddingJobRepository
 
     Task<List<ImageRecord>> GetUnprocessedImagesAsync(
         int limit,
+        int afterId,
         CancellationToken cancellationToken);
 
     Task<ImageRecord?> GetImageByIdAsync(
@@ -201,6 +202,7 @@ WHERE id = @id;";
 
     public async Task<List<ImageRecord>> GetUnprocessedImagesAsync(
         int limit,
+        int afterId,
         CancellationToken cancellationToken)
     {
         if (limit <= 0)
@@ -216,6 +218,7 @@ FROM frl.frl_images i
 LEFT JOIN frl.frl_caption_embeddings old ON old.idnum = i.idnum
 WHERE i.status = 'live'
   AND i.filename IS NOT NULL
+  AND i.idnum > @afterId
   AND NOT EXISTS (
       SELECT 1
       FROM frl.frl_caption_embeddings_qwen3 ce
@@ -232,6 +235,7 @@ LIMIT @limit;";
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.CommandTimeout = 180;
         cmd.Parameters.AddWithValue("limit", limit);
+        cmd.Parameters.AddWithValue("afterId", afterId);
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
 
