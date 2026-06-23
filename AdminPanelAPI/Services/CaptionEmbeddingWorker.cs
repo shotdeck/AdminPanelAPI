@@ -2,6 +2,9 @@ namespace AdminPanelAPI.Services
 {
     public class CaptionEmbeddingWorker : BackgroundService
     {
+        private const int MaxRetries = 10;
+        private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(30);
+
         private readonly IServiceProvider _serviceProvider;
         private readonly ICaptionEmbeddingJobQueue _queue;
         private readonly ILogger<CaptionEmbeddingWorker> _logger;
@@ -53,7 +56,8 @@ namespace AdminPanelAPI.Services
                             "CaptionEmbeddingWorker: Processing job {JobId} (process-all, concurrency={Concurrency}, skipCaption={SkipCaption})",
                             jobId, concurrency, skipCaption);
 
-                        await service.ProcessAllAsync(jobId, concurrency, stoppingToken, skipCaption);
+                        await RunWithAutoRetryAsync(
+                            jobId, concurrency, skipCaption, service, repo, stoppingToken);
                     }
                     else
                     {
@@ -105,6 +109,49 @@ namespace AdminPanelAPI.Services
             }
 
             _logger.LogInformation("CaptionEmbeddingWorker stopped.");
+        }
+
+        private async Task RunWithAutoRetryAsync(
+            long jobId,
+            int concurrency,
+            bool skipCaption,
+            ICaptionEmbeddingService service,
+            ICaptionEmbeddingJobRepository repo,
+            CancellationToken stoppingToken)
+        {
+            for (int attempt = 1; attempt <= MaxRetries; attempt++)
+            {
+                try
+                {
+                    await service.ProcessAllAsync(jobId, concurrency, stoppingToken, skipCaption);
+                    return; // success
+                }
+                catch (OperationCanceledException)
+                {
+                    throw; // don't retry cancellations
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "CaptionEmbeddingWorker: Job {JobId} failed on attempt {Attempt}/{MaxRetries}. Retrying in {Delay}s...",
+                        jobId, attempt, MaxRetries, RetryDelay.TotalSeconds);
+
+                    if (attempt == MaxRetries)
+                        throw; // exhausted retries, let outer handler mark as failed
+
+                    await repo.UpdateProgressAsync(
+                        jobId,
+                        $"Auto-retry: attempt {attempt} failed ({ex.Message}). Restarting in {RetryDelay.TotalSeconds}s...",
+                        null, null, stoppingToken);
+
+                    await Task.Delay(RetryDelay, stoppingToken);
+
+                    _logger.LogInformation(
+                        "CaptionEmbeddingWorker: Job {JobId} restarting (attempt {Attempt}/{MaxRetries})",
+                        jobId, attempt + 1, MaxRetries);
+                }
+            }
         }
     }
 }
