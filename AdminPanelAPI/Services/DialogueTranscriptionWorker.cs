@@ -50,7 +50,7 @@ namespace AdminPanelAPI.Services
                         jobId, job.MovieId);
 
                     await service.TranscribeMovieAsync(
-                        jobId, job.MovieId, stoppingToken);
+                        jobId, job.MovieId, job.R2Key, stoppingToken);
 
                     var updatedJob = await repo.GetJobAsync(jobId, stoppingToken);
                     await repo.MarkCompletedAsync(

@@ -35,10 +35,11 @@ namespace AdminPanelAPI.Controllers
         [HttpPost("transcribe/{movieId:int}")]
         public async Task<IActionResult> TranscribeMovie(
             int movieId,
-            CancellationToken cancellationToken)
+            [FromQuery] string? r2Key = null,
+            CancellationToken cancellationToken = default)
         {
             var jobId = await _jobRepository.CreateJobAsync(
-                movieId, null, null, cancellationToken);
+                movieId, r2Key, null, cancellationToken);
 
             await _jobQueue.QueueJobAsync(jobId, cancellationToken);
 
@@ -46,6 +47,7 @@ namespace AdminPanelAPI.Controllers
             {
                 jobId,
                 movieId,
+                r2Key,
                 status = "Queued"
             });
         }

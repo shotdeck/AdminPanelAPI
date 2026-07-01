@@ -36,11 +36,12 @@ namespace AdminPanelAPI.Services
         public async Task TranscribeMovieAsync(
             long jobId,
             int movieId,
+            string? r2Key,
             CancellationToken cancellationToken)
         {
             _logger.LogInformation(
-                "Starting dialogue transcription. JobId={JobId}, MovieId={MovieId}",
-                jobId, movieId);
+                "Starting dialogue transcription. JobId={JobId}, MovieId={MovieId}, R2Key={R2Key}",
+                jobId, movieId, r2Key);
 
             await _repo.UpdateProgressAsync(jobId, "Sending to transcription API", 5, cancellationToken);
 
@@ -48,6 +49,8 @@ namespace AdminPanelAPI.Services
             client.Timeout = TimeSpan.FromMinutes(60);
 
             var url = $"{_transcriptionApiBaseUrl.TrimEnd('/')}/transcribe?movie_id={movieId}";
+            if (!string.IsNullOrWhiteSpace(r2Key))
+                url += $"&r2_key={Uri.EscapeDataString(r2Key)}";
 
             using var response = await client.PostAsync(url, null, cancellationToken);
             var content = await response.Content.ReadAsStringAsync(cancellationToken);
