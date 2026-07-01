@@ -62,6 +62,12 @@ builder.Services.AddScoped<ICaptionEmbeddingService, CaptionEmbeddingService>();
 builder.Services.AddHostedService<CaptionEmbeddingWorker>();
 
 
+// Dialogue search transcription pipeline
+builder.Services.AddSingleton<IDialogueJobQueue, DialogueJobQueue>();
+builder.Services.AddScoped<IDialogueTranscriptionJobRepository, DialogueTranscriptionJobRepository>();
+builder.Services.AddScoped<IDialogueTranscriptionService, DialogueTranscriptionService>();
+builder.Services.AddHostedService<DialogueTranscriptionWorker>();
+
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
 
