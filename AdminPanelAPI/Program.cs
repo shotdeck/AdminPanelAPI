@@ -5,6 +5,12 @@ using ShotDeck.Keywords;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Allow large file uploads (up to 10 GB for movie files)
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.Limits.MaxRequestBodySize = 10L * 1024 * 1024 * 1024;
+});
+
 // Controllers & Swagger
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();

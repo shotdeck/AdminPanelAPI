@@ -1,4 +1,7 @@
 using AdminPanelAPI.Models;
+using Amazon.Runtime;
+using Amazon.S3;
+using Amazon.S3.Model;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
 using System.Text;
@@ -13,20 +16,112 @@ namespace AdminPanelAPI.Controllers
         private readonly IDialogueTranscriptionJobRepository _jobRepository;
         private readonly IDialogueJobQueue _jobQueue;
         private readonly IConfiguration _configuration;
+        private readonly ILogger<DialogueSearchController> _logger;
         private readonly string _connectionString;
 
+        private readonly string _r2AccountId;
+        private readonly string _r2AccessKey;
+        private readonly string _r2SecretKey;
+        private readonly string _r2BucketName;
+
         private const double PaddingSeconds = 0.5;
+        private const long MaxUploadSizeBytes = 10L * 1024 * 1024 * 1024; // 10 GB
 
         public DialogueSearchController(
             IDialogueTranscriptionJobRepository jobRepository,
             IDialogueJobQueue jobQueue,
-            IConfiguration configuration)
+            IConfiguration configuration,
+            ILogger<DialogueSearchController> logger)
         {
             _jobRepository = jobRepository;
             _jobQueue = jobQueue;
             _configuration = configuration;
+            _logger = logger;
             _connectionString = configuration.GetConnectionString("Default")
                 ?? throw new InvalidOperationException("Missing connection string: Default");
+
+            _r2AccountId = configuration["R2:AccountId"] ?? "";
+            _r2AccessKey = configuration["R2:AccessKey"] ?? "";
+            _r2SecretKey = configuration["R2:SecretKey"] ?? "";
+            _r2BucketName = configuration["DialogueSearch:R2BucketName"] ?? "movies";
+        }
+
+        /// <summary>
+        /// Upload an MP4 file to R2 and queue it for dialogue transcription.
+        /// </summary>
+        [HttpPost("upload/{movieId:int}")]
+        [RequestSizeLimit(MaxUploadSizeBytes)]
+        [RequestFormLimits(MultipartBodyLengthLimit = MaxUploadSizeBytes)]
+        public async Task<IActionResult> UploadAndTranscribe(
+            int movieId,
+            IFormFile file,
+            CancellationToken cancellationToken = default)
+        {
+            if (file == null || file.Length == 0)
+                return BadRequest(new { error = "No file provided." });
+
+            if (!file.FileName.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase))
+                return BadRequest(new { error = "Only .mp4 files are accepted." });
+
+            if (file.Length > MaxUploadSizeBytes)
+                return BadRequest(new { error = $"File exceeds maximum size of {MaxUploadSizeBytes / (1024 * 1024 * 1024)} GB." });
+
+            if (string.IsNullOrWhiteSpace(_r2AccountId) ||
+                string.IsNullOrWhiteSpace(_r2AccessKey) ||
+                string.IsNullOrWhiteSpace(_r2SecretKey))
+            {
+                return StatusCode(500, new { error = "R2 credentials are not configured." });
+            }
+
+            var sanitizedName = SanitizeFileName(file.FileName);
+            var r2Key = $"{movieId}/{sanitizedName}";
+
+            _logger.LogInformation(
+                "Uploading movie file to R2. MovieId={MovieId}, R2Key={R2Key}, Size={Size}",
+                movieId, r2Key, file.Length);
+
+            var creds = new BasicAWSCredentials(_r2AccessKey.Trim(), _r2SecretKey.Trim());
+            var s3Config = new AmazonS3Config
+            {
+                ServiceURL = $"https://{_r2AccountId.Trim()}.r2.cloudflarestorage.com",
+                ForcePathStyle = true,
+                UseAccelerateEndpoint = false,
+                UseDualstackEndpoint = false,
+                EndpointDiscoveryEnabled = false
+            };
+
+            using var s3Client = new AmazonS3Client(creds, s3Config);
+
+            await using var stream = file.OpenReadStream();
+            var putRequest = new PutObjectRequest
+            {
+                BucketName = _r2BucketName,
+                Key = r2Key,
+                InputStream = stream,
+                ContentType = "video/mp4",
+                DisablePayloadSigning = true
+            };
+
+            await s3Client.PutObjectAsync(putRequest, cancellationToken);
+
+            _logger.LogInformation(
+                "Upload complete. MovieId={MovieId}, R2Key={R2Key}",
+                movieId, r2Key);
+
+            var jobId = await _jobRepository.CreateJobAsync(
+                movieId, r2Key, null, cancellationToken);
+
+            await _jobQueue.QueueJobAsync(jobId, cancellationToken);
+
+            return Ok(new
+            {
+                jobId,
+                movieId,
+                r2Key,
+                r2Bucket = _r2BucketName,
+                fileSizeBytes = file.Length,
+                status = "Queued"
+            });
         }
 
         /// <summary>
@@ -297,6 +392,12 @@ LIMIT 30;";
                 .Select(w => w.Trim('\''))
                 .Where(w => !string.IsNullOrEmpty(w))
                 .ToList();
+        }
+
+        private static string SanitizeFileName(string fileName)
+        {
+            var name = Path.GetFileName(fileName);
+            return Regex.Replace(name, @"[^\w.\-]", "_");
         }
     }
 }
