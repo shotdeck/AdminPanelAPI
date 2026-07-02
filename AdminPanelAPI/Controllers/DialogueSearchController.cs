@@ -76,10 +76,6 @@ namespace AdminPanelAPI.Controllers
             var sanitizedName = SanitizeFileName(file.FileName);
             var r2Key = $"{movieId}/{sanitizedName}";
 
-            _logger.LogInformation(
-                "Uploading movie file to R2. MovieId={MovieId}, R2Key={R2Key}, Size={Size}",
-                movieId, r2Key, file.Length);
-
             var creds = new BasicAWSCredentials(_r2AccessKey.Trim(), _r2SecretKey.Trim());
             var s3Config = new AmazonS3Config
             {
@@ -92,21 +88,36 @@ namespace AdminPanelAPI.Controllers
 
             using var s3Client = new AmazonS3Client(creds, s3Config);
 
-            await using var stream = file.OpenReadStream();
-            var putRequest = new PutObjectRequest
+            var alreadyExists = await R2ObjectExistsAsync(s3Client, r2Key, cancellationToken);
+
+            if (alreadyExists)
             {
-                BucketName = _r2BucketName,
-                Key = r2Key,
-                InputStream = stream,
-                ContentType = "video/mp4",
-                DisablePayloadSigning = true
-            };
+                _logger.LogInformation(
+                    "File already exists in R2, skipping upload. MovieId={MovieId}, R2Key={R2Key}",
+                    movieId, r2Key);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Uploading movie file to R2. MovieId={MovieId}, R2Key={R2Key}, Size={Size}",
+                    movieId, r2Key, file.Length);
 
-            await s3Client.PutObjectAsync(putRequest, cancellationToken);
+                await using var stream = file.OpenReadStream();
+                var putRequest = new PutObjectRequest
+                {
+                    BucketName = _r2BucketName,
+                    Key = r2Key,
+                    InputStream = stream,
+                    ContentType = "video/mp4",
+                    DisablePayloadSigning = true
+                };
 
-            _logger.LogInformation(
-                "Upload complete. MovieId={MovieId}, R2Key={R2Key}",
-                movieId, r2Key);
+                await s3Client.PutObjectAsync(putRequest, cancellationToken);
+
+                _logger.LogInformation(
+                    "Upload complete. MovieId={MovieId}, R2Key={R2Key}",
+                    movieId, r2Key);
+            }
 
             var jobId = await _jobRepository.CreateJobAsync(
                 movieId, r2Key, null, cancellationToken);
@@ -120,6 +131,7 @@ namespace AdminPanelAPI.Controllers
                 r2Key,
                 r2Bucket = _r2BucketName,
                 fileSizeBytes = file.Length,
+                skippedUpload = alreadyExists,
                 status = "Queued"
             });
         }
@@ -392,6 +404,23 @@ LIMIT 30;";
                 .Select(w => w.Trim('\''))
                 .Where(w => !string.IsNullOrEmpty(w))
                 .ToList();
+        }
+
+        private async Task<bool> R2ObjectExistsAsync(
+            AmazonS3Client client,
+            string key,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                await client.GetObjectMetadataAsync(
+                    _r2BucketName, key, cancellationToken);
+                return true;
+            }
+            catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                return false;
+            }
         }
 
         private static string SanitizeFileName(string fileName)
