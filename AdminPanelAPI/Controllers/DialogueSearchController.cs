@@ -294,6 +294,164 @@ namespace AdminPanelAPI.Controllers
             });
         }
 
+        /// <summary>
+        /// Speech mode search: breaks input text into optimal phrase segments
+        /// and finds a matching clip for each segment. Returns clips without
+        /// padding (exact word timestamps) for tight back-to-back playback.
+        /// </summary>
+        [HttpGet("speech-search")]
+        public async Task<IActionResult> SpeechSearch(
+            [FromQuery] string text,
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return BadRequest(new { error = "Query parameter 'text' is required." });
+
+            var words = TokenizeQuery(text);
+            if (words.Count == 0)
+                return BadRequest(new { error = "Text is empty after tokenization." });
+
+            const int maxPhraseLength = 8;
+
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken);
+
+            var segments = new List<DialogueSearchResult>();
+            var position = 0;
+
+            while (position < words.Count)
+            {
+                DialogueSearchResult? bestMatch = null;
+                var maxLen = Math.Min(maxPhraseLength, words.Count - position);
+
+                // Try longest phrase first, then shorter
+                for (var len = maxLen; len >= 1; len--)
+                {
+                    var phraseWords = words.GetRange(position, len);
+                    var match = await FindFirstMatch(conn, phraseWords, cancellationToken);
+
+                    if (match != null)
+                    {
+                        bestMatch = match;
+                        position += len;
+                        break;
+                    }
+                }
+
+                if (bestMatch != null)
+                {
+                    segments.Add(bestMatch);
+                }
+                else
+                {
+                    // No match found for this word — skip it
+                    segments.Add(new DialogueSearchResult
+                    {
+                        MovieId = 0,
+                        Phrase = words[position],
+                        Context = "",
+                        StartTime = 0,
+                        EndTime = 0
+                    });
+                    position++;
+                }
+            }
+
+            return Ok(new
+            {
+                text,
+                totalSegments = segments.Count,
+                segments
+            });
+        }
+
+        /// <summary>
+        /// Find the first matching clip for a phrase (no padding — exact word timestamps).
+        /// </summary>
+        private async Task<DialogueSearchResult?> FindFirstMatch(
+            NpgsqlConnection conn,
+            List<string> phraseWords,
+            CancellationToken cancellationToken)
+        {
+            if (phraseWords.Count == 1)
+            {
+                const string sql = @"
+SELECT w.movieid, w.word, w.start_time, w.end_time
+FROM frl.frl_transcript_words w
+WHERE w.word = @word
+ORDER BY RANDOM()
+LIMIT 1;";
+
+                await using var cmd = new NpgsqlCommand(sql, conn);
+                cmd.Parameters.AddWithValue("word", phraseWords[0]);
+
+                await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+                if (await reader.ReadAsync(cancellationToken))
+                {
+                    var result = new DialogueSearchResult
+                    {
+                        MovieId = reader.GetInt32(0),
+                        Phrase = reader.GetString(1),
+                        Context = "",
+                        StartTime = reader.GetDouble(2),
+                        EndTime = reader.GetDouble(3)
+                    };
+                    await reader.CloseAsync();
+
+                    result.Context = await GetContextAsync(
+                        conn, result.MovieId, result.StartTime, result.EndTime, cancellationToken);
+
+                    return result;
+                }
+                await reader.CloseAsync();
+                return null;
+            }
+
+            // Multi-word phrase: self-join query
+            var sb = new StringBuilder();
+            sb.AppendLine($"SELECT w0.movieid, w0.start_time, w{phraseWords.Count - 1}.end_time");
+            sb.AppendLine("FROM frl.frl_transcript_words w0");
+
+            for (var i = 1; i < phraseWords.Count; i++)
+            {
+                sb.AppendLine($"JOIN frl.frl_transcript_words w{i}");
+                sb.AppendLine($"  ON w{i}.movieid = w0.movieid");
+                sb.AppendLine($"  AND w{i}.word_index = w0.word_index + {i}");
+                sb.AppendLine($"  AND w{i}.word = @word{i}");
+            }
+
+            sb.AppendLine("WHERE w0.word = @word0");
+            sb.AppendLine("ORDER BY RANDOM()");
+            sb.AppendLine("LIMIT 1;");
+
+            await using var phraseCmd = new NpgsqlCommand(sb.ToString(), conn);
+            for (var i = 0; i < phraseWords.Count; i++)
+            {
+                phraseCmd.Parameters.AddWithValue($"word{i}", phraseWords[i]);
+            }
+
+            await using var phraseReader = await phraseCmd.ExecuteReaderAsync(cancellationToken);
+            if (await phraseReader.ReadAsync(cancellationToken))
+            {
+                var result = new DialogueSearchResult
+                {
+                    MovieId = phraseReader.GetInt32(0),
+                    Phrase = string.Join(" ", phraseWords),
+                    Context = "",
+                    StartTime = phraseReader.GetDouble(1),
+                    EndTime = phraseReader.GetDouble(2)
+                };
+                await phraseReader.CloseAsync();
+
+                result.Context = await GetContextAsync(
+                    conn, result.MovieId, result.StartTime, result.EndTime, cancellationToken);
+
+                return result;
+            }
+            await phraseReader.CloseAsync();
+            return null;
+        }
+
         private async Task<List<DialogueSearchResult>> SearchSingleWord(
             NpgsqlConnection conn,
             string word,
