@@ -25,6 +25,7 @@ namespace AdminPanelAPI.Controllers
         private readonly string _r2BucketName;
 
         private const double PaddingSeconds = 0.5;
+        private const double SpeechPaddingSeconds = 0.15;
         private const long MaxUploadSizeBytes = 10L * 1024 * 1024 * 1024; // 10 GB
         private const int PresignedUrlExpiryMinutes = 60;
 
@@ -296,8 +297,8 @@ namespace AdminPanelAPI.Controllers
 
         /// <summary>
         /// Speech mode search: breaks input text into optimal phrase segments
-        /// and finds a matching clip for each segment. Returns clips without
-        /// padding (exact word timestamps) for tight back-to-back playback.
+        /// and finds a matching clip for each segment. Returns clips with small
+        /// padding (±0.15s) clamped to not overlap neighboring words.
         /// </summary>
         [HttpGet("speech-search")]
         public async Task<IActionResult> SpeechSearch(
@@ -366,7 +367,8 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
-        /// Find the first matching clip for a phrase (no padding — exact word timestamps).
+        /// Find the first matching clip for a phrase. Applies small padding
+        /// clamped to not bleed into neighboring words.
         /// </summary>
         private async Task<DialogueSearchResult?> FindFirstMatch(
             NpgsqlConnection conn,
@@ -376,7 +378,11 @@ namespace AdminPanelAPI.Controllers
             if (phraseWords.Count == 1)
             {
                 const string sql = @"
-SELECT w.movieid, w.word, w.start_time, w.end_time
+SELECT w.movieid, w.word, w.start_time, w.end_time, w.word_index,
+       (SELECT end_time FROM frl.frl_transcript_words
+        WHERE movieid = w.movieid AND word_index = w.word_index - 1) as prev_end,
+       (SELECT start_time FROM frl.frl_transcript_words
+        WHERE movieid = w.movieid AND word_index = w.word_index + 1) as next_start
 FROM frl.frl_transcript_words w
 WHERE w.word = @word
 ORDER BY RANDOM()
@@ -388,13 +394,18 @@ LIMIT 1;";
                 await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
                 if (await reader.ReadAsync(cancellationToken))
                 {
+                    var rawStart = reader.GetDouble(2);
+                    var rawEnd = reader.GetDouble(3);
+                    var prevEnd = reader.IsDBNull(5) ? (double?)null : reader.GetDouble(5);
+                    var nextStart = reader.IsDBNull(6) ? (double?)null : reader.GetDouble(6);
+
                     var result = new DialogueSearchResult
                     {
                         MovieId = reader.GetInt32(0),
                         Phrase = reader.GetString(1),
                         Context = "",
-                        StartTime = reader.GetDouble(2),
-                        EndTime = reader.GetDouble(3)
+                        StartTime = ClampPaddedStart(rawStart, prevEnd),
+                        EndTime = ClampPaddedEnd(rawEnd, nextStart)
                     };
                     await reader.CloseAsync();
 
@@ -407,9 +418,12 @@ LIMIT 1;";
                 return null;
             }
 
-            // Multi-word phrase: self-join query
+            // Multi-word phrase: self-join query with neighbor boundaries
+            var lastIdx = phraseWords.Count - 1;
             var sb = new StringBuilder();
-            sb.AppendLine($"SELECT w0.movieid, w0.start_time, w{phraseWords.Count - 1}.end_time");
+            sb.AppendLine($"SELECT w0.movieid, w0.start_time, w{lastIdx}.end_time, w0.word_index, w{lastIdx}.word_index,");
+            sb.AppendLine($"  (SELECT end_time FROM frl.frl_transcript_words WHERE movieid = w0.movieid AND word_index = w0.word_index - 1) as prev_end,");
+            sb.AppendLine($"  (SELECT start_time FROM frl.frl_transcript_words WHERE movieid = w0.movieid AND word_index = w{lastIdx}.word_index + 1) as next_start");
             sb.AppendLine("FROM frl.frl_transcript_words w0");
 
             for (var i = 1; i < phraseWords.Count; i++)
@@ -433,13 +447,18 @@ LIMIT 1;";
             await using var phraseReader = await phraseCmd.ExecuteReaderAsync(cancellationToken);
             if (await phraseReader.ReadAsync(cancellationToken))
             {
+                var rawStart = phraseReader.GetDouble(1);
+                var rawEnd = phraseReader.GetDouble(2);
+                var prevEnd = phraseReader.IsDBNull(5) ? (double?)null : phraseReader.GetDouble(5);
+                var nextStart = phraseReader.IsDBNull(6) ? (double?)null : phraseReader.GetDouble(6);
+
                 var result = new DialogueSearchResult
                 {
                     MovieId = phraseReader.GetInt32(0),
                     Phrase = string.Join(" ", phraseWords),
                     Context = "",
-                    StartTime = phraseReader.GetDouble(1),
-                    EndTime = phraseReader.GetDouble(2)
+                    StartTime = ClampPaddedStart(rawStart, prevEnd),
+                    EndTime = ClampPaddedEnd(rawEnd, nextStart)
                 };
                 await phraseReader.CloseAsync();
 
@@ -450,6 +469,30 @@ LIMIT 1;";
             }
             await phraseReader.CloseAsync();
             return null;
+        }
+
+        /// <summary>
+        /// Apply speech padding to start time, clamped so it doesn't bleed
+        /// into the previous word.
+        /// </summary>
+        private static double ClampPaddedStart(double startTime, double? prevWordEnd)
+        {
+            var padded = startTime - SpeechPaddingSeconds;
+            if (prevWordEnd.HasValue)
+                padded = Math.Max(padded, prevWordEnd.Value);
+            return Math.Max(0, padded);
+        }
+
+        /// <summary>
+        /// Apply speech padding to end time, clamped so it doesn't bleed
+        /// into the next word.
+        /// </summary>
+        private static double ClampPaddedEnd(double endTime, double? nextWordStart)
+        {
+            var padded = endTime + SpeechPaddingSeconds;
+            if (nextWordStart.HasValue)
+                padded = Math.Min(padded, nextWordStart.Value);
+            return padded;
         }
 
         private async Task<List<DialogueSearchResult>> SearchSingleWord(
