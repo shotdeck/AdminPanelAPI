@@ -26,6 +26,7 @@ namespace AdminPanelAPI.Controllers
 
         private const double PaddingSeconds = 0.5;
         private const long MaxUploadSizeBytes = 10L * 1024 * 1024 * 1024; // 10 GB
+        private const int PresignedUrlExpiryMinutes = 60;
 
         public DialogueSearchController(
             IDialogueTranscriptionJobRepository jobRepository,
@@ -207,6 +208,49 @@ namespace AdminPanelAPI.Controllers
                 return NotFound(new { message = $"Job {jobId} not found." });
 
             return Ok(job);
+        }
+
+        /// <summary>
+        /// Get a presigned R2 URL for streaming a movie file.
+        /// </summary>
+        [HttpGet("video-url/{movieId:int}")]
+        public async Task<IActionResult> GetVideoUrl(
+            int movieId,
+            CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(_r2AccountId) ||
+                string.IsNullOrWhiteSpace(_r2AccessKey) ||
+                string.IsNullOrWhiteSpace(_r2SecretKey))
+            {
+                return StatusCode(500, new { error = "R2 credentials are not configured." });
+            }
+
+            // Look up the R2 key from the most recent completed job for this movie
+            var r2Key = await GetR2KeyForMovieAsync(movieId, cancellationToken);
+            if (r2Key == null)
+                return NotFound(new { error = $"No transcribed movie found for movieId {movieId}." });
+
+            var creds = new BasicAWSCredentials(_r2AccessKey.Trim(), _r2SecretKey.Trim());
+            var s3Config = new AmazonS3Config
+            {
+                ServiceURL = $"https://{_r2AccountId.Trim()}.r2.cloudflarestorage.com",
+                ForcePathStyle = true,
+                UseAccelerateEndpoint = false,
+                UseDualstackEndpoint = false,
+                EndpointDiscoveryEnabled = false
+            };
+
+            using var s3Client = new AmazonS3Client(creds, s3Config);
+
+            var url = s3Client.GetPreSignedURL(new GetPreSignedUrlRequest
+            {
+                BucketName = _r2BucketName,
+                Key = r2Key,
+                Expires = DateTime.UtcNow.AddMinutes(PresignedUrlExpiryMinutes),
+                Verb = HttpVerb.GET
+            });
+
+            return Ok(new { movieId, r2Key, url, expiresInMinutes = PresignedUrlExpiryMinutes });
         }
 
         /// <summary>
@@ -404,6 +448,25 @@ LIMIT 30;";
                 .Select(w => w.Trim('\''))
                 .Where(w => !string.IsNullOrEmpty(w))
                 .ToList();
+        }
+
+        private async Task<string?> GetR2KeyForMovieAsync(
+            int movieId,
+            CancellationToken cancellationToken)
+        {
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken);
+
+            const string sql = @"
+SELECT r2_key FROM frl.frl_dialogue_transcription_jobs
+WHERE movieid = @movieId AND r2_key IS NOT NULL
+ORDER BY id DESC LIMIT 1;";
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("movieId", movieId);
+
+            var result = await cmd.ExecuteScalarAsync(cancellationToken);
+            return result as string;
         }
 
         private async Task<bool> R2ObjectExistsAsync(
