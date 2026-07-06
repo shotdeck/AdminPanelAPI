@@ -104,48 +104,35 @@ namespace AdminPanelAPI.Services
             var wordIndex = 0;
             var insertedCount = 0;
 
-            // Batch insert in groups of 500
-            const int batchSize = 500;
-
-            for (var i = 0; i < words.Count; i += batchSize)
+            // Bulk insert with binary COPY — streams all rows in a single
+            // operation instead of one round-trip per word.
+            await using (var writer = await conn.BeginBinaryImportAsync(
+                "COPY frl.frl_transcript_words (movieid, word_index, word, start_time, end_time, confidence) FROM STDIN (FORMAT BINARY)",
+                cancellationToken))
             {
-                var batch = words.Skip(i).Take(batchSize).ToList();
-
-                await using var tx = await conn.BeginTransactionAsync(cancellationToken);
-
-                try
+                foreach (var w in words)
                 {
-                    foreach (var w in batch)
-                    {
-                        var cleaned = CleanWord(w.Word);
-                        if (string.IsNullOrEmpty(cleaned))
-                            continue;
+                    var cleaned = CleanWord(w.Word);
+                    if (string.IsNullOrEmpty(cleaned))
+                        continue;
 
-                        const string sql = @"
-INSERT INTO frl.frl_transcript_words (movieid, word_index, word, start_time, end_time, confidence)
-VALUES (@movieid, @word_index, @word, @start_time, @end_time, @confidence);";
+                    await writer.StartRowAsync(cancellationToken);
+                    await writer.WriteAsync(movieId, NpgsqlTypes.NpgsqlDbType.Integer, cancellationToken);
+                    await writer.WriteAsync(wordIndex, NpgsqlTypes.NpgsqlDbType.Integer, cancellationToken);
+                    await writer.WriteAsync(cleaned, NpgsqlTypes.NpgsqlDbType.Varchar, cancellationToken);
+                    await writer.WriteAsync(Math.Round(w.Start, 3), NpgsqlTypes.NpgsqlDbType.Double, cancellationToken);
+                    await writer.WriteAsync(Math.Round(w.End, 3), NpgsqlTypes.NpgsqlDbType.Double, cancellationToken);
 
-                        await using var cmd = new NpgsqlCommand(sql, conn, tx);
-                        cmd.Parameters.AddWithValue("movieid", movieId);
-                        cmd.Parameters.AddWithValue("word_index", wordIndex);
-                        cmd.Parameters.AddWithValue("word", cleaned);
-                        cmd.Parameters.AddWithValue("start_time", Math.Round(w.Start, 3));
-                        cmd.Parameters.AddWithValue("end_time", Math.Round(w.End, 3));
-                        cmd.Parameters.AddWithValue("confidence",
-                            w.Probability.HasValue ? (object)Math.Round(w.Probability.Value, 4) : DBNull.Value);
+                    if (w.Probability.HasValue)
+                        await writer.WriteAsync(Math.Round(w.Probability.Value, 4), NpgsqlTypes.NpgsqlDbType.Double, cancellationToken);
+                    else
+                        await writer.WriteNullAsync(cancellationToken);
 
-                        await cmd.ExecuteNonQueryAsync(cancellationToken);
-                        wordIndex++;
-                        insertedCount++;
-                    }
-
-                    await tx.CommitAsync(cancellationToken);
+                    wordIndex++;
+                    insertedCount++;
                 }
-                catch
-                {
-                    await tx.RollbackAsync(cancellationToken);
-                    throw;
-                }
+
+                await writer.CompleteAsync(cancellationToken);
             }
 
             return insertedCount;
