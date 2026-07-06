@@ -505,7 +505,7 @@ LIMIT 1;";
 SELECT w.movieid, w.word, w.start_time, w.end_time, w.word_index
 FROM frl.frl_transcript_words w
 WHERE w.word = @word
-ORDER BY w.movieid, w.start_time
+ORDER BY RANDOM()
 LIMIT @limit;";
 
             await using var cmd = new NpgsqlCommand(sql, conn);
@@ -567,7 +567,7 @@ LIMIT @limit;";
             }
 
             sb.AppendLine("WHERE w0.word = @word0");
-            sb.AppendLine("ORDER BY w0.movieid, w0.start_time");
+            sb.AppendLine("ORDER BY RANDOM()");
             sb.AppendLine("LIMIT @limit;");
 
             await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
