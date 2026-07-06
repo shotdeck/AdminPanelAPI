@@ -502,8 +502,9 @@ LIMIT 1;";
             CancellationToken cancellationToken)
         {
             const string sql = @"
-SELECT w.movieid, w.word, w.start_time, w.end_time, w.word_index
+SELECT w.movieid, m.title, w.word, w.start_time, w.end_time, w.word_index
 FROM frl.frl_transcript_words w
+LEFT JOIN frl.frl_movies m ON m.idnum = w.movieid
 WHERE w.word = @word
 ORDER BY RANDOM()
 LIMIT @limit;";
@@ -519,14 +520,16 @@ LIMIT @limit;";
             while (await reader.ReadAsync(cancellationToken))
             {
                 var movieId = reader.GetInt32(0);
-                var matchedWord = reader.GetString(1);
-                var startTime = reader.GetDouble(2);
-                var endTime = reader.GetDouble(3);
-                var wordIndex = reader.GetInt32(4);
+                var movieTitle = reader.IsDBNull(1) ? null : reader.GetString(1);
+                var matchedWord = reader.GetString(2);
+                var startTime = reader.GetDouble(3);
+                var endTime = reader.GetDouble(4);
+                var wordIndex = reader.GetInt32(5);
 
                 results.Add(new DialogueSearchResult
                 {
                     MovieId = movieId,
+                    MovieTitle = movieTitle,
                     Phrase = matchedWord,
                     Context = "",
                     StartTime = Math.Max(0, startTime - PaddingSeconds),
@@ -554,7 +557,7 @@ LIMIT @limit;";
         {
             // Build a query with self-joins for consecutive word matching
             var sb = new StringBuilder();
-            sb.AppendLine("SELECT w0.movieid, w0.word_index, w0.start_time,");
+            sb.AppendLine("SELECT w0.movieid, m.title, w0.word_index, w0.start_time,");
             sb.AppendLine($"  w{words.Count - 1}.end_time");
             sb.AppendLine("FROM frl.frl_transcript_words w0");
 
@@ -566,6 +569,7 @@ LIMIT @limit;";
                 sb.AppendLine($"  AND w{i}.word = @word{i}");
             }
 
+            sb.AppendLine("LEFT JOIN frl.frl_movies m ON m.idnum = w0.movieid");
             sb.AppendLine("WHERE w0.word = @word0");
             sb.AppendLine("ORDER BY RANDOM()");
             sb.AppendLine("LIMIT @limit;");
@@ -585,12 +589,14 @@ LIMIT @limit;";
             while (await reader.ReadAsync(cancellationToken))
             {
                 var movieId = reader.GetInt32(0);
-                var startTime = reader.GetDouble(2);
-                var endTime = reader.GetDouble(3);
+                var movieTitle = reader.IsDBNull(1) ? null : reader.GetString(1);
+                var startTime = reader.GetDouble(3);
+                var endTime = reader.GetDouble(4);
 
                 results.Add(new DialogueSearchResult
                 {
                     MovieId = movieId,
+                    MovieTitle = movieTitle,
                     Phrase = string.Join(" ", words),
                     Context = "",
                     StartTime = Math.Max(0, startTime - PaddingSeconds),

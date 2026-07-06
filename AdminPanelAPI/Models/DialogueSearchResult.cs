@@ -3,6 +3,7 @@ namespace AdminPanelAPI.Models
     public class DialogueSearchResult
     {
         public int MovieId { get; set; }
+        public string? MovieTitle { get; set; }
         public string Phrase { get; set; } = "";
         public string Context { get; set; } = "";
         public double StartTime { get; set; }
