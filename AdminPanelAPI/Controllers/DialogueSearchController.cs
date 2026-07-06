@@ -59,6 +59,47 @@ namespace AdminPanelAPI.Controllers
             IFormFile file,
             CancellationToken cancellationToken = default)
         {
+            return await UploadToR2AndQueueAsync(movieId, file, cancellationToken);
+        }
+
+        /// <summary>
+        /// Upload an MP4 file to R2 and queue it for dialogue transcription,
+        /// resolving the movie id from the file name. The file name is expected
+        /// to contain the title and year, e.g. "The Boss Baby (2017)_BR.HD.01_SF.mp4",
+        /// which is looked up in frl_movies (title + year) to find the idnum.
+        /// </summary>
+        [HttpPost("upload")]
+        [RequestSizeLimit(MaxUploadSizeBytes)]
+        [RequestFormLimits(MultipartBodyLengthLimit = MaxUploadSizeBytes)]
+        public async Task<IActionResult> UploadAndTranscribeByFileName(
+            IFormFile file,
+            CancellationToken cancellationToken = default)
+        {
+            if (file == null || file.Length == 0)
+                return BadRequest(new { error = "No file provided." });
+
+            if (!TryParseTitleAndYear(file.FileName, out var title, out var year))
+                return BadRequest(new
+                {
+                    error = $"Could not parse a title and year from file name '{file.FileName}'. " +
+                            "Expected a name like 'The Boss Baby (2017)_BR.HD.01_SF.mp4'."
+                });
+
+            var movieId = await LookupMovieIdAsync(title, year, cancellationToken);
+            if (movieId == null)
+                return NotFound(new
+                {
+                    error = $"No movie found in frl_movies matching title '{title}' and year {year}."
+                });
+
+            return await UploadToR2AndQueueAsync(movieId.Value, file, cancellationToken);
+        }
+
+        private async Task<IActionResult> UploadToR2AndQueueAsync(
+            int movieId,
+            IFormFile file,
+            CancellationToken cancellationToken)
+        {
             if (file == null || file.Length == 0)
                 return BadRequest(new { error = "No file provided." });
 
@@ -697,6 +738,53 @@ ORDER BY id DESC LIMIT 1;";
         {
             var name = Path.GetFileName(fileName);
             return Regex.Replace(name, @"[^\w.\-]", "_");
+        }
+
+        private static readonly Regex TitleYearRegex =
+            new(@"^(?<title>.+?)\s*\((?<year>\d{4})\)", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Parse the movie title and release year from a file name such as
+        /// "The Boss Baby (2017)_BR.HD.01_SF.mp4".
+        /// </summary>
+        private static bool TryParseTitleAndYear(string fileName, out string title, out int year)
+        {
+            title = "";
+            year = 0;
+
+            var name = Path.GetFileNameWithoutExtension(fileName);
+            var match = TitleYearRegex.Match(name);
+            if (!match.Success)
+                return false;
+
+            title = match.Groups["title"].Value.Trim();
+            year = int.Parse(match.Groups["year"].Value);
+            return !string.IsNullOrWhiteSpace(title);
+        }
+
+        private async Task<int?> LookupMovieIdAsync(
+            string title,
+            int year,
+            CancellationToken cancellationToken)
+        {
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken);
+
+            const string sql = @"
+SELECT idnum FROM frl.frl_movies
+WHERE LOWER(title) = LOWER(@title) AND year = @year
+ORDER BY idnum
+LIMIT 1;";
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("title", title);
+            cmd.Parameters.AddWithValue("year", year);
+
+            var result = await cmd.ExecuteScalarAsync(cancellationToken);
+            if (result == null || result is DBNull)
+                return null;
+
+            return Convert.ToInt32(result);
         }
     }
 }
