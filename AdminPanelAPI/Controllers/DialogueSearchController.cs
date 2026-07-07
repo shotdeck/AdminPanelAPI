@@ -527,7 +527,7 @@ SELECT w.movieid, w.word, w.start_time, w.end_time, w.word_index,
        (SELECT start_time FROM frl.frl_transcript_words
         WHERE movieid = w.movieid AND word_index = w.word_index + 1) as next_start
 FROM frl.frl_transcript_words w
-WHERE w.word = @word
+WHERE w.word_normalized = @word
 ORDER BY RANDOM()
 LIMIT 1;";
 
@@ -574,10 +574,10 @@ LIMIT 1;";
                 sb.AppendLine($"JOIN frl.frl_transcript_words w{i}");
                 sb.AppendLine($"  ON w{i}.movieid = w0.movieid");
                 sb.AppendLine($"  AND w{i}.word_index = w0.word_index + {i}");
-                sb.AppendLine($"  AND w{i}.word = @word{i}");
+                sb.AppendLine($"  AND w{i}.word_normalized = @word{i}");
             }
 
-            sb.AppendLine("WHERE w0.word = @word0");
+            sb.AppendLine("WHERE w0.word_normalized = @word0");
             sb.AppendLine("ORDER BY RANDOM()");
             sb.AppendLine("LIMIT 1;");
 
@@ -650,7 +650,7 @@ SELECT w.movieid, m.title, w.word, w.start_time, w.end_time, w.word_index,
        w.segment_index, w.segment_start
 FROM frl.frl_transcript_words w
 LEFT JOIN frl.frl_movies m ON m.idnum = w.movieid
-WHERE w.word = @word"
+WHERE w.word_normalized = @word"
                 + (movieId.HasValue ? "\n  AND w.movieid = @movieId" : "")
                 + @"
 ORDER BY RANDOM()
@@ -718,11 +718,11 @@ LIMIT @limit;";
                 sb.AppendLine($"JOIN frl.frl_transcript_words w{i}");
                 sb.AppendLine($"  ON w{i}.movieid = w0.movieid");
                 sb.AppendLine($"  AND w{i}.word_index = w0.word_index + {i}");
-                sb.AppendLine($"  AND w{i}.word = @word{i}");
+                sb.AppendLine($"  AND w{i}.word_normalized = @word{i}");
             }
 
             sb.AppendLine("LEFT JOIN frl.frl_movies m ON m.idnum = w0.movieid");
-            sb.AppendLine("WHERE w0.word = @word0");
+            sb.AppendLine("WHERE w0.word_normalized = @word0");
             if (movieId.HasValue)
                 sb.AppendLine("  AND w0.movieid = @movieId");
             sb.AppendLine("ORDER BY RANDOM()");
@@ -808,9 +808,14 @@ LIMIT 30;";
 
         private static List<string> TokenizeQuery(string query)
         {
+            // Split on whitespace/punctuation, then strip every non-alphanumeric
+            // char from each token so it matches word_normalized (which is
+            // regexp_replace(lower(word), '[^a-z0-9]', '')). This makes matching
+            // apostrophe/punctuation- and case-insensitive: "lets", "let's" and
+            // "Let's" all normalize to "lets".
             return Regex.Replace(query.ToLowerInvariant(), @"[^\w']", " ")
                 .Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                .Select(w => w.Trim('\''))
+                .Select(w => Regex.Replace(w, @"[^a-z0-9]", ""))
                 .Where(w => !string.IsNullOrEmpty(w))
                 .ToList();
         }
