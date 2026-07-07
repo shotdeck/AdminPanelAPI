@@ -296,6 +296,94 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
+        /// Get a presigned R2 URL for a single ~10s movie segment. The player
+        /// loads this small file and seeks within it instead of the full movie.
+        /// </summary>
+        [HttpGet("segment-url/{movieId:int}")]
+        public IActionResult GetSegmentUrl(
+            int movieId,
+            [FromQuery] int index)
+        {
+            if (string.IsNullOrWhiteSpace(_r2AccountId) ||
+                string.IsNullOrWhiteSpace(_r2AccessKey) ||
+                string.IsNullOrWhiteSpace(_r2SecretKey))
+            {
+                return StatusCode(500, new { error = "R2 credentials are not configured." });
+            }
+
+            if (index < 0)
+                return BadRequest(new { error = "index must be >= 0" });
+
+            var key = $"segments/{movieId}/{index:D6}.mp4";
+
+            var creds = new BasicAWSCredentials(_r2AccessKey.Trim(), _r2SecretKey.Trim());
+            var s3Config = new AmazonS3Config
+            {
+                ServiceURL = $"https://{_r2AccountId.Trim()}.r2.cloudflarestorage.com",
+                ForcePathStyle = true,
+                UseAccelerateEndpoint = false,
+                UseDualstackEndpoint = false,
+                EndpointDiscoveryEnabled = false
+            };
+
+            using var s3Client = new AmazonS3Client(creds, s3Config);
+
+            var url = s3Client.GetPreSignedURL(new GetPreSignedUrlRequest
+            {
+                BucketName = _r2BucketName,
+                Key = key,
+                Expires = DateTime.UtcNow.AddMinutes(PresignedUrlExpiryMinutes),
+                Verb = HttpVerb.GET
+            });
+
+            return Ok(new { movieId, index, r2Key = key, url, expiresInMinutes = PresignedUrlExpiryMinutes });
+        }
+
+        /// <summary>
+        /// Split a single already-uploaded movie into segments (no re-transcription
+        /// if it already has words). Reuses the transcription job pipeline.
+        /// </summary>
+        [HttpPost("segment/{movieId:int}")]
+        public async Task<IActionResult> SegmentMovie(
+            int movieId,
+            [FromQuery] string? r2Key = null,
+            CancellationToken cancellationToken = default)
+        {
+            var jobId = await _jobRepository.CreateJobAsync(
+                movieId, r2Key, null, cancellationToken);
+            await _jobQueue.QueueJobAsync(jobId, cancellationToken);
+
+            return Ok(new { jobId, movieId, status = "Queued" });
+        }
+
+        /// <summary>
+        /// Backfill: queue segmenting for a batch of movies that have already been
+        /// transcribed but not yet split into segments. Skips re-transcription.
+        /// </summary>
+        [HttpPost("segment-batch")]
+        public async Task<IActionResult> SegmentBatch(
+            [FromQuery] int count = 25,
+            CancellationToken cancellationToken = default)
+        {
+            if (count <= 0)
+                return BadRequest(new { error = "count must be greater than 0" });
+
+            var movieIds = await _jobRepository.GetMovieIdsNeedingSegmentsAsync(
+                count, cancellationToken);
+
+            var jobs = new List<object>();
+            foreach (var movieId in movieIds)
+            {
+                var jobId = await _jobRepository.CreateJobAsync(
+                    movieId, null, null, cancellationToken);
+                await _jobQueue.QueueJobAsync(jobId, cancellationToken);
+                jobs.Add(new { jobId, movieId, status = "Queued" });
+            }
+
+            return Ok(new { requested = count, queued = jobs.Count, jobs });
+        }
+
+        /// <summary>
         /// Search for a word or phrase across all transcribed movies.
         /// Returns matching clips with timestamps.
         /// </summary>
@@ -543,7 +631,8 @@ LIMIT 1;";
             CancellationToken cancellationToken)
         {
             const string sql = @"
-SELECT w.movieid, m.title, w.word, w.start_time, w.end_time, w.word_index
+SELECT w.movieid, m.title, w.word, w.start_time, w.end_time, w.word_index,
+       w.segment_index, w.segment_start
 FROM frl.frl_transcript_words w
 LEFT JOIN frl.frl_movies m ON m.idnum = w.movieid
 WHERE w.word = @word
@@ -574,7 +663,9 @@ LIMIT @limit;";
                     Phrase = matchedWord,
                     Context = "",
                     StartTime = Math.Max(0, startTime - PaddingSeconds),
-                    EndTime = endTime + PaddingSeconds
+                    EndTime = endTime + PaddingSeconds,
+                    SegmentIndex = reader.IsDBNull(6) ? null : reader.GetInt32(6),
+                    SegmentStart = reader.IsDBNull(7) ? null : reader.GetDouble(7)
                 });
             }
 
@@ -599,7 +690,7 @@ LIMIT @limit;";
             // Build a query with self-joins for consecutive word matching
             var sb = new StringBuilder();
             sb.AppendLine("SELECT w0.movieid, m.title, w0.word_index, w0.start_time,");
-            sb.AppendLine($"  w{words.Count - 1}.end_time");
+            sb.AppendLine($"  w{words.Count - 1}.end_time, w0.segment_index, w0.segment_start");
             sb.AppendLine("FROM frl.frl_transcript_words w0");
 
             for (var i = 1; i < words.Count; i++)
@@ -641,7 +732,9 @@ LIMIT @limit;";
                     Phrase = string.Join(" ", words),
                     Context = "",
                     StartTime = Math.Max(0, startTime - PaddingSeconds),
-                    EndTime = endTime + PaddingSeconds
+                    EndTime = endTime + PaddingSeconds,
+                    SegmentIndex = reader.IsDBNull(5) ? null : reader.GetInt32(5),
+                    SegmentStart = reader.IsDBNull(6) ? null : reader.GetDouble(6)
                 });
             }
 

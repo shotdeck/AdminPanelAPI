@@ -10,6 +10,7 @@ public interface IDialogueTranscriptionJobRepository
     Task MarkFailedAsync(long jobId, string error, CancellationToken cancellationToken);
     Task UpdateProgressAsync(long jobId, string step, int progressPct, CancellationToken cancellationToken);
     Task<List<int>> GetUntranscribedMovieIdsAsync(int limit, CancellationToken cancellationToken);
+    Task<List<int>> GetMovieIdsNeedingSegmentsAsync(int limit, CancellationToken cancellationToken);
 }
 
 public class DialogueTranscriptionJobRepository : IDialogueTranscriptionJobRepository
@@ -97,6 +98,35 @@ LIMIT @limit;";
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
 
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            movieIds.Add(reader.GetInt32(0));
+        }
+
+        return movieIds;
+    }
+
+    public async Task<List<int>> GetMovieIdsNeedingSegmentsAsync(int limit, CancellationToken cancellationToken)
+    {
+        // Movies that have transcript words but none mapped to a segment yet.
+        const string sql = @"
+SELECT movieid
+FROM frl.frl_transcript_words
+GROUP BY movieid
+HAVING COUNT(*) FILTER (WHERE segment_index IS NOT NULL) = 0
+ORDER BY movieid
+LIMIT @limit;";
+
+        var movieIds = new List<int>();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 180;
+        cmd.Parameters.AddWithValue("limit", limit);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
             movieIds.Add(reader.GetInt32(0));
