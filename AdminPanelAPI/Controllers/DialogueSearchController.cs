@@ -347,40 +347,53 @@ namespace AdminPanelAPI.Controllers
         public async Task<IActionResult> SegmentMovie(
             int movieId,
             [FromQuery] string? r2Key = null,
+            [FromQuery] bool force = false,
             CancellationToken cancellationToken = default)
         {
+            // force re-segments a movie that is already segmented (e.g. to fix bad
+            // offsets): clear its segment mapping so the job re-splits + re-maps.
+            if (force)
+                await _jobRepository.ClearSegmentMappingAsync(movieId, cancellationToken);
+
             var jobId = await _jobRepository.CreateJobAsync(
                 movieId, r2Key, null, cancellationToken);
             await _jobQueue.QueueJobAsync(jobId, cancellationToken);
 
-            return Ok(new { jobId, movieId, status = "Queued" });
+            return Ok(new { jobId, movieId, status = "Queued", forced = force });
         }
 
         /// <summary>
         /// Backfill: queue segmenting for a batch of movies that have already been
         /// transcribed but not yet split into segments. Skips re-transcription.
+        /// With force=true, re-segments movies that are ALREADY segmented (clears
+        /// their existing mapping first) — used to repair bad segment offsets.
         /// </summary>
         [HttpPost("segment-batch")]
         public async Task<IActionResult> SegmentBatch(
             [FromQuery] int count = 25,
+            [FromQuery] bool force = false,
             CancellationToken cancellationToken = default)
         {
             if (count <= 0)
                 return BadRequest(new { error = "count must be greater than 0" });
 
-            var movieIds = await _jobRepository.GetMovieIdsNeedingSegmentsAsync(
-                count, cancellationToken);
+            var movieIds = force
+                ? await _jobRepository.GetSegmentedMovieIdsAsync(count, cancellationToken)
+                : await _jobRepository.GetMovieIdsNeedingSegmentsAsync(count, cancellationToken);
 
             var jobs = new List<object>();
             foreach (var movieId in movieIds)
             {
+                if (force)
+                    await _jobRepository.ClearSegmentMappingAsync(movieId, cancellationToken);
+
                 var jobId = await _jobRepository.CreateJobAsync(
                     movieId, null, null, cancellationToken);
                 await _jobQueue.QueueJobAsync(jobId, cancellationToken);
                 jobs.Add(new { jobId, movieId, status = "Queued" });
             }
 
-            return Ok(new { requested = count, queued = jobs.Count, jobs });
+            return Ok(new { requested = count, queued = jobs.Count, forced = force, jobs });
         }
 
         /// <summary>

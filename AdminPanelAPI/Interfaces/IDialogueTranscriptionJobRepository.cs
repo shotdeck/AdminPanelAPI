@@ -11,6 +11,8 @@ public interface IDialogueTranscriptionJobRepository
     Task UpdateProgressAsync(long jobId, string step, int progressPct, CancellationToken cancellationToken);
     Task<List<int>> GetUntranscribedMovieIdsAsync(int limit, CancellationToken cancellationToken);
     Task<List<int>> GetMovieIdsNeedingSegmentsAsync(int limit, CancellationToken cancellationToken);
+    Task<List<int>> GetSegmentedMovieIdsAsync(int limit, CancellationToken cancellationToken);
+    Task ClearSegmentMappingAsync(int movieId, CancellationToken cancellationToken);
 }
 
 public class DialogueTranscriptionJobRepository : IDialogueTranscriptionJobRepository
@@ -133,6 +135,49 @@ LIMIT @limit;";
         }
 
         return movieIds;
+    }
+
+    public async Task<List<int>> GetSegmentedMovieIdsAsync(int limit, CancellationToken cancellationToken)
+    {
+        // Movies whose words are already mapped to segments (for force re-segment).
+        const string sql = @"
+SELECT DISTINCT movieid
+FROM frl.frl_transcript_words
+WHERE segment_index IS NOT NULL
+ORDER BY movieid
+LIMIT @limit;";
+
+        var movieIds = new List<int>();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 180;
+        cmd.Parameters.AddWithValue("limit", limit);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            movieIds.Add(reader.GetInt32(0));
+        }
+
+        return movieIds;
+    }
+
+    public async Task ClearSegmentMappingAsync(int movieId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+UPDATE frl.frl_transcript_words
+SET segment_index = NULL, segment_start = NULL
+WHERE movieid = @movieid;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 120;
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task<DialogueTranscriptionJobStatusResponse?> GetJobAsync(long jobId, CancellationToken cancellationToken)
