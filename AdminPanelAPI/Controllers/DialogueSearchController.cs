@@ -404,6 +404,7 @@ namespace AdminPanelAPI.Controllers
         public async Task<IActionResult> Search(
             [FromQuery] string q,
             [FromQuery] int limit = 50,
+            [FromQuery] int? movieId = null,
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(q))
@@ -422,11 +423,11 @@ namespace AdminPanelAPI.Controllers
 
             if (words.Count == 1)
             {
-                results = await SearchSingleWord(conn, words[0], limit, cancellationToken);
+                results = await SearchSingleWord(conn, words[0], limit, movieId, cancellationToken);
             }
             else
             {
-                results = await SearchPhrase(conn, words, limit, cancellationToken);
+                results = await SearchPhrase(conn, words, limit, movieId, cancellationToken);
             }
 
             return Ok(new DialogueSearchResponse
@@ -641,20 +642,25 @@ LIMIT 1;";
             NpgsqlConnection conn,
             string word,
             int limit,
+            int? movieId,
             CancellationToken cancellationToken)
         {
-            const string sql = @"
+            var sql = @"
 SELECT w.movieid, m.title, w.word, w.start_time, w.end_time, w.word_index,
        w.segment_index, w.segment_start
 FROM frl.frl_transcript_words w
 LEFT JOIN frl.frl_movies m ON m.idnum = w.movieid
-WHERE w.word = @word
+WHERE w.word = @word"
+                + (movieId.HasValue ? "\n  AND w.movieid = @movieId" : "")
+                + @"
 ORDER BY RANDOM()
 LIMIT @limit;";
 
             await using var cmd = new NpgsqlCommand(sql, conn);
             cmd.Parameters.AddWithValue("word", word);
             cmd.Parameters.AddWithValue("limit", limit);
+            if (movieId.HasValue)
+                cmd.Parameters.AddWithValue("movieId", movieId.Value);
 
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
 
@@ -662,7 +668,7 @@ LIMIT @limit;";
 
             while (await reader.ReadAsync(cancellationToken))
             {
-                var movieId = reader.GetInt32(0);
+                var rowMovieId = reader.GetInt32(0);
                 var movieTitle = reader.IsDBNull(1) ? null : reader.GetString(1);
                 var matchedWord = reader.GetString(2);
                 var startTime = reader.GetDouble(3);
@@ -671,7 +677,7 @@ LIMIT @limit;";
 
                 results.Add(new DialogueSearchResult
                 {
-                    MovieId = movieId,
+                    MovieId = rowMovieId,
                     MovieTitle = movieTitle,
                     Phrase = matchedWord,
                     Context = "",
@@ -698,6 +704,7 @@ LIMIT @limit;";
             NpgsqlConnection conn,
             List<string> words,
             int limit,
+            int? movieId,
             CancellationToken cancellationToken)
         {
             // Build a query with self-joins for consecutive word matching
@@ -716,6 +723,8 @@ LIMIT @limit;";
 
             sb.AppendLine("LEFT JOIN frl.frl_movies m ON m.idnum = w0.movieid");
             sb.AppendLine("WHERE w0.word = @word0");
+            if (movieId.HasValue)
+                sb.AppendLine("  AND w0.movieid = @movieId");
             sb.AppendLine("ORDER BY RANDOM()");
             sb.AppendLine("LIMIT @limit;");
 
@@ -726,6 +735,8 @@ LIMIT @limit;";
                 cmd.Parameters.AddWithValue($"word{i}", words[i]);
             }
             cmd.Parameters.AddWithValue("limit", limit);
+            if (movieId.HasValue)
+                cmd.Parameters.AddWithValue("movieId", movieId.Value);
 
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
 
@@ -733,14 +744,14 @@ LIMIT @limit;";
 
             while (await reader.ReadAsync(cancellationToken))
             {
-                var movieId = reader.GetInt32(0);
+                var rowMovieId = reader.GetInt32(0);
                 var movieTitle = reader.IsDBNull(1) ? null : reader.GetString(1);
                 var startTime = reader.GetDouble(3);
                 var endTime = reader.GetDouble(4);
 
                 results.Add(new DialogueSearchResult
                 {
-                    MovieId = movieId,
+                    MovieId = rowMovieId,
                     MovieTitle = movieTitle,
                     Phrase = string.Join(" ", words),
                     Context = "",
