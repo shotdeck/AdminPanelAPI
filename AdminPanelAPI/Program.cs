@@ -74,7 +74,7 @@ builder.Services.AddScoped<IDialogueTranscriptionJobRepository, DialogueTranscri
 builder.Services.AddScoped<IDialogueTranscriptionService, DialogueTranscriptionService>();
 builder.Services.AddHostedService<DialogueTranscriptionWorker>();
 
-// Music identification pipeline (Chromaprint + AcoustID)
+// Music identification pipeline (music detection + ACRCloud)
 builder.Services.AddSingleton<IMusicJobQueue, MusicJobQueue>();
 builder.Services.AddScoped<IMusicIdentificationJobRepository, MusicIdentificationJobRepository>();
 builder.Services.AddScoped<IMusicIdentificationService, MusicIdentificationService>();

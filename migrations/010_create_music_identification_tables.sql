@@ -1,5 +1,5 @@
 -- Create music identification tables for movie music scanning
--- (Chromaprint + AcoustID pipeline, mirrors the dialogue transcription tables).
+-- (music detection + ACRCloud pipeline, mirrors the dialogue transcription tables).
 
 CREATE TABLE IF NOT EXISTS frl.frl_music_identification_jobs (
     id              BIGSERIAL PRIMARY KEY,
