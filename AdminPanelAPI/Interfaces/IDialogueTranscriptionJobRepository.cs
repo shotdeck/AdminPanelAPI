@@ -13,6 +13,7 @@ public interface IDialogueTranscriptionJobRepository
     Task<List<int>> GetMovieIdsNeedingSegmentsAsync(int limit, CancellationToken cancellationToken);
     Task<List<int>> GetSegmentedMovieIdsAsync(int limit, CancellationToken cancellationToken);
     Task ClearSegmentMappingAsync(int movieId, CancellationToken cancellationToken);
+    Task DeleteWordsAsync(int movieId, CancellationToken cancellationToken);
 }
 
 public class DialogueTranscriptionJobRepository : IDialogueTranscriptionJobRepository
@@ -170,6 +171,20 @@ LIMIT @limit;";
         const string sql = @"
 UPDATE frl.frl_transcript_words
 SET segment_index = NULL, segment_start = NULL
+WHERE movieid = @movieid;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 120;
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task DeleteWordsAsync(int movieId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+DELETE FROM frl.frl_transcript_words
 WHERE movieid = @movieid;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
