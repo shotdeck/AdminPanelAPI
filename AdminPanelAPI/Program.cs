@@ -74,6 +74,12 @@ builder.Services.AddScoped<IDialogueTranscriptionJobRepository, DialogueTranscri
 builder.Services.AddScoped<IDialogueTranscriptionService, DialogueTranscriptionService>();
 builder.Services.AddHostedService<DialogueTranscriptionWorker>();
 
+// Music identification pipeline (Chromaprint + AcoustID)
+builder.Services.AddSingleton<IMusicJobQueue, MusicJobQueue>();
+builder.Services.AddScoped<IMusicIdentificationJobRepository, MusicIdentificationJobRepository>();
+builder.Services.AddScoped<IMusicIdentificationService, MusicIdentificationService>();
+builder.Services.AddHostedService<MusicIdentificationWorker>();
+
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
 
