@@ -186,8 +186,16 @@ namespace AdminPanelAPI.Controllers
         public async Task<IActionResult> TranscribeMovie(
             int movieId,
             [FromQuery] string? r2Key = null,
+            [FromQuery] bool force = false,
             CancellationToken cancellationToken = default)
         {
+            // force re-transcribes a movie that already has words (e.g. to purge
+            // hallucinations after a transcription-settings change): delete its
+            // words so the worker's "already has words -> skip" guard doesn't fire.
+            // Segment files stay in R2; the job re-maps words to them afterwards.
+            if (force)
+                await _jobRepository.DeleteWordsAsync(movieId, cancellationToken);
+
             var jobId = await _jobRepository.CreateJobAsync(
                 movieId, r2Key, null, cancellationToken);
 
@@ -198,7 +206,8 @@ namespace AdminPanelAPI.Controllers
                 jobId,
                 movieId,
                 r2Key,
-                status = "Queued"
+                status = "Queued",
+                forced = force
             });
         }
 
