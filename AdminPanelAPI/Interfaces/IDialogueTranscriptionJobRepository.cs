@@ -14,6 +14,7 @@ public interface IDialogueTranscriptionJobRepository
     Task<List<int>> GetSegmentedMovieIdsAsync(int limit, CancellationToken cancellationToken);
     Task ClearSegmentMappingAsync(int movieId, CancellationToken cancellationToken);
     Task DeleteWordsAsync(int movieId, CancellationToken cancellationToken);
+    Task<int> GetMovieWordCountAsync(int movieId, CancellationToken cancellationToken);
 }
 
 public class DialogueTranscriptionJobRepository : IDialogueTranscriptionJobRepository
@@ -285,6 +286,19 @@ SET status = 'Failed',
 WHERE id = @id;";
 
         await ExecuteNonQueryAsync(sql, jobId, error, cancellationToken);
+    }
+
+    public async Task<int> GetMovieWordCountAsync(int movieId, CancellationToken cancellationToken)
+    {
+        const string sql =
+            "SELECT COUNT(*) FROM frl.frl_transcript_words WHERE movieid = @movieid;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        var result = await cmd.ExecuteScalarAsync(cancellationToken);
+        return Convert.ToInt32(result);
     }
 
     private async Task ExecuteNonQueryAsync(string sql, long jobId, string? error, CancellationToken cancellationToken)
