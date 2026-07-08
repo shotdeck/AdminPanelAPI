@@ -172,7 +172,8 @@ WHERE id = @id;";
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);
 
-        // Idempotent re-run: clear existing segments for this movie.
+        // Idempotent re-run: clear existing segments for this movie. Artists and
+        // songs are shared across movies, so they are left in place.
         await using (var deleteCmd = new NpgsqlCommand(
             "DELETE FROM frl.frl_join_movies_music_segments WHERE movieid = @movieid", conn))
         {
@@ -183,36 +184,36 @@ WHERE id = @id;";
         await using var tx = await conn.BeginTransactionAsync(cancellationToken);
         try
         {
-            const string sql = @"
+            const string insertSegmentSql = @"
 INSERT INTO frl.frl_join_movies_music_segments
-    (movieid, start_time, end_time, matched, title, artist, recording_id, score)
+    (movieid, song_id, start_time, end_time, matched, score)
 VALUES
-    (@movieid, @start_time, @end_time, @matched, @title, @artist, @recording_id, @score);";
+    (@movieid, @song_id, @start_time, @end_time, @matched, @score);";
 
             foreach (var seg in response.MatchedSegments)
             {
-                await using var cmd = new NpgsqlCommand(sql, conn, tx);
+                // Deduplicate the artist and song across movies, then link the
+                // per-movie occurrence to the shared song.
+                long? songId = await UpsertSongAsync(conn, tx, seg, cancellationToken);
+
+                await using var cmd = new NpgsqlCommand(insertSegmentSql, conn, tx);
                 cmd.Parameters.AddWithValue("movieid", movieId);
+                cmd.Parameters.AddWithValue("song_id", (object?)songId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("start_time", seg.Start);
                 cmd.Parameters.AddWithValue("end_time", seg.End);
-                cmd.Parameters.AddWithValue("matched", true);
-                cmd.Parameters.AddWithValue("title", (object?)seg.Title ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("artist", (object?)seg.Artist ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("recording_id", (object?)seg.RecordingId ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("matched", songId != null);
                 cmd.Parameters.AddWithValue("score", seg.Score);
                 await cmd.ExecuteNonQueryAsync(cancellationToken);
             }
 
             foreach (var win in response.UnmatchedWindows)
             {
-                await using var cmd = new NpgsqlCommand(sql, conn, tx);
+                await using var cmd = new NpgsqlCommand(insertSegmentSql, conn, tx);
                 cmd.Parameters.AddWithValue("movieid", movieId);
+                cmd.Parameters.AddWithValue("song_id", DBNull.Value);
                 cmd.Parameters.AddWithValue("start_time", win.Start);
                 cmd.Parameters.AddWithValue("end_time", win.End);
                 cmd.Parameters.AddWithValue("matched", false);
-                cmd.Parameters.AddWithValue("title", DBNull.Value);
-                cmd.Parameters.AddWithValue("artist", DBNull.Value);
-                cmd.Parameters.AddWithValue("recording_id", DBNull.Value);
                 cmd.Parameters.AddWithValue("score", DBNull.Value);
                 await cmd.ExecuteNonQueryAsync(cancellationToken);
             }
@@ -226,13 +227,56 @@ VALUES
         }
     }
 
+    /// <summary>
+    /// Upsert the segment's artist and song (dedup by artist name and ACRCloud
+    /// acrid) and return the song id. Returns null when there is no recording id
+    /// to key on.
+    /// </summary>
+    private static async Task<long?> UpsertSongAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx, MatchedSegment seg, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(seg.RecordingId))
+            return null;
+
+        long? artistId = null;
+        if (!string.IsNullOrWhiteSpace(seg.Artist))
+        {
+            const string artistSql = @"
+INSERT INTO frl.frl_music_artists (name)
+VALUES (@name)
+ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+RETURNING id;";
+            await using var artistCmd = new NpgsqlCommand(artistSql, conn, tx);
+            artistCmd.Parameters.AddWithValue("name", seg.Artist!);
+            artistId = Convert.ToInt64(await artistCmd.ExecuteScalarAsync(cancellationToken));
+        }
+
+        const string songSql = @"
+INSERT INTO frl.frl_music_songs (title, isrc, acrid, artist_id)
+VALUES (@title, @isrc, @acrid, @artist_id)
+ON CONFLICT (acrid) DO UPDATE SET
+    title = EXCLUDED.title,
+    isrc = COALESCE(EXCLUDED.isrc, frl.frl_music_songs.isrc),
+    artist_id = COALESCE(EXCLUDED.artist_id, frl.frl_music_songs.artist_id)
+RETURNING id;";
+        await using var songCmd = new NpgsqlCommand(songSql, conn, tx);
+        songCmd.Parameters.AddWithValue("title", (object?)seg.Title ?? DBNull.Value);
+        songCmd.Parameters.AddWithValue("isrc", (object?)seg.Isrc ?? DBNull.Value);
+        songCmd.Parameters.AddWithValue("acrid", seg.RecordingId!);
+        songCmd.Parameters.AddWithValue("artist_id", (object?)artistId ?? DBNull.Value);
+        return Convert.ToInt64(await songCmd.ExecuteScalarAsync(cancellationToken));
+    }
+
     public async Task<List<MusicSegmentResult>> GetSegmentsAsync(int movieId, CancellationToken cancellationToken)
     {
         const string sql = @"
-SELECT movieid, start_time, end_time, matched, title, artist, recording_id, score
-FROM frl.frl_join_movies_music_segments
-WHERE movieid = @movieid
-ORDER BY start_time;";
+SELECT s.movieid, s.start_time, s.end_time, s.matched,
+       so.title, ar.name AS artist, so.acrid, so.isrc, s.score
+FROM frl.frl_join_movies_music_segments s
+LEFT JOIN frl.frl_music_songs so ON s.song_id = so.id
+LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
+WHERE s.movieid = @movieid
+ORDER BY s.start_time;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);
@@ -253,7 +297,8 @@ ORDER BY start_time;";
                 Title = reader.IsDBNull(4) ? null : reader.GetString(4),
                 Artist = reader.IsDBNull(5) ? null : reader.GetString(5),
                 RecordingId = reader.IsDBNull(6) ? null : reader.GetString(6),
-                Score = reader.IsDBNull(7) ? null : reader.GetDouble(7)
+                Isrc = reader.IsDBNull(7) ? null : reader.GetString(7),
+                Score = reader.IsDBNull(8) ? null : reader.GetDouble(8)
             });
         }
 

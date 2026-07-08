@@ -12,6 +12,7 @@ namespace AdminPanelAPI.Models
         public string? Title { get; set; }
         public string? Artist { get; set; }
         public string? RecordingId { get; set; }
+        public string? Isrc { get; set; }
         public double? Score { get; set; }
     }
 }

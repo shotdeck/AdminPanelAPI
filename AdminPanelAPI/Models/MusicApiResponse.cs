@@ -43,6 +43,9 @@ namespace AdminPanelAPI.Models
         [JsonPropertyName("recording_id")]
         public string? RecordingId { get; set; }
 
+        [JsonPropertyName("isrc")]
+        public string? Isrc { get; set; }
+
         [JsonPropertyName("score")]
         public double Score { get; set; }
     }
