@@ -261,7 +261,7 @@ LIMIT @limit;";
 
                 if (r.Movements == null || r.Movements.Count == 0)
                 {
-                    await InsertMovementAsync(r.ImageId, "static", 0, ct);
+                    await InsertMovementAsync(r.ImageId, "hold", 0, ct);
                     await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
                     processed++;
                     continue;
@@ -452,7 +452,7 @@ LIMIT @limit;";
 
                 if (r.Movements == null || r.Movements.Count == 0)
                 {
-                    await InsertMovementAsync(r.ImageId, "static", 0, ct);
+                    await InsertMovementAsync(r.ImageId, "hold", 0, ct);
                     await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
                     processed++;
                     continue;
