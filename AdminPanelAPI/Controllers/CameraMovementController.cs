@@ -999,6 +999,11 @@ WHERE imageid = @imageid AND movement = @movement;";
                             item.ImageId, action, item.Movement, null,
                             item.Confidence, ct);
                     }
+
+                    if (item.Status == "ok")
+                    {
+                        await PromoteToSubMovementsAsync(item.ImageId, item.Movement, ct);
+                    }
                 }
             }
 
@@ -1311,6 +1316,41 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
             cmd.Parameters.AddWithValue("@imageid", imageId);
 
             await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        // Parent movement -> more specific "sub" variants. When a parent tag is
+        // QC-confirmed (status 'ok'), each sub is queued as 'not_checked' so a
+        // reviewer can decide whether the clip is actually the niche variant.
+        private static readonly Dictionary<string, string[]> SubMovements = new()
+        {
+            ["zoom_in"]   = new[] { "crash_zoom_in", "dolly_zoom_in" },
+            ["zoom_out"]  = new[] { "crash_zoom_out", "dolly_zoom_out" },
+            ["dolly_in"]  = new[] { "push_in", "following" },
+            ["dolly_out"] = new[] { "pull_out", "leading" },
+            ["pan_left"]  = new[] { "whip_pan_left" },
+            ["pan_right"] = new[] { "whip_pan_right" },
+        };
+
+        // Queue the sub-variants of a confirmed parent movement for QC review.
+        // Existing rows (already reviewed either way) are left untouched.
+        private async Task PromoteToSubMovementsAsync(
+            int imageId, string parentMovement, CancellationToken ct)
+        {
+            if (!SubMovements.TryGetValue(parentMovement, out var subs))
+                return;
+
+            const string sql = @"
+INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
+VALUES (@imageid, @movement, 0, 'not_checked')
+ON CONFLICT (imageid, movement) DO NOTHING;";
+
+            foreach (var sub in subs)
+            {
+                await using var cmd = new NpgsqlCommand(sql, _connection);
+                cmd.Parameters.AddWithValue("@imageid", imageId);
+                cmd.Parameters.AddWithValue("@movement", sub);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
         }
 
         private async Task<Dictionary<int, List<SegmentDto>>> FetchSegmentsAsync(
