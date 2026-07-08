@@ -263,6 +263,7 @@ LIMIT @limit;";
                 {
                     await InsertMovementAsync(r.ImageId, "hold", 0, ct);
                     await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
+                    await MaybeTagNoMovementAsync(r.ImageId, ct);
                     processed++;
                     continue;
                 }
@@ -274,6 +275,7 @@ LIMIT @limit;";
                 }
 
                 await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
+                await MaybeTagNoMovementAsync(r.ImageId, ct);
                 processed++;
             }
 
@@ -454,6 +456,7 @@ LIMIT @limit;";
                 {
                     await InsertMovementAsync(r.ImageId, "hold", 0, ct);
                     await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
+                    await MaybeTagNoMovementAsync(r.ImageId, ct);
                     processed++;
                     continue;
                 }
@@ -465,6 +468,7 @@ LIMIT @limit;";
                 }
 
                 await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
+                await MaybeTagNoMovementAsync(r.ImageId, ct);
                 processed++;
             }
 
@@ -1281,6 +1285,30 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
             cmd.Parameters.AddWithValue("@imageid", imageId);
             cmd.Parameters.AddWithValue("@movement", movement);
             cmd.Parameters.AddWithValue("@confidence", (float)confidence);
+
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        // Auto-tag "no_movement" when an image's only movement is "hold"
+        // (has a hold row and no other movement besides no_movement itself).
+        // Inserted as 'not_checked' so it surfaces for QC review.
+        private async Task MaybeTagNoMovementAsync(int imageId, CancellationToken ct)
+        {
+            const string sql = @"
+INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
+SELECT @imageid, 'no_movement', 0, 'not_checked'
+WHERE EXISTS (
+    SELECT 1 FROM frl.frl_join_image_camera_movements
+    WHERE imageid = @imageid AND movement = 'hold'
+)
+AND NOT EXISTS (
+    SELECT 1 FROM frl.frl_join_image_camera_movements
+    WHERE imageid = @imageid AND movement NOT IN ('hold', 'no_movement')
+)
+ON CONFLICT (imageid, movement) DO NOTHING;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@imageid", imageId);
 
             await cmd.ExecuteNonQueryAsync(ct);
         }
