@@ -151,7 +151,7 @@ namespace AdminPanelAPI.Controllers
         {
             const string sql = @"
 SELECT r2_key
-FROM frl.frl_music_identification_jobs
+FROM frl.frl_join_movies_music_identification_jobs
 WHERE movieid = @movieid
   AND r2_key IS NOT NULL
 ORDER BY created_at DESC

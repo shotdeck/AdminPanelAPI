@@ -26,7 +26,7 @@ public class MusicIdentificationJobRepository : IMusicIdentificationJobRepositor
     public async Task<long> CreateJobAsync(int movieId, string? r2Key, string? r2Url, CancellationToken cancellationToken)
     {
         const string sql = @"
-INSERT INTO frl.frl_music_identification_jobs (
+INSERT INTO frl.frl_join_movies_music_identification_jobs (
     movieid,
     r2_key,
     r2_url,
@@ -55,7 +55,7 @@ RETURNING id;";
     public async Task UpdateProgressAsync(long jobId, string step, int progressPct, CancellationToken cancellationToken)
     {
         const string sql = @"
-UPDATE frl.frl_music_identification_jobs
+UPDATE frl.frl_join_movies_music_identification_jobs
 SET current_step = @step,
     progress_pct = @progress_pct
 WHERE id = @id;";
@@ -88,7 +88,7 @@ SELECT
     started_at,
     completed_at,
     error
-FROM frl.frl_music_identification_jobs
+FROM frl.frl_join_movies_music_identification_jobs
 WHERE id = @id;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -123,7 +123,7 @@ WHERE id = @id;";
     public async Task MarkRunningAsync(long jobId, CancellationToken cancellationToken)
     {
         const string sql = @"
-UPDATE frl.frl_music_identification_jobs
+UPDATE frl.frl_join_movies_music_identification_jobs
 SET status = 'Running',
     started_at = now(),
     error = null
@@ -135,7 +135,7 @@ WHERE id = @id;";
     public async Task MarkCompletedAsync(long jobId, int matchedCount, int unmatchedCount, CancellationToken cancellationToken)
     {
         const string sql = @"
-UPDATE frl.frl_music_identification_jobs
+UPDATE frl.frl_join_movies_music_identification_jobs
 SET status = 'Completed',
     completed_at = now(),
     matched_count = @matched_count,
@@ -158,7 +158,7 @@ WHERE id = @id;";
     public async Task MarkFailedAsync(long jobId, string error, CancellationToken cancellationToken)
     {
         const string sql = @"
-UPDATE frl.frl_music_identification_jobs
+UPDATE frl.frl_join_movies_music_identification_jobs
 SET status = 'Failed',
     completed_at = now(),
     error = @error
@@ -174,7 +174,7 @@ WHERE id = @id;";
 
         // Idempotent re-run: clear existing segments for this movie.
         await using (var deleteCmd = new NpgsqlCommand(
-            "DELETE FROM frl.frl_music_segments WHERE movieid = @movieid", conn))
+            "DELETE FROM frl.frl_join_movies_music_segments WHERE movieid = @movieid", conn))
         {
             deleteCmd.Parameters.AddWithValue("movieid", movieId);
             await deleteCmd.ExecuteNonQueryAsync(cancellationToken);
@@ -184,7 +184,7 @@ WHERE id = @id;";
         try
         {
             const string sql = @"
-INSERT INTO frl.frl_music_segments
+INSERT INTO frl.frl_join_movies_music_segments
     (movieid, start_time, end_time, matched, title, artist, recording_id, score)
 VALUES
     (@movieid, @start_time, @end_time, @matched, @title, @artist, @recording_id, @score);";
@@ -230,7 +230,7 @@ VALUES
     {
         const string sql = @"
 SELECT movieid, start_time, end_time, matched, title, artist, recording_id, score
-FROM frl.frl_music_segments
+FROM frl.frl_join_movies_music_segments
 WHERE movieid = @movieid
 ORDER BY start_time;";
 
