@@ -59,12 +59,18 @@ namespace AdminPanelAPI.Services
             {
                 await _repo.UpdateProgressAsync(jobId, "Sending to transcription API", 5, cancellationToken);
 
+                // The Modal /transcribe endpoint requires r2_key. A re-transcribe
+                // (transcribe/{id}?force=true) has no r2Key on the job, so resolve
+                // it from the movie's most recent job here.
+                r2Key ??= await GetR2KeyForMovieAsync(movieId, cancellationToken);
+                if (string.IsNullOrWhiteSpace(r2Key))
+                    throw new Exception($"No r2_key found for movie {movieId}; cannot transcribe.");
+
                 var client = _httpClientFactory.CreateClient();
                 client.Timeout = TimeSpan.FromMinutes(60);
 
-                var url = $"{_transcriptionApiBaseUrl.TrimEnd('/')}/transcribe?movie_id={movieId}";
-                if (!string.IsNullOrWhiteSpace(r2Key))
-                    url += $"&r2_key={Uri.EscapeDataString(r2Key)}";
+                var url = $"{_transcriptionApiBaseUrl.TrimEnd('/')}/transcribe?movie_id={movieId}"
+                    + $"&r2_key={Uri.EscapeDataString(r2Key)}";
 
                 using var response = await client.PostAsync(url, null, cancellationToken);
                 var content = await response.Content.ReadAsStringAsync(cancellationToken);
@@ -271,6 +277,12 @@ ORDER BY id DESC LIMIT 1;", conn);
                 {
                     var cleaned = CleanWord(w.Word);
                     if (string.IsNullOrEmpty(cleaned))
+                        continue;
+
+                    // Skip absurdly long tokens: real words are never this long,
+                    // so these are transcription artifacts (run-on hallucinations),
+                    // and they'd overflow the word/word_normalized VARCHAR(200) columns.
+                    if (cleaned.Length > 100)
                         continue;
 
                     await writer.StartRowAsync(cancellationToken);
