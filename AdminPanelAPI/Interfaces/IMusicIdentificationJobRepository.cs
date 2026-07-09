@@ -11,6 +11,8 @@ public interface IMusicIdentificationJobRepository
     Task UpdateProgressAsync(long jobId, string step, int progressPct, CancellationToken cancellationToken);
     Task StoreSegmentsAsync(int movieId, MusicApiResponse response, CancellationToken cancellationToken);
     Task<List<MusicSegmentResult>> GetSegmentsAsync(int movieId, CancellationToken cancellationToken);
+    Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, CancellationToken cancellationToken);
+    Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, CancellationToken cancellationToken);
 }
 
 public class MusicIdentificationJobRepository : IMusicIdentificationJobRepository
@@ -303,6 +305,99 @@ ORDER BY s.start_time;";
         }
 
         return results;
+    }
+
+    public async Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
+       s.movieid, m.title AS movie_title, m.year AS movie_year,
+       s.start_time, s.end_time, s.score
+FROM frl.frl_join_movies_music_segments s
+JOIN frl.frl_music_songs so ON s.song_id = so.id
+LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
+LEFT JOIN frl.frl_movies m ON m.idnum = s.movieid
+WHERE s.matched = true
+  AND (so.title ILIKE @q OR ar.name ILIKE @q)
+ORDER BY so.title, s.movieid, s.start_time
+LIMIT @limit;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("q", $"%{query}%");
+        cmd.Parameters.AddWithValue("limit", limit);
+
+        return await ReadTrackGroupsAsync(cmd, cancellationToken);
+    }
+
+    public async Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
+       s.movieid, m.title AS movie_title, m.year AS movie_year,
+       s.start_time, s.end_time, s.score
+FROM frl.frl_join_movies_music_segments s
+JOIN frl.frl_music_songs so ON s.song_id = so.id
+LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
+LEFT JOIN frl.frl_movies m ON m.idnum = s.movieid
+WHERE s.matched = true
+  AND s.movieid = @movieid
+ORDER BY so.title, s.start_time;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+
+        return await ReadTrackGroupsAsync(cmd, cancellationToken);
+    }
+
+    /// <summary>
+    /// Read occurrence rows and group them by song, preserving row order so the
+    /// group order matches the SQL ORDER BY.
+    /// </summary>
+    private static async Task<List<MusicTrackGroup>> ReadTrackGroupsAsync(
+        NpgsqlCommand cmd, CancellationToken cancellationToken)
+    {
+        var groups = new List<MusicTrackGroup>();
+        var bySong = new Dictionary<long, MusicTrackGroup>();
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var songId = reader.GetInt64(0);
+            if (!bySong.TryGetValue(songId, out var group))
+            {
+                group = new MusicTrackGroup
+                {
+                    SongId = songId,
+                    Title = reader.IsDBNull(1) ? null : reader.GetString(1),
+                    Artist = reader.IsDBNull(2) ? null : reader.GetString(2),
+                    Isrc = reader.IsDBNull(3) ? null : reader.GetString(3),
+                    Acrid = reader.IsDBNull(4) ? null : reader.GetString(4)
+                };
+                bySong[songId] = group;
+                groups.Add(group);
+            }
+
+            group.Occurrences.Add(new MusicTrackOccurrence
+            {
+                MovieId = reader.GetInt32(5),
+                MovieTitle = reader.IsDBNull(6) ? null : reader.GetString(6),
+                MovieYear = reader.IsDBNull(7) ? null : reader.GetInt32(7),
+                StartTime = reader.GetDouble(8),
+                EndTime = reader.GetDouble(9),
+                Score = reader.IsDBNull(10) ? null : reader.GetDouble(10)
+            });
+        }
+
+        foreach (var g in groups)
+            g.OccurrenceCount = g.Occurrences.Count;
+
+        return groups;
     }
 
     private async Task ExecuteNonQueryAsync(string sql, long jobId, string? error, CancellationToken cancellationToken)

@@ -3,10 +3,22 @@ using System.Text.Json.Serialization;
 namespace AdminPanelAPI.Models
 {
     /// <summary>
-    /// Response shape returned by the Modal music-identification API.
+    /// Response from POST /identify — the spawned call id to poll for results.
     /// </summary>
+    public class MusicApiStartResponse
+    {
+        [JsonPropertyName("call_id")]
+        public string? CallId { get; set; }
+
+        [JsonPropertyName("status")]
+        public string? Status { get; set; }
+    }
+
     public class MusicApiResponse
     {
+        [JsonPropertyName("status")]
+        public string? Status { get; set; }
+
         [JsonPropertyName("movie_id")]
         public int MovieId { get; set; }
 

@@ -106,6 +106,50 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
+        /// Search identified music by song title or artist/band name. Returns
+        /// matching songs, each grouped with every occurrence (movie + timestamps).
+        /// </summary>
+        [HttpGet("search")]
+        public async Task<IActionResult> Search(
+            [FromQuery] string q,
+            [FromQuery] int limit = 500,
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(q))
+                return BadRequest(new { error = "Query parameter 'q' is required." });
+
+            limit = Math.Clamp(limit, 1, 2000);
+            var tracks = await _jobRepository.SearchTracksAsync(q.Trim(), limit, cancellationToken);
+
+            return Ok(new
+            {
+                query = q.Trim(),
+                trackCount = tracks.Count,
+                occurrenceCount = tracks.Sum(t => t.OccurrenceCount),
+                tracks
+            });
+        }
+
+        /// <summary>
+        /// List all identified songs for a movie, grouped with their occurrences.
+        /// </summary>
+        [HttpGet("movie/{movieId:int}/tracks")]
+        public async Task<IActionResult> GetMovieTracks(
+            int movieId,
+            CancellationToken cancellationToken)
+        {
+            var tracks = await _jobRepository.GetMovieTracksAsync(movieId, cancellationToken);
+
+            return Ok(new
+            {
+                movieId,
+                trackCount = tracks.Count,
+                occurrenceCount = tracks.Sum(t => t.OccurrenceCount),
+                tracks
+            });
+        }
+
+        /// <summary>
         /// Get a presigned R2 URL for streaming a movie file (from its music job).
         /// </summary>
         [HttpGet("video-url/{movieId:int}")]

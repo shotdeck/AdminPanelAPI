@@ -43,29 +43,59 @@ namespace AdminPanelAPI.Services
             await _repo.UpdateProgressAsync(jobId, "Sending to music identification API", 5, cancellationToken);
 
             var client = _httpClientFactory.CreateClient();
-            client.Timeout = TimeSpan.FromMinutes(60);
+            client.Timeout = TimeSpan.FromMinutes(10);
 
-            var url = $"{_musicApiBaseUrl.TrimEnd('/')}/identify" +
-                      $"?movie_id={movieId}&r2_key={Uri.EscapeDataString(r2Key)}";
+            var baseUrl = _musicApiBaseUrl.TrimEnd('/');
 
-            using var response = await client.PostAsync(url, null, cancellationToken);
-            var content = await response.Content.ReadAsStringAsync(cancellationToken);
+            // The Modal app processes a full movie asynchronously: POST /identify
+            // returns a call_id immediately, then we poll GET /result/{call_id}.
+            var startUrl = $"{baseUrl}/identify" +
+                           $"?movie_id={movieId}&r2_key={Uri.EscapeDataString(r2Key)}";
 
-            if (!response.IsSuccessStatusCode)
+            using var startResponse = await client.PostAsync(startUrl, null, cancellationToken);
+            var startContent = await startResponse.Content.ReadAsStringAsync(cancellationToken);
+            if (!startResponse.IsSuccessStatusCode)
             {
                 throw new Exception(
-                    $"Music identification API failed. Status: {(int)response.StatusCode}, Body: {content}");
+                    $"Music identification API failed to start. Status: {(int)startResponse.StatusCode}, Body: {startContent}");
             }
 
-            await _repo.UpdateProgressAsync(jobId, "Parsing results", 70, cancellationToken);
+            var start = JsonSerializer.Deserialize<MusicApiStartResponse>(startContent);
+            if (start?.CallId == null)
+                throw new Exception($"Music identification API did not return a call_id: {startContent}");
 
-            var result = JsonSerializer.Deserialize<MusicApiResponse>(content);
+            await _repo.UpdateProgressAsync(jobId, "Detecting music and recognizing songs", 30, cancellationToken);
 
-            if (result == null || result.Error != null)
+            MusicApiResponse? result = null;
+            var resultUrl = $"{baseUrl}/result/{start.CallId}";
+            var deadline = DateTime.UtcNow.AddMinutes(55);
+
+            while (DateTime.UtcNow < deadline)
             {
-                throw new Exception(
-                    $"Music identification API returned error: {result?.Error ?? "empty response"}");
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+
+                using var poll = await client.GetAsync(resultUrl, cancellationToken);
+                var pollContent = await poll.Content.ReadAsStringAsync(cancellationToken);
+                if (!poll.IsSuccessStatusCode)
+                    throw new Exception(
+                        $"Music identification result poll failed. Status: {(int)poll.StatusCode}, Body: {pollContent}");
+
+                var status = JsonSerializer.Deserialize<MusicApiResponse>(pollContent);
+                if (status == null)
+                    continue;
+                if (status.Status == "processing")
+                    continue;
+                if (status.Status == "error" || status.Error != null)
+                    throw new Exception(
+                        $"Music identification API returned error: {status.Error ?? "unknown error"}");
+
+                result = status;
+                break;
             }
+
+            if (result == null)
+                throw new Exception("Music identification timed out waiting for results.");
 
             await _repo.UpdateProgressAsync(jobId, "Storing segments in database", 85, cancellationToken);
 
