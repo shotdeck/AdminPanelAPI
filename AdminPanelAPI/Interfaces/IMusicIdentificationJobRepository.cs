@@ -485,9 +485,45 @@ LIMIT @limit;";
         }
 
         foreach (var g in groups)
+        {
+            g.Occurrences = MergeNearbyOccurrences(g.Occurrences);
             g.OccurrenceCount = g.Occurrences.Count;
+        }
 
         return groups;
+    }
+
+    // A song can drop out of ACRCloud recognition for a few seconds during a
+    // continuous scene (dialogue over the music), which splits one cue into
+    // several rows. Merge occurrences of the same song within the same movie
+    // when the gap between them is small, so the UI shows one clip per scene.
+    private const double MergeGapSeconds = 90;
+
+    private static List<MusicTrackOccurrence> MergeNearbyOccurrences(List<MusicTrackOccurrence> occurrences)
+    {
+        var ordered = occurrences
+            .OrderBy(o => o.MovieId)
+            .ThenBy(o => o.StartTime)
+            .ToList();
+
+        var merged = new List<MusicTrackOccurrence>();
+        foreach (var o in ordered)
+        {
+            var last = merged.LastOrDefault();
+            if (last != null &&
+                last.MovieId == o.MovieId &&
+                o.StartTime - last.EndTime <= MergeGapSeconds)
+            {
+                last.EndTime = Math.Max(last.EndTime, o.EndTime);
+                last.Score = Math.Max(last.Score ?? 0, o.Score ?? 0);
+            }
+            else
+            {
+                merged.Add(o);
+            }
+        }
+
+        return merged;
     }
 
     private async Task ExecuteNonQueryAsync(string sql, long jobId, string? error, CancellationToken cancellationToken)
