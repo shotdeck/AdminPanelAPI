@@ -44,16 +44,29 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
-        /// Queue a single movie for music identification.
+        /// Queue a single movie for music identification. If 'r2Key' is omitted it
+        /// is resolved from the movies bucket by convention (movies/{movieId}/*.mp4).
         /// </summary>
         [HttpPost("identify/{movieId:int}")]
         public async Task<IActionResult> IdentifyMovie(
             int movieId,
-            [FromQuery] string r2Key,
+            [FromQuery] string? r2Key = null,
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(r2Key))
-                return BadRequest(new { error = "Query parameter 'r2Key' is required." });
+            {
+                // Every movie is dialogue-processed before music, so its r2_key is
+                // already recorded on the dialogue job — reuse it (no R2 call). Fall
+                // back to listing the movies bucket by convention if there's none.
+                r2Key = await GetR2KeyFromDialogueJobAsync(movieId, cancellationToken)
+                    ?? await ResolveR2KeyForMovieAsync(movieId, cancellationToken);
+                if (string.IsNullOrWhiteSpace(r2Key))
+                    return NotFound(new
+                    {
+                        error = $"No r2_key found for movie {movieId} (no dialogue job and "
+                            + $"no .mp4 under '{movieId}/'); pass 'r2Key' explicitly."
+                    });
+            }
 
             var jobId = await _jobRepository.CreateJobAsync(
                 movieId, r2Key, null, cancellationToken);
@@ -236,6 +249,79 @@ namespace AdminPanelAPI.Controllers
             });
 
             return Ok(new { movieId, r2Key, url, expiresInMinutes = PresignedUrlExpiryMinutes });
+        }
+
+        /// <summary>
+        /// Resolve a movie's r2_key from its most recent dialogue transcription job.
+        /// Every movie is dialogue-processed before music, so this is the cheapest,
+        /// most authoritative source. Returns null if the movie has no dialogue job.
+        /// </summary>
+        private async Task<string?> GetR2KeyFromDialogueJobAsync(
+            int movieId, CancellationToken cancellationToken)
+        {
+            const string sql = @"
+SELECT r2_key
+FROM frl.frl_dialogue_transcription_jobs
+WHERE movieid = @movieid
+  AND r2_key IS NOT NULL
+ORDER BY id DESC
+LIMIT 1;";
+
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken);
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("movieid", movieId);
+
+            return await cmd.ExecuteScalarAsync(cancellationToken) as string;
+        }
+
+        /// <summary>
+        /// Resolve a movie's mp4 key from the movies bucket by convention:
+        /// files live at movies/{movieId}/{file}.mp4. The final source file to scan
+        /// is tagged "SF" in its name (e.g. "..._SFv1.3.mp4") and there is normally
+        /// exactly one; prefer it, falling back to the largest mp4. Null if none.
+        /// </summary>
+        private async Task<string?> ResolveR2KeyForMovieAsync(
+            int movieId, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(_r2AccountId) ||
+                string.IsNullOrWhiteSpace(_r2AccessKey) ||
+                string.IsNullOrWhiteSpace(_r2SecretKey))
+            {
+                return null;
+            }
+
+            var creds = new BasicAWSCredentials(_r2AccessKey.Trim(), _r2SecretKey.Trim());
+            var s3Config = new AmazonS3Config
+            {
+                ServiceURL = $"https://{_r2AccountId.Trim()}.r2.cloudflarestorage.com",
+                ForcePathStyle = true,
+                UseAccelerateEndpoint = false,
+                UseDualstackEndpoint = false,
+                EndpointDiscoveryEnabled = false
+            };
+
+            using var s3Client = new AmazonS3Client(creds, s3Config);
+
+            var response = await s3Client.ListObjectsV2Async(new ListObjectsV2Request
+            {
+                BucketName = _r2BucketName,
+                Prefix = $"{movieId}/"
+            }, cancellationToken);
+
+            var mp4s = (response.S3Objects ?? new List<S3Object>())
+                .Where(o => o.Key.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var sourceFiles = mp4s
+                .Where(o => o.Key.Contains("SF", StringComparison.Ordinal))
+                .ToList();
+
+            return (sourceFiles.Count > 0 ? sourceFiles : mp4s)
+                .OrderByDescending(o => o.Size)
+                .Select(o => o.Key)
+                .FirstOrDefault();
         }
 
         private async Task<string?> GetR2KeyForMovieAsync(int movieId, CancellationToken cancellationToken)
