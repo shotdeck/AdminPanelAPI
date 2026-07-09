@@ -44,16 +44,25 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
-        /// Queue a single movie for music identification.
+        /// Queue a single movie for music identification. If 'r2Key' is omitted it
+        /// is resolved from the movies bucket by convention (movies/{movieId}/*.mp4).
         /// </summary>
         [HttpPost("identify/{movieId:int}")]
         public async Task<IActionResult> IdentifyMovie(
             int movieId,
-            [FromQuery] string r2Key,
+            [FromQuery] string? r2Key = null,
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(r2Key))
-                return BadRequest(new { error = "Query parameter 'r2Key' is required." });
+            {
+                r2Key = await ResolveR2KeyForMovieAsync(movieId, cancellationToken);
+                if (string.IsNullOrWhiteSpace(r2Key))
+                    return NotFound(new
+                    {
+                        error = $"No .mp4 found under '{movieId}/' in the movies bucket; "
+                            + "pass 'r2Key' explicitly."
+                    });
+            }
 
             var jobId = await _jobRepository.CreateJobAsync(
                 movieId, r2Key, null, cancellationToken);
@@ -236,6 +245,46 @@ namespace AdminPanelAPI.Controllers
             });
 
             return Ok(new { movieId, r2Key, url, expiresInMinutes = PresignedUrlExpiryMinutes });
+        }
+
+        /// <summary>
+        /// Resolve a movie's mp4 key from the movies bucket by convention:
+        /// files live at movies/{movieId}/{file}.mp4. Picks the largest mp4 under
+        /// that prefix (the full feature, not a clip). Returns null if none found.
+        /// </summary>
+        private async Task<string?> ResolveR2KeyForMovieAsync(
+            int movieId, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(_r2AccountId) ||
+                string.IsNullOrWhiteSpace(_r2AccessKey) ||
+                string.IsNullOrWhiteSpace(_r2SecretKey))
+            {
+                return null;
+            }
+
+            var creds = new BasicAWSCredentials(_r2AccessKey.Trim(), _r2SecretKey.Trim());
+            var s3Config = new AmazonS3Config
+            {
+                ServiceURL = $"https://{_r2AccountId.Trim()}.r2.cloudflarestorage.com",
+                ForcePathStyle = true,
+                UseAccelerateEndpoint = false,
+                UseDualstackEndpoint = false,
+                EndpointDiscoveryEnabled = false
+            };
+
+            using var s3Client = new AmazonS3Client(creds, s3Config);
+
+            var response = await s3Client.ListObjectsV2Async(new ListObjectsV2Request
+            {
+                BucketName = _r2BucketName,
+                Prefix = $"{movieId}/"
+            }, cancellationToken);
+
+            return (response.S3Objects ?? new List<S3Object>())
+                .Where(o => o.Key.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(o => o.Size)
+                .Select(o => o.Key)
+                .FirstOrDefault();
         }
 
         private async Task<string?> GetR2KeyForMovieAsync(int movieId, CancellationToken cancellationToken)
