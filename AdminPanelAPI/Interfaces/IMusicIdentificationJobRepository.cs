@@ -14,6 +14,7 @@ public interface IMusicIdentificationJobRepository
     Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, CancellationToken cancellationToken);
     Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, CancellationToken cancellationToken);
     Task<List<MovieMusicSummary>> SearchMoviesByTitleAsync(string query, int limit, CancellationToken cancellationToken);
+    Task<MusicSearchOptions> GetSearchOptionsAsync(string query, int limit, CancellationToken cancellationToken);
 }
 
 public class MusicIdentificationJobRepository : IMusicIdentificationJobRepository
@@ -393,6 +394,55 @@ LIMIT @limit;";
         }
 
         return results;
+    }
+
+    public async Task<MusicSearchOptions> GetSearchOptionsAsync(string query, int limit, CancellationToken cancellationToken)
+    {
+        // Distinct artists and song titles that have at least one identified
+        // (matched) occurrence. Empty query returns all, for the dropdown.
+        const string artistSql = @"
+SELECT DISTINCT ar.name
+FROM frl.frl_music_artists ar
+JOIN frl.frl_music_songs so ON so.artist_id = ar.id
+JOIN frl.frl_join_movies_music_segments s ON s.song_id = so.id AND s.matched = true
+WHERE ar.name IS NOT NULL AND (@q = '' OR ar.name ILIKE @like)
+ORDER BY ar.name
+LIMIT @limit;";
+
+        const string songSql = @"
+SELECT DISTINCT so.title
+FROM frl.frl_music_songs so
+JOIN frl.frl_join_movies_music_segments s ON s.song_id = so.id AND s.matched = true
+WHERE so.title IS NOT NULL AND (@q = '' OR so.title ILIKE @like)
+ORDER BY so.title
+LIMIT @limit;";
+
+        var options = new MusicSearchOptions();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using (var cmd = new NpgsqlCommand(artistSql, conn))
+        {
+            cmd.Parameters.AddWithValue("q", query);
+            cmd.Parameters.AddWithValue("like", $"%{query}%");
+            cmd.Parameters.AddWithValue("limit", limit);
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                options.Artists.Add(reader.GetString(0));
+        }
+
+        await using (var cmd = new NpgsqlCommand(songSql, conn))
+        {
+            cmd.Parameters.AddWithValue("q", query);
+            cmd.Parameters.AddWithValue("like", $"%{query}%");
+            cmd.Parameters.AddWithValue("limit", limit);
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                options.Songs.Add(reader.GetString(0));
+        }
+
+        return options;
     }
 
     /// <summary>

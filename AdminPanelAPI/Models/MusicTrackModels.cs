@@ -28,6 +28,16 @@ namespace AdminPanelAPI.Models
     }
 
     /// <summary>
+    /// The distinct artists and song titles that have identified music, used to
+    /// populate the Band/Song search dropdown.
+    /// </summary>
+    public class MusicSearchOptions
+    {
+        public List<string> Artists { get; set; } = new();
+        public List<string> Songs { get; set; } = new();
+    }
+
+    /// <summary>
     /// A song grouped with every occurrence of it (across one or many movies).
     /// </summary>
     public class MusicTrackGroup

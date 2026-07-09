@@ -131,6 +131,30 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
+        /// List distinct artists and song titles that have identified music,
+        /// for populating the Band/Song search dropdown. Empty query returns all.
+        /// </summary>
+        [HttpGet("search/options")]
+        public async Task<IActionResult> SearchOptions(
+            [FromQuery] string? q = null,
+            [FromQuery] int limit = 1000,
+            CancellationToken cancellationToken = default)
+        {
+            var query = (q ?? string.Empty).Trim();
+            limit = Math.Clamp(limit, 1, 5000);
+            var options = await _jobRepository.GetSearchOptionsAsync(query, limit, cancellationToken);
+
+            return Ok(new
+            {
+                query,
+                artistCount = options.Artists.Count,
+                songCount = options.Songs.Count,
+                artists = options.Artists,
+                songs = options.Songs
+            });
+        }
+
+        /// <summary>
         /// Search movies by title (frl_movies.title), returning only movies that
         /// have identified music, with per-movie track/occurrence counts.
         /// </summary>
