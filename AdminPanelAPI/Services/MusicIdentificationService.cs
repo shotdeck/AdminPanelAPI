@@ -42,60 +42,45 @@ namespace AdminPanelAPI.Services
 
             await _repo.UpdateProgressAsync(jobId, "Sending to music identification API", 5, cancellationToken);
 
-            var client = _httpClientFactory.CreateClient();
-            client.Timeout = TimeSpan.FromMinutes(10);
-
             var baseUrl = _musicApiBaseUrl.TrimEnd('/');
 
-            // The Modal app processes a full movie asynchronously: POST /identify
-            // returns a call_id immediately, then we poll GET /result/{call_id}.
-            var startUrl = $"{baseUrl}/identify" +
-                           $"?movie_id={movieId}&r2_key={Uri.EscapeDataString(r2Key)}";
-
-            using var startResponse = await client.PostAsync(startUrl, null, cancellationToken);
-            var startContent = await startResponse.Content.ReadAsStringAsync(cancellationToken);
-            if (!startResponse.IsSuccessStatusCode)
-            {
-                throw new Exception(
-                    $"Music identification API failed to start. Status: {(int)startResponse.StatusCode}, Body: {startContent}");
-            }
-
-            var start = JsonSerializer.Deserialize<MusicApiStartResponse>(startContent);
-            if (start?.CallId == null)
-                throw new Exception($"Music identification API did not return a call_id: {startContent}");
-
-            await _repo.UpdateProgressAsync(jobId, "Detecting music and recognizing songs", 30, cancellationToken);
+            // A healthy full-movie scan finishes in ~10-12 min. Modal occasionally
+            // stalls at the detect step (an intermittent hang we've observed on
+            // larger files); rather than blocking the single-threaded queue on one
+            // hung call for the better part of an hour, cap each attempt and
+            // re-spawn a fresh Modal call. Re-spawning reliably clears the stall.
+            var perAttemptTimeout = TimeSpan.FromMinutes(18);
+            const int maxAttempts = 2;
 
             MusicApiResponse? result = null;
-            var resultUrl = $"{baseUrl}/result/{start.CallId}";
-            var deadline = DateTime.UtcNow.AddMinutes(55);
+            Exception? lastError = null;
 
-            while (DateTime.UtcNow < deadline)
+            for (int attempt = 1; attempt <= maxAttempts && result == null; attempt++)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
-
-                using var poll = await client.GetAsync(resultUrl, cancellationToken);
-                var pollContent = await poll.Content.ReadAsStringAsync(cancellationToken);
-                if (!poll.IsSuccessStatusCode)
-                    throw new Exception(
-                        $"Music identification result poll failed. Status: {(int)poll.StatusCode}, Body: {pollContent}");
-
-                var status = JsonSerializer.Deserialize<MusicApiResponse>(pollContent);
-                if (status == null)
-                    continue;
-                if (status.Status == "processing")
-                    continue;
-                if (status.Status == "error" || status.Error != null)
-                    throw new Exception(
-                        $"Music identification API returned error: {status.Error ?? "unknown error"}");
-
-                result = status;
-                break;
+                try
+                {
+                    result = await RunIdentifyAttemptAsync(
+                        jobId, movieId, r2Key, baseUrl, perAttemptTimeout, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                    _logger.LogWarning(
+                        ex,
+                        "Music job {JobId} attempt {Attempt}/{Max} failed or stalled.",
+                        jobId, attempt, maxAttempts);
+                    if (attempt < maxAttempts)
+                        await _repo.UpdateProgressAsync(
+                            jobId, "Modal call stalled — retrying", 10, cancellationToken);
+                }
             }
 
             if (result == null)
-                throw new Exception("Music identification timed out waiting for results.");
+                throw lastError ?? new Exception("Music identification failed with no result.");
 
             await _repo.UpdateProgressAsync(jobId, "Storing segments in database", 85, cancellationToken);
 
@@ -110,6 +95,68 @@ namespace AdminPanelAPI.Services
             _logger.LogInformation(
                 "Music identification complete. JobId={JobId}, MovieId={MovieId}, Matched={Matched}, Unmatched={Unmatched}",
                 jobId, movieId, result.MatchedSegments.Count, result.UnmatchedWindows.Count);
+        }
+
+        // Spawns one Modal /identify call and polls /result until it completes.
+        // Bounded by `timeout` (a linked CTS): if Modal stalls, this throws so the
+        // caller can re-spawn a fresh call instead of blocking the queue.
+        private async Task<MusicApiResponse> RunIdentifyAttemptAsync(
+            long jobId,
+            int movieId,
+            string? r2Key,
+            string baseUrl,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            using var attemptCts =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            attemptCts.CancelAfter(timeout);
+            var ct = attemptCts.Token;
+
+            var client = _httpClientFactory.CreateClient();
+            client.Timeout = TimeSpan.FromMinutes(10);
+
+            // The Modal app processes a full movie asynchronously: POST /identify
+            // returns a call_id immediately, then we poll GET /result/{call_id}.
+            var startUrl = $"{baseUrl}/identify" +
+                           $"?movie_id={movieId}&r2_key={Uri.EscapeDataString(r2Key!)}";
+
+            using var startResponse = await client.PostAsync(startUrl, null, ct);
+            var startContent = await startResponse.Content.ReadAsStringAsync(ct);
+            if (!startResponse.IsSuccessStatusCode)
+                throw new Exception(
+                    $"Music identification API failed to start. Status: {(int)startResponse.StatusCode}, Body: {startContent}");
+
+            var start = JsonSerializer.Deserialize<MusicApiStartResponse>(startContent);
+            if (start?.CallId == null)
+                throw new Exception($"Music identification API did not return a call_id: {startContent}");
+
+            await _repo.UpdateProgressAsync(jobId, "Detecting music and recognizing songs", 30, cancellationToken);
+
+            var resultUrl = $"{baseUrl}/result/{start.CallId}";
+
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Task.Delay(TimeSpan.FromSeconds(5), ct);
+
+                using var poll = await client.GetAsync(resultUrl, ct);
+                var pollContent = await poll.Content.ReadAsStringAsync(ct);
+                if (!poll.IsSuccessStatusCode)
+                    throw new Exception(
+                        $"Music identification result poll failed. Status: {(int)poll.StatusCode}, Body: {pollContent}");
+
+                var status = JsonSerializer.Deserialize<MusicApiResponse>(pollContent);
+                if (status == null)
+                    continue;
+                if (status.Status == "processing")
+                    continue;
+                if (status.Status == "error" || status.Error != null)
+                    throw new Exception(
+                        $"Music identification API returned error: {status.Error ?? "unknown error"}");
+
+                return status;
+            }
         }
     }
 }
