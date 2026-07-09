@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using AdminPanelAPI.Models;
 using Npgsql;
 
@@ -453,24 +454,44 @@ LIMIT @limit;";
         NpgsqlCommand cmd, CancellationToken cancellationToken)
     {
         var groups = new List<MusicTrackGroup>();
-        var bySong = new Dictionary<long, MusicTrackGroup>();
+        // Group by normalized artist+title, not song_id: ACRCloud often returns
+        // the same recording under several catalog entries (e.g. "What Is Life"
+        // and "What Is Life (2009 Mix)"), which would otherwise show as separate
+        // overlapping tracks.
+        var byKey = new Dictionary<string, MusicTrackGroup>();
 
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
             var songId = reader.GetInt64(0);
-            if (!bySong.TryGetValue(songId, out var group))
+            var title = reader.IsDBNull(1) ? null : reader.GetString(1);
+            var artist = reader.IsDBNull(2) ? null : reader.GetString(2);
+            var isrc = reader.IsDBNull(3) ? null : reader.GetString(3);
+            var acrid = reader.IsDBNull(4) ? null : reader.GetString(4);
+
+            var key = GroupKey(artist, title);
+            if (!byKey.TryGetValue(key, out var group))
             {
                 group = new MusicTrackGroup
                 {
                     SongId = songId,
-                    Title = reader.IsDBNull(1) ? null : reader.GetString(1),
-                    Artist = reader.IsDBNull(2) ? null : reader.GetString(2),
-                    Isrc = reader.IsDBNull(3) ? null : reader.GetString(3),
-                    Acrid = reader.IsDBNull(4) ? null : reader.GetString(4)
+                    Title = title,
+                    Artist = artist,
+                    Isrc = isrc,
+                    Acrid = acrid
                 };
-                bySong[songId] = group;
+                byKey[key] = group;
                 groups.Add(group);
+            }
+            else if (title != null &&
+                     (group.Title == null || title.Length < group.Title.Length))
+            {
+                // Prefer the plainest variant title (usually the shortest,
+                // e.g. "What Is Life" over "What Is Life (2009 Mix)").
+                group.SongId = songId;
+                group.Title = title;
+                group.Isrc = isrc ?? group.Isrc;
+                group.Acrid = acrid ?? group.Acrid;
             }
 
             group.Occurrences.Add(new MusicTrackOccurrence
@@ -491,6 +512,25 @@ LIMIT @limit;";
         }
 
         return groups;
+    }
+
+    // Normalized artist+title key so the same recording matched to different
+    // ACRCloud catalog entries (e.g. "What Is Life" vs "What Is Life (2009 Mix)")
+    // groups into one track. Lowercased, parenthetical/bracket qualifiers and
+    // trailing "- remastered ..." dropped, punctuation stripped.
+    private static string GroupKey(string? artist, string? title)
+    {
+        return $"{Normalize(artist)}|{Normalize(title)}";
+    }
+
+    private static string Normalize(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "";
+        var s = value.ToLowerInvariant();
+        s = Regex.Replace(s, @"\s*[\(\[].*?[\)\]]", " ");     // drop (...) / [...]
+        s = Regex.Replace(s, @"\s*-\s*(remaster|remastered|mix|version|edit|mono|stereo|live).*$", " ");
+        s = Regex.Replace(s, @"[^a-z0-9]+", " ");             // strip punctuation
+        return s.Trim();
     }
 
     // A song can drop out of ACRCloud recognition for a few seconds during a
