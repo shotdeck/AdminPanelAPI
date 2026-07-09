@@ -55,12 +55,16 @@ namespace AdminPanelAPI.Controllers
         {
             if (string.IsNullOrWhiteSpace(r2Key))
             {
-                r2Key = await ResolveR2KeyForMovieAsync(movieId, cancellationToken);
+                // Every movie is dialogue-processed before music, so its r2_key is
+                // already recorded on the dialogue job — reuse it (no R2 call). Fall
+                // back to listing the movies bucket by convention if there's none.
+                r2Key = await GetR2KeyFromDialogueJobAsync(movieId, cancellationToken)
+                    ?? await ResolveR2KeyForMovieAsync(movieId, cancellationToken);
                 if (string.IsNullOrWhiteSpace(r2Key))
                     return NotFound(new
                     {
-                        error = $"No .mp4 found under '{movieId}/' in the movies bucket; "
-                            + "pass 'r2Key' explicitly."
+                        error = $"No r2_key found for movie {movieId} (no dialogue job and "
+                            + $"no .mp4 under '{movieId}/'); pass 'r2Key' explicitly."
                     });
             }
 
@@ -245,6 +249,31 @@ namespace AdminPanelAPI.Controllers
             });
 
             return Ok(new { movieId, r2Key, url, expiresInMinutes = PresignedUrlExpiryMinutes });
+        }
+
+        /// <summary>
+        /// Resolve a movie's r2_key from its most recent dialogue transcription job.
+        /// Every movie is dialogue-processed before music, so this is the cheapest,
+        /// most authoritative source. Returns null if the movie has no dialogue job.
+        /// </summary>
+        private async Task<string?> GetR2KeyFromDialogueJobAsync(
+            int movieId, CancellationToken cancellationToken)
+        {
+            const string sql = @"
+SELECT r2_key
+FROM frl.frl_dialogue_transcription_jobs
+WHERE movieid = @movieid
+  AND r2_key IS NOT NULL
+ORDER BY id DESC
+LIMIT 1;";
+
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken);
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("movieid", movieId);
+
+            return await cmd.ExecuteScalarAsync(cancellationToken) as string;
         }
 
         /// <summary>
