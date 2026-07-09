@@ -249,8 +249,9 @@ namespace AdminPanelAPI.Controllers
 
         /// <summary>
         /// Resolve a movie's mp4 key from the movies bucket by convention:
-        /// files live at movies/{movieId}/{file}.mp4. Picks the largest mp4 under
-        /// that prefix (the full feature, not a clip). Returns null if none found.
+        /// files live at movies/{movieId}/{file}.mp4. The final source file to scan
+        /// is tagged "SF" in its name (e.g. "..._SFv1.3.mp4") and there is normally
+        /// exactly one; prefer it, falling back to the largest mp4. Null if none.
         /// </summary>
         private async Task<string?> ResolveR2KeyForMovieAsync(
             int movieId, CancellationToken cancellationToken)
@@ -280,8 +281,15 @@ namespace AdminPanelAPI.Controllers
                 Prefix = $"{movieId}/"
             }, cancellationToken);
 
-            return (response.S3Objects ?? new List<S3Object>())
+            var mp4s = (response.S3Objects ?? new List<S3Object>())
                 .Where(o => o.Key.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var sourceFiles = mp4s
+                .Where(o => o.Key.Contains("SF", StringComparison.Ordinal))
+                .ToList();
+
+            return (sourceFiles.Count > 0 ? sourceFiles : mp4s)
                 .OrderByDescending(o => o.Size)
                 .Select(o => o.Key)
                 .FirstOrDefault();
