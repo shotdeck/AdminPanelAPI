@@ -15,6 +15,19 @@ namespace AdminPanelAPI.Models
     }
 
     /// <summary>
+    /// A movie that has identified music, with how many distinct songs and
+    /// occurrences were found in it.
+    /// </summary>
+    public class MovieMusicSummary
+    {
+        public int MovieId { get; set; }
+        public string? Title { get; set; }
+        public int? Year { get; set; }
+        public int TrackCount { get; set; }
+        public int OccurrenceCount { get; set; }
+    }
+
+    /// <summary>
     /// A song grouped with every occurrence of it (across one or many movies).
     /// </summary>
     public class MusicTrackGroup

@@ -131,6 +131,29 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
+        /// Search movies by title (frl_movies.title), returning only movies that
+        /// have identified music, with per-movie track/occurrence counts.
+        /// </summary>
+        [HttpGet("movies/search")]
+        public async Task<IActionResult> SearchMovies(
+            [FromQuery] string? q = null,
+            [FromQuery] int limit = 200,
+            CancellationToken cancellationToken = default)
+        {
+            // Empty query lists all processed movies (for populating a dropdown).
+            var query = (q ?? string.Empty).Trim();
+            limit = Math.Clamp(limit, 1, 1000);
+            var movies = await _jobRepository.SearchMoviesByTitleAsync(query, limit, cancellationToken);
+
+            return Ok(new
+            {
+                query,
+                movieCount = movies.Count,
+                movies
+            });
+        }
+
+        /// <summary>
         /// List all identified songs for a movie, grouped with their occurrences.
         /// </summary>
         [HttpGet("movie/{movieId:int}/tracks")]

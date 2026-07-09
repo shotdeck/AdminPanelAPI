@@ -13,6 +13,7 @@ public interface IMusicIdentificationJobRepository
     Task<List<MusicSegmentResult>> GetSegmentsAsync(int movieId, CancellationToken cancellationToken);
     Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, CancellationToken cancellationToken);
     Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, CancellationToken cancellationToken);
+    Task<List<MovieMusicSummary>> SearchMoviesByTitleAsync(string query, int limit, CancellationToken cancellationToken);
 }
 
 public class MusicIdentificationJobRepository : IMusicIdentificationJobRepository
@@ -353,6 +354,45 @@ ORDER BY so.title, s.start_time;";
         cmd.Parameters.AddWithValue("movieid", movieId);
 
         return await ReadTrackGroupsAsync(cmd, cancellationToken);
+    }
+
+    public async Task<List<MovieMusicSummary>> SearchMoviesByTitleAsync(string query, int limit, CancellationToken cancellationToken)
+    {
+        // Movies whose title matches and that have at least one identified song.
+        const string sql = @"
+SELECT m.idnum, m.title, m.year,
+       COUNT(DISTINCT s.song_id) AS track_count,
+       COUNT(*) AS occurrence_count
+FROM frl.frl_movies m
+JOIN frl.frl_join_movies_music_segments s
+     ON s.movieid = m.idnum AND s.matched = true
+WHERE m.title ILIKE @q
+GROUP BY m.idnum, m.title, m.year
+ORDER BY m.title
+LIMIT @limit;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("q", $"%{query}%");
+        cmd.Parameters.AddWithValue("limit", limit);
+
+        var results = new List<MovieMusicSummary>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(new MovieMusicSummary
+            {
+                MovieId = reader.GetInt32(0),
+                Title = reader.IsDBNull(1) ? null : reader.GetString(1),
+                Year = reader.IsDBNull(2) ? null : reader.GetInt32(2),
+                TrackCount = Convert.ToInt32(reader.GetInt64(3)),
+                OccurrenceCount = Convert.ToInt32(reader.GetInt64(4))
+            });
+        }
+
+        return results;
     }
 
     /// <summary>
