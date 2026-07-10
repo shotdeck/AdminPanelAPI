@@ -16,6 +16,9 @@ public interface IMusicIdentificationJobRepository
     Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, CancellationToken cancellationToken);
     Task<List<MovieMusicSummary>> SearchMoviesByTitleAsync(string query, int limit, CancellationToken cancellationToken);
     Task<MusicSearchOptions> GetSearchOptionsAsync(string query, int limit, CancellationToken cancellationToken);
+    Task<MovieInfo?> GetMovieInfoAsync(int movieId, CancellationToken cancellationToken);
+    Task<List<MovieSongRow>> GetMovieSongRowsAsync(int movieId, CancellationToken cancellationToken);
+    Task SetSongConfidenceAsync(int movieId, IReadOnlyDictionary<long, string> confidenceBySongId, CancellationToken cancellationToken);
 }
 
 public class MusicIdentificationJobRepository : IMusicIdentificationJobRepository
@@ -281,7 +284,7 @@ RETURNING id;";
         const string sql = @"
 SELECT s.movieid, s.start_time, s.end_time, s.matched,
        so.title, ar.name AS artist, so.acrid, so.isrc, s.score,
-       s.source, so.spotify_url
+       s.source, so.spotify_url, s.confidence
 FROM frl.frl_join_movies_music_segments s
 LEFT JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
@@ -310,7 +313,8 @@ ORDER BY s.start_time;";
                 Isrc = reader.IsDBNull(7) ? null : reader.GetString(7),
                 Score = reader.IsDBNull(8) ? null : reader.GetDouble(8),
                 Source = reader.IsDBNull(9) ? null : reader.GetString(9),
-                SpotifyUrl = reader.IsDBNull(10) ? null : reader.GetString(10)
+                SpotifyUrl = reader.IsDBNull(10) ? null : reader.GetString(10),
+                Confidence = reader.IsDBNull(11) ? null : reader.GetString(11)
             });
         }
 
@@ -322,7 +326,7 @@ ORDER BY s.start_time;";
         const string sql = @"
 SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
        s.movieid, m.title AS movie_title, m.year AS movie_year,
-       s.start_time, s.end_time, s.score, so.spotify_url, s.source
+       s.start_time, s.end_time, s.score, so.spotify_url, s.source, s.confidence
 FROM frl.frl_join_movies_music_segments s
 JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
@@ -347,7 +351,7 @@ LIMIT @limit;";
         const string sql = @"
 SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
        s.movieid, m.title AS movie_title, m.year AS movie_year,
-       s.start_time, s.end_time, s.score, so.spotify_url, s.source
+       s.start_time, s.end_time, s.score, so.spotify_url, s.source, s.confidence
 FROM frl.frl_join_movies_music_segments s
 JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
@@ -453,6 +457,92 @@ LIMIT @limit;";
         return options;
     }
 
+    public async Task<MovieInfo?> GetMovieInfoAsync(int movieId, CancellationToken cancellationToken)
+    {
+        const string sql = @"SELECT idnum, title, year FROM frl.frl_movies WHERE idnum = @movieid;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+            return null;
+
+        return new MovieInfo
+        {
+            MovieId = reader.GetInt32(0),
+            Title = reader.IsDBNull(1) ? null : reader.GetString(1),
+            Year = reader.IsDBNull(2) ? null : reader.GetInt32(2)
+        };
+    }
+
+    public async Task<List<MovieSongRow>> GetMovieSongRowsAsync(int movieId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT DISTINCT so.id, so.title, ar.name AS artist
+FROM frl.frl_join_movies_music_segments s
+JOIN frl.frl_music_songs so ON s.song_id = so.id
+LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
+WHERE s.matched = true AND s.movieid = @movieid;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+
+        var rows = new List<MovieSongRow>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            rows.Add(new MovieSongRow
+            {
+                SongId = reader.GetInt64(0),
+                Title = reader.IsDBNull(1) ? null : reader.GetString(1),
+                Artist = reader.IsDBNull(2) ? null : reader.GetString(2)
+            });
+        }
+
+        return rows;
+    }
+
+    public async Task SetSongConfidenceAsync(
+        int movieId, IReadOnlyDictionary<long, string> confidenceBySongId, CancellationToken cancellationToken)
+    {
+        if (confidenceBySongId.Count == 0)
+            return;
+
+        const string sql = @"
+UPDATE frl.frl_join_movies_music_segments
+SET confidence = @confidence
+WHERE movieid = @movieid AND song_id = @song_id;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            foreach (var (songId, confidence) in confidenceBySongId)
+            {
+                await using var cmd = new NpgsqlCommand(sql, conn, tx);
+                cmd.Parameters.AddWithValue("confidence", confidence);
+                cmd.Parameters.AddWithValue("movieid", movieId);
+                cmd.Parameters.AddWithValue("song_id", songId);
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await tx.CommitAsync(cancellationToken);
+        }
+        catch
+        {
+            await tx.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
     /// <summary>
     /// Read occurrence rows and group them by song, preserving row order so the
     /// group order matches the SQL ORDER BY.
@@ -516,7 +606,8 @@ LIMIT @limit;";
                 StartTime = reader.GetDouble(8),
                 EndTime = reader.GetDouble(9),
                 Score = reader.IsDBNull(10) ? null : reader.GetDouble(10),
-                Source = reader.IsDBNull(12) ? null : reader.GetString(12)
+                Source = reader.IsDBNull(12) ? null : reader.GetString(12),
+                Confidence = reader.IsDBNull(13) ? null : reader.GetString(13)
             });
         }
 
@@ -524,6 +615,7 @@ LIMIT @limit;";
         {
             g.Occurrences = MergeNearbyOccurrences(g.Occurrences);
             g.OccurrenceCount = g.Occurrences.Count;
+            g.Confidence = BestConfidence(g.Occurrences);
         }
 
         return groups;
@@ -536,6 +628,20 @@ LIMIT @limit;";
     private static string GroupKey(string? artist, string? title)
     {
         return $"{Normalize(artist)}|{Normalize(title)}";
+    }
+
+    // A track's group-level confidence is the strongest across its occurrences
+    // (confirmed > review > unverified). Null when the movie isn't reconciled.
+    private static string? BestConfidence(IEnumerable<MusicTrackOccurrence> occurrences)
+    {
+        string? best = null;
+        foreach (var o in occurrences)
+        {
+            if (o.Confidence == "confirmed") return "confirmed";
+            if (o.Confidence == "review") best = "review";
+            else if (o.Confidence == "unverified" && best == null) best = "unverified";
+        }
+        return best;
     }
 
     private static string Normalize(string? value)
