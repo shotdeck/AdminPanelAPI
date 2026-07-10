@@ -14,5 +14,7 @@ namespace AdminPanelAPI.Models
         public string? RecordingId { get; set; }
         public string? Isrc { get; set; }
         public double? Score { get; set; }
+        public string? Source { get; set; }
+        public string? SpotifyUrl { get; set; }
     }
 }

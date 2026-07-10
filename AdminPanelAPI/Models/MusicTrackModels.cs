@@ -12,6 +12,7 @@ namespace AdminPanelAPI.Models
         public double StartTime { get; set; }
         public double EndTime { get; set; }
         public double? Score { get; set; }
+        public string? Source { get; set; }
     }
 
     /// <summary>
@@ -47,6 +48,7 @@ namespace AdminPanelAPI.Models
         public string? Artist { get; set; }
         public string? Isrc { get; set; }
         public string? Acrid { get; set; }
+        public string? SpotifyUrl { get; set; }
         public int OccurrenceCount { get; set; }
         public List<MusicTrackOccurrence> Occurrences { get; set; } = new();
     }
