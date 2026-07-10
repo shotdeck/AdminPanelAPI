@@ -13,6 +13,7 @@ namespace AdminPanelAPI.Controllers
     {
         private readonly IMusicIdentificationJobRepository _jobRepository;
         private readonly IMusicJobQueue _jobQueue;
+        private readonly ISoundtrackReconciliationService _reconciliationService;
         private readonly IConfiguration _configuration;
         private readonly ILogger<MusicIdentificationController> _logger;
         private readonly string _connectionString;
@@ -27,11 +28,13 @@ namespace AdminPanelAPI.Controllers
         public MusicIdentificationController(
             IMusicIdentificationJobRepository jobRepository,
             IMusicJobQueue jobQueue,
+            ISoundtrackReconciliationService reconciliationService,
             IConfiguration configuration,
             ILogger<MusicIdentificationController> logger)
         {
             _jobRepository = jobRepository;
             _jobQueue = jobQueue;
+            _reconciliationService = reconciliationService;
             _configuration = configuration;
             _logger = logger;
             _connectionString = configuration.GetConnectionString("Default")
@@ -207,6 +210,20 @@ namespace AdminPanelAPI.Controllers
                 occurrenceCount = tracks.Sum(t => t.OccurrenceCount),
                 tracks
             });
+        }
+
+        /// <summary>
+        /// Reconcile a movie's identified tracks against its known soundtrack
+        /// (Wikipedia): tags each occurrence confirmed / review / unverified and
+        /// returns the report. Non-destructive — nothing is deleted.
+        /// </summary>
+        [HttpPost("reconcile/{movieId:int}")]
+        public async Task<IActionResult> Reconcile(
+            int movieId,
+            CancellationToken cancellationToken)
+        {
+            var result = await _reconciliationService.ReconcileAsync(movieId, cancellationToken);
+            return Ok(result);
         }
 
         /// <summary>

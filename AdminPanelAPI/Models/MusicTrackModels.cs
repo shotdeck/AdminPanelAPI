@@ -13,6 +13,23 @@ namespace AdminPanelAPI.Models
         public double EndTime { get; set; }
         public double? Score { get; set; }
         public string? Source { get; set; }
+        public string? Confidence { get; set; }
+    }
+
+    /// <summary>Basic movie metadata used for soundtrack reconciliation.</summary>
+    public class MovieInfo
+    {
+        public int MovieId { get; set; }
+        public string? Title { get; set; }
+        public int? Year { get; set; }
+    }
+
+    /// <summary>A distinct identified song in a movie (for reconciliation).</summary>
+    public class MovieSongRow
+    {
+        public long SongId { get; set; }
+        public string? Title { get; set; }
+        public string? Artist { get; set; }
     }
 
     /// <summary>
@@ -49,6 +66,7 @@ namespace AdminPanelAPI.Models
         public string? Isrc { get; set; }
         public string? Acrid { get; set; }
         public string? SpotifyUrl { get; set; }
+        public string? Confidence { get; set; }
         public int OccurrenceCount { get; set; }
         public List<MusicTrackOccurrence> Occurrences { get; set; } = new();
     }
