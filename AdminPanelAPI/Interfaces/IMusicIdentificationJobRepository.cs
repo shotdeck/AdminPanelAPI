@@ -191,9 +191,9 @@ WHERE id = @id;";
         {
             const string insertSegmentSql = @"
 INSERT INTO frl.frl_join_movies_music_segments
-    (movieid, song_id, start_time, end_time, matched, score)
+    (movieid, song_id, start_time, end_time, matched, score, source)
 VALUES
-    (@movieid, @song_id, @start_time, @end_time, @matched, @score);";
+    (@movieid, @song_id, @start_time, @end_time, @matched, @score, @source);";
 
             foreach (var seg in response.MatchedSegments)
             {
@@ -207,7 +207,8 @@ VALUES
                 cmd.Parameters.AddWithValue("start_time", seg.Start);
                 cmd.Parameters.AddWithValue("end_time", seg.End);
                 cmd.Parameters.AddWithValue("matched", songId != null);
-                cmd.Parameters.AddWithValue("score", seg.Score);
+                cmd.Parameters.AddWithValue("score", (object?)seg.Score ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("source", (object?)seg.Source ?? DBNull.Value);
                 await cmd.ExecuteNonQueryAsync(cancellationToken);
             }
 
@@ -220,6 +221,7 @@ VALUES
                 cmd.Parameters.AddWithValue("end_time", win.End);
                 cmd.Parameters.AddWithValue("matched", false);
                 cmd.Parameters.AddWithValue("score", DBNull.Value);
+                cmd.Parameters.AddWithValue("source", DBNull.Value);
                 await cmd.ExecuteNonQueryAsync(cancellationToken);
             }
 
@@ -257,18 +259,20 @@ RETURNING id;";
         }
 
         const string songSql = @"
-INSERT INTO frl.frl_music_songs (title, isrc, acrid, artist_id)
-VALUES (@title, @isrc, @acrid, @artist_id)
+INSERT INTO frl.frl_music_songs (title, isrc, acrid, artist_id, spotify_url)
+VALUES (@title, @isrc, @acrid, @artist_id, @spotify_url)
 ON CONFLICT (acrid) DO UPDATE SET
     title = EXCLUDED.title,
     isrc = COALESCE(EXCLUDED.isrc, frl.frl_music_songs.isrc),
-    artist_id = COALESCE(EXCLUDED.artist_id, frl.frl_music_songs.artist_id)
+    artist_id = COALESCE(EXCLUDED.artist_id, frl.frl_music_songs.artist_id),
+    spotify_url = COALESCE(EXCLUDED.spotify_url, frl.frl_music_songs.spotify_url)
 RETURNING id;";
         await using var songCmd = new NpgsqlCommand(songSql, conn, tx);
         songCmd.Parameters.AddWithValue("title", (object?)seg.Title ?? DBNull.Value);
         songCmd.Parameters.AddWithValue("isrc", (object?)seg.Isrc ?? DBNull.Value);
         songCmd.Parameters.AddWithValue("acrid", seg.RecordingId!);
         songCmd.Parameters.AddWithValue("artist_id", (object?)artistId ?? DBNull.Value);
+        songCmd.Parameters.AddWithValue("spotify_url", (object?)seg.SpotifyUrl ?? DBNull.Value);
         return Convert.ToInt64(await songCmd.ExecuteScalarAsync(cancellationToken));
     }
 
@@ -276,7 +280,8 @@ RETURNING id;";
     {
         const string sql = @"
 SELECT s.movieid, s.start_time, s.end_time, s.matched,
-       so.title, ar.name AS artist, so.acrid, so.isrc, s.score
+       so.title, ar.name AS artist, so.acrid, so.isrc, s.score,
+       s.source, so.spotify_url
 FROM frl.frl_join_movies_music_segments s
 LEFT JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
@@ -303,7 +308,9 @@ ORDER BY s.start_time;";
                 Artist = reader.IsDBNull(5) ? null : reader.GetString(5),
                 RecordingId = reader.IsDBNull(6) ? null : reader.GetString(6),
                 Isrc = reader.IsDBNull(7) ? null : reader.GetString(7),
-                Score = reader.IsDBNull(8) ? null : reader.GetDouble(8)
+                Score = reader.IsDBNull(8) ? null : reader.GetDouble(8),
+                Source = reader.IsDBNull(9) ? null : reader.GetString(9),
+                SpotifyUrl = reader.IsDBNull(10) ? null : reader.GetString(10)
             });
         }
 
@@ -315,7 +322,7 @@ ORDER BY s.start_time;";
         const string sql = @"
 SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
        s.movieid, m.title AS movie_title, m.year AS movie_year,
-       s.start_time, s.end_time, s.score
+       s.start_time, s.end_time, s.score, so.spotify_url, s.source
 FROM frl.frl_join_movies_music_segments s
 JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
@@ -340,7 +347,7 @@ LIMIT @limit;";
         const string sql = @"
 SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
        s.movieid, m.title AS movie_title, m.year AS movie_year,
-       s.start_time, s.end_time, s.score
+       s.start_time, s.end_time, s.score, so.spotify_url, s.source
 FROM frl.frl_join_movies_music_segments s
 JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
@@ -468,6 +475,7 @@ LIMIT @limit;";
             var artist = reader.IsDBNull(2) ? null : reader.GetString(2);
             var isrc = reader.IsDBNull(3) ? null : reader.GetString(3);
             var acrid = reader.IsDBNull(4) ? null : reader.GetString(4);
+            var spotifyUrl = reader.IsDBNull(11) ? null : reader.GetString(11);
 
             var key = GroupKey(artist, title);
             if (!byKey.TryGetValue(key, out var group))
@@ -478,7 +486,8 @@ LIMIT @limit;";
                     Title = title,
                     Artist = artist,
                     Isrc = isrc,
-                    Acrid = acrid
+                    Acrid = acrid,
+                    SpotifyUrl = spotifyUrl
                 };
                 byKey[key] = group;
                 groups.Add(group);
@@ -492,6 +501,11 @@ LIMIT @limit;";
                 group.Title = title;
                 group.Isrc = isrc ?? group.Isrc;
                 group.Acrid = acrid ?? group.Acrid;
+                group.SpotifyUrl = spotifyUrl ?? group.SpotifyUrl;
+            }
+            else
+            {
+                group.SpotifyUrl ??= spotifyUrl;
             }
 
             group.Occurrences.Add(new MusicTrackOccurrence
@@ -501,7 +515,8 @@ LIMIT @limit;";
                 MovieYear = reader.IsDBNull(7) ? null : reader.GetInt32(7),
                 StartTime = reader.GetDouble(8),
                 EndTime = reader.GetDouble(9),
-                Score = reader.IsDBNull(10) ? null : reader.GetDouble(10)
+                Score = reader.IsDBNull(10) ? null : reader.GetDouble(10),
+                Source = reader.IsDBNull(12) ? null : reader.GetString(12)
             });
         }
 
