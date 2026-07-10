@@ -14,6 +14,7 @@ namespace AdminPanelAPI.Controllers
         private readonly IMusicIdentificationJobRepository _jobRepository;
         private readonly IMusicJobQueue _jobQueue;
         private readonly ISoundtrackReconciliationService _reconciliationService;
+        private readonly IStreamingLinkService _streamingLinkService;
         private readonly IConfiguration _configuration;
         private readonly ILogger<MusicIdentificationController> _logger;
         private readonly string _connectionString;
@@ -29,12 +30,14 @@ namespace AdminPanelAPI.Controllers
             IMusicIdentificationJobRepository jobRepository,
             IMusicJobQueue jobQueue,
             ISoundtrackReconciliationService reconciliationService,
+            IStreamingLinkService streamingLinkService,
             IConfiguration configuration,
             ILogger<MusicIdentificationController> logger)
         {
             _jobRepository = jobRepository;
             _jobQueue = jobQueue;
             _reconciliationService = reconciliationService;
+            _streamingLinkService = streamingLinkService;
             _configuration = configuration;
             _logger = logger;
             _connectionString = configuration.GetConnectionString("Default")
@@ -223,6 +226,25 @@ namespace AdminPanelAPI.Controllers
             CancellationToken cancellationToken)
         {
             var result = await _reconciliationService.ReconcileAsync(movieId, cancellationToken);
+            return Ok(result);
+        }
+
+        /// <summary>
+        /// Backfill streaming links on a movie's identified tracks: search Spotify
+        /// for each (title, artist) with a similarity guard, store the matched
+        /// Spotify URL, and derive a universal all-services link (song.link).
+        /// Non-destructive — only fills links. Pass force=true to re-resolve
+        /// tracks that already have links.
+        /// </summary>
+        [HttpPost("streaming-links/{movieId:int}")]
+        public async Task<IActionResult> BackfillStreamingLinks(
+            int movieId,
+            [FromQuery] bool force = false,
+            CancellationToken cancellationToken = default)
+        {
+            var result = await _streamingLinkService.BackfillAsync(movieId, force, cancellationToken);
+            if (!result.CredentialsConfigured)
+                return StatusCode(503, new { error = "Spotify credentials not configured on the server." });
             return Ok(result);
         }
 

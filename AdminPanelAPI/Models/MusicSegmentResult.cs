@@ -16,6 +16,7 @@ namespace AdminPanelAPI.Models
         public double? Score { get; set; }
         public string? Source { get; set; }
         public string? SpotifyUrl { get; set; }
+        public string? StreamingUrl { get; set; }
         public string? Confidence { get; set; }
     }
 }
