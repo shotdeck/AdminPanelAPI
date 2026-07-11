@@ -214,20 +214,42 @@ namespace AdminPanelAPI.Services
         private async Task<string?> ResolveUniversalAsync(string spotifyUrl, CancellationToken cancellationToken)
         {
             var url = "https://api.song.link/v1-alpha.1/links?userCountry=US&url=" + Uri.EscapeDataString(spotifyUrl);
-            try
+
+            // Odesli's free tier is aggressively rate-limited (~10 req/min); a
+            // burst backfill hits 429 constantly. Retry on 429/5xx honoring
+            // Retry-After (capped) so universal links actually populate.
+            for (var attempt = 0; attempt < 4; attempt++)
             {
-                using var resp = await _http.GetAsync(url, cancellationToken);
-                if (!resp.IsSuccessStatusCode)
+                try
+                {
+                    using var resp = await _http.GetAsync(url, cancellationToken);
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        var json = await resp.Content.ReadAsStringAsync(cancellationToken);
+                        using var doc = JsonDocument.Parse(json);
+                        return doc.RootElement.TryGetProperty("pageUrl", out var p) ? p.GetString() : null;
+                    }
+
+                    var status = (int)resp.StatusCode;
+                    var retryable = status == 429 || status >= 500;
+                    if (!retryable || attempt == 3)
+                        return null;
+
+                    var delay = resp.Headers.RetryAfter?.Delta
+                        ?? TimeSpan.FromSeconds(Math.Min(8, Math.Pow(2, attempt + 1)));
+                    await Task.Delay(delay, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Odesli lookup failed for {Url}", spotifyUrl);
                     return null;
-                var json = await resp.Content.ReadAsStringAsync(cancellationToken);
-                using var doc = JsonDocument.Parse(json);
-                return doc.RootElement.TryGetProperty("pageUrl", out var p) ? p.GetString() : null;
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Odesli lookup failed for {Url}", spotifyUrl);
-                return null;
-            }
+            return null;
         }
 
         private static HashSet<string> Tokens(string? value)
