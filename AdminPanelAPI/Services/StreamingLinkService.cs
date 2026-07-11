@@ -123,7 +123,7 @@ namespace AdminPanelAPI.Services
                     StreamingUrl = universal
                 });
 
-                if (pending.Count >= 10)
+                if (pending.Count >= 3)
                     await FlushAsync();
             }
 
@@ -266,9 +266,12 @@ namespace AdminPanelAPI.Services
                 url += "&key=" + Uri.EscapeDataString(apiKey);
 
             // Odesli's free tier is aggressively rate-limited (~10 req/min); a
-            // burst backfill hits 429 constantly. Retry on 429/5xx honoring
-            // Retry-After (capped) so universal links actually populate.
-            for (var attempt = 0; attempt < 4; attempt++)
+            // burst backfill hits 429 constantly. Retry on 429/5xx but cap the
+            // wait so a single request stays well under the gateway timeout and
+            // keeps making progress — links that don't resolve this pass fill in
+            // on the next (idempotent) run. A configured API key lifts the limit,
+            // so retries are rarely needed then.
+            for (var attempt = 0; attempt < 3; attempt++)
             {
                 try
                 {
@@ -282,11 +285,11 @@ namespace AdminPanelAPI.Services
 
                     var status = (int)resp.StatusCode;
                     var retryable = status == 429 || status >= 500;
-                    if (!retryable || attempt == 3)
+                    if (!retryable || attempt == 2)
                         return null;
 
-                    var delay = resp.Headers.RetryAfter?.Delta
-                        ?? TimeSpan.FromSeconds(Math.Min(8, Math.Pow(2, attempt + 1)));
+                    var suggested = resp.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(attempt + 1);
+                    var delay = suggested > TimeSpan.FromSeconds(3) ? TimeSpan.FromSeconds(3) : suggested;
                     await Task.Delay(delay, cancellationToken);
                 }
                 catch (OperationCanceledException)
