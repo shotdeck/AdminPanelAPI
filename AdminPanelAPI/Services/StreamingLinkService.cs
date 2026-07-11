@@ -71,28 +71,49 @@ namespace AdminPanelAPI.Services
             var songs = await _repository.GetMovieSongRowsWithLinksAsync(movieId, cancellationToken);
             result.TotalTracks = songs.Count;
 
-            var updates = new Dictionary<long, (string? spotifyUrl, string? streamingUrl)>();
+            var odesliKey = _configuration["Odesli:ApiKey"] ?? _configuration["ODESLI_API_KEY"];
+
+            // Flush links to the DB in batches so partial progress survives even
+            // if the request is cut short (Odesli's free tier is slow enough that
+            // a large movie can otherwise run long). Re-running is idempotent.
+            var pending = new Dictionary<long, (string? spotifyUrl, string? streamingUrl)>();
+            async Task FlushAsync()
+            {
+                if (pending.Count == 0) return;
+                await _repository.SetSongLinksAsync(pending, cancellationToken);
+                pending.Clear();
+            }
+
             foreach (var song in songs)
             {
-                if (!force && !string.IsNullOrWhiteSpace(song.SpotifyUrl) && !string.IsNullOrWhiteSpace(song.StreamingUrl))
+                var haveSpotify = !string.IsNullOrWhiteSpace(song.SpotifyUrl);
+                var haveUniversal = !string.IsNullOrWhiteSpace(song.StreamingUrl);
+                if (!force && haveSpotify && haveUniversal)
                 {
                     result.Skipped++;
                     continue;
                 }
 
-                var spotifyUrl = await SearchSpotifyAsync(song.Title, song.Artist, token, cancellationToken);
-                if (spotifyUrl == null)
+                // Reuse the stored Spotify link when present; only search when we
+                // don't have one (or force). This makes universal-link-only
+                // re-runs cheap — no wasted Spotify calls.
+                var spotifyUrl = (!force && haveSpotify)
+                    ? song.SpotifyUrl
+                    : await SearchSpotifyAsync(song.Title, song.Artist, token, cancellationToken);
+                if (string.IsNullOrWhiteSpace(spotifyUrl))
                 {
                     result.Unmatched++;
                     continue;
                 }
 
                 result.ResolvedSpotify++;
-                string? universal = await ResolveUniversalAsync(spotifyUrl, cancellationToken);
-                if (universal != null)
+                var universal = (!force && haveUniversal)
+                    ? song.StreamingUrl
+                    : await ResolveUniversalAsync(spotifyUrl, odesliKey, cancellationToken);
+                if (!string.IsNullOrWhiteSpace(universal))
                     result.ResolvedUniversal++;
 
-                updates[song.SongId] = (spotifyUrl, universal);
+                pending[song.SongId] = (spotifyUrl, universal);
                 result.Linked.Add(new StreamingLinkedTrack
                 {
                     SongId = song.SongId,
@@ -101,9 +122,12 @@ namespace AdminPanelAPI.Services
                     SpotifyUrl = spotifyUrl,
                     StreamingUrl = universal
                 });
+
+                if (pending.Count >= 10)
+                    await FlushAsync();
             }
 
-            await _repository.SetSongLinksAsync(updates, cancellationToken);
+            await FlushAsync();
             return result;
         }
 
@@ -235,9 +259,11 @@ namespace AdminPanelAPI.Services
         /// track. Best-effort: returns null (and never throws) on any failure so a
         /// missing universal link never blocks storing the Spotify link.
         /// </summary>
-        private async Task<string?> ResolveUniversalAsync(string spotifyUrl, CancellationToken cancellationToken)
+        private async Task<string?> ResolveUniversalAsync(string spotifyUrl, string? apiKey, CancellationToken cancellationToken)
         {
             var url = "https://api.song.link/v1-alpha.1/links?userCountry=US&url=" + Uri.EscapeDataString(spotifyUrl);
+            if (!string.IsNullOrWhiteSpace(apiKey))
+                url += "&key=" + Uri.EscapeDataString(apiKey);
 
             // Odesli's free tier is aggressively rate-limited (~10 req/min); a
             // burst backfill hits 429 constantly. Retry on 429/5xx honoring
