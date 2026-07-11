@@ -139,6 +139,8 @@ namespace AdminPanelAPI.Services
             {
                 $"{movieTitle} (soundtrack)",
                 $"{movieTitle} (film score)",
+                $"{movieTitle}: Original Motion Picture Soundtrack",
+                $"{movieTitle} (Original Motion Picture Soundtrack)",
                 $"Music of {movieTitle}",
                 $"Music of the {movieTitle} franchise",
                 year.HasValue ? $"{movieTitle} ({year} film)" : $"{movieTitle} (film)"
@@ -181,7 +183,13 @@ namespace AdminPanelAPI.Services
                 var titles = new List<string>();
                 foreach (var h in hits.EnumerateArray())
                     titles.Add(h.GetProperty("title").GetString() ?? "");
-                return titles.Where(t => t.Length > 0).ToList();
+                // Only trust search hits that actually reference this film, so a
+                // vague search doesn't reconcile against an unrelated article
+                // (e.g. "Bridesmaids" -> "My Best Friend's Wedding").
+                var movieLower = movieTitle.ToLowerInvariant();
+                return titles
+                    .Where(t => t.Length > 0 && t.ToLowerInvariant().Contains(movieLower))
+                    .ToList();
             }
             catch (Exception ex)
             {
@@ -269,10 +277,26 @@ namespace AdminPanelAPI.Services
                 foreach (Match m in Regex.Matches(block, @"\|\s*extra(\d+)\s*=\s*([^\n]+)"))
                     extras[m.Groups[1].Value] = Clean(m.Groups[2].Value);
 
+                // Score albums list only titles (all by one composer), so their
+                // per-track "extra" performer is empty. Fall back to the album's
+                // infobox artist for those, so e.g. every Hildur Guðnadóttir cue
+                // on the Joker score confirms. Skipped for "various artists"
+                // compilations, whose per-track extras are authoritative.
+                var albumArtist = "";
+                var aim = Regex.Match(wikitext, @"\|\s*artist\s*=\s*([^\n]+)");
+                if (aim.Success)
+                {
+                    var aa = Clean(aim.Groups[1].Value);
+                    if (!aa.ToLowerInvariant().Contains("various"))
+                        albumArtist = aa;
+                }
+
                 var movieLower = movieTitle.ToLowerInvariant();
                 foreach (var (k, title) in titles)
                 {
-                    var artist = extras.TryGetValue(k, out var a) ? a : "";
+                    var artist = extras.TryGetValue(k, out var a) && !string.IsNullOrWhiteSpace(a)
+                        ? a
+                        : albumArtist;
                     // Skip score-only cues whose "performer" is really the film name.
                     if (!string.IsNullOrWhiteSpace(artist) &&
                         !artist.ToLowerInvariant().Contains(movieLower))

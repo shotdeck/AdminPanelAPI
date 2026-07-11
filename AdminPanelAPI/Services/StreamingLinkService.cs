@@ -157,16 +157,13 @@ namespace AdminPanelAPI.Services
 
             try
             {
-                using var req = new HttpRequestMessage(HttpMethod.Get, url);
-                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                using var resp = await _http.SendAsync(req, cancellationToken);
-                if (!resp.IsSuccessStatusCode)
+                var json = await GetWithRetryAsync(url, token, cancellationToken);
+                if (json == null)
                 {
-                    _logger.LogDebug("Spotify search failed ({Status}) for {Query}", (int)resp.StatusCode, query);
+                    _logger.LogDebug("Spotify search failed for {Query}", query);
                     return null;
                 }
 
-                var json = await resp.Content.ReadAsStringAsync(cancellationToken);
                 using var doc = JsonDocument.Parse(json);
                 if (!doc.RootElement.TryGetProperty("tracks", out var tracks) ||
                     !tracks.TryGetProperty("items", out var items))
@@ -207,6 +204,33 @@ namespace AdminPanelAPI.Services
         }
 
         /// <summary>
+        /// GET a Spotify API endpoint, retrying on 429/5xx honoring Retry-After
+        /// (capped) so a burst backfill doesn't drop tracks when the search API
+        /// rate-limits. Returns the body on success, else null.
+        /// </summary>
+        private async Task<string?> GetWithRetryAsync(string url, string token, CancellationToken cancellationToken)
+        {
+            for (var attempt = 0; attempt < 4; attempt++)
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                using var resp = await _http.SendAsync(req, cancellationToken);
+                if (resp.IsSuccessStatusCode)
+                    return await resp.Content.ReadAsStringAsync(cancellationToken);
+
+                var status = (int)resp.StatusCode;
+                var retryable = status == 429 || status >= 500;
+                if (!retryable || attempt == 3)
+                    return null;
+
+                var delay = resp.Headers.RetryAfter?.Delta
+                    ?? TimeSpan.FromSeconds(Math.Min(8, Math.Pow(2, attempt + 1)));
+                await Task.Delay(delay, cancellationToken);
+            }
+            return null;
+        }
+
+        /// <summary>
         /// Ask Odesli / song.link for a universal all-services page for a Spotify
         /// track. Best-effort: returns null (and never throws) on any failure so a
         /// missing universal link never blocks storing the Spotify link.
@@ -214,20 +238,42 @@ namespace AdminPanelAPI.Services
         private async Task<string?> ResolveUniversalAsync(string spotifyUrl, CancellationToken cancellationToken)
         {
             var url = "https://api.song.link/v1-alpha.1/links?userCountry=US&url=" + Uri.EscapeDataString(spotifyUrl);
-            try
+
+            // Odesli's free tier is aggressively rate-limited (~10 req/min); a
+            // burst backfill hits 429 constantly. Retry on 429/5xx honoring
+            // Retry-After (capped) so universal links actually populate.
+            for (var attempt = 0; attempt < 4; attempt++)
             {
-                using var resp = await _http.GetAsync(url, cancellationToken);
-                if (!resp.IsSuccessStatusCode)
+                try
+                {
+                    using var resp = await _http.GetAsync(url, cancellationToken);
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        var json = await resp.Content.ReadAsStringAsync(cancellationToken);
+                        using var doc = JsonDocument.Parse(json);
+                        return doc.RootElement.TryGetProperty("pageUrl", out var p) ? p.GetString() : null;
+                    }
+
+                    var status = (int)resp.StatusCode;
+                    var retryable = status == 429 || status >= 500;
+                    if (!retryable || attempt == 3)
+                        return null;
+
+                    var delay = resp.Headers.RetryAfter?.Delta
+                        ?? TimeSpan.FromSeconds(Math.Min(8, Math.Pow(2, attempt + 1)));
+                    await Task.Delay(delay, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Odesli lookup failed for {Url}", spotifyUrl);
                     return null;
-                var json = await resp.Content.ReadAsStringAsync(cancellationToken);
-                using var doc = JsonDocument.Parse(json);
-                return doc.RootElement.TryGetProperty("pageUrl", out var p) ? p.GetString() : null;
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Odesli lookup failed for {Url}", spotifyUrl);
-                return null;
-            }
+            return null;
         }
 
         private static HashSet<string> Tokens(string? value)
