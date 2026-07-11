@@ -270,9 +270,16 @@ namespace AdminPanelAPI.Services
                 if (!retryable || attempt == 3)
                     return null;
 
-                var delay = resp.Headers.RetryAfter?.Delta
+                // Spotify answers 429 with a Retry-After that can be *hours* once
+                // an app trips its quota. Never sleep that long inside a request
+                // (it hangs until the gateway timeout and only deepens the ban):
+                // if the cooldown is more than a few seconds, give up now and let
+                // a later run retry. Cap short transient waits too.
+                var suggested = resp.Headers.RetryAfter?.Delta
                     ?? TimeSpan.FromSeconds(Math.Min(8, Math.Pow(2, attempt + 1)));
-                await Task.Delay(delay, cancellationToken);
+                if (suggested > TimeSpan.FromSeconds(5))
+                    return null;
+                await Task.Delay(suggested, cancellationToken);
             }
             return null;
         }
