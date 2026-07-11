@@ -33,7 +33,9 @@ namespace AdminPanelAPI.Services
             _http = http;
             _logger = logger;
             if (!_http.DefaultRequestHeaders.Contains("User-Agent"))
-                _http.DefaultRequestHeaders.Add("User-Agent", "shotdeck-music/1.0 (reconciliation)");
+                _http.DefaultRequestHeaders.Add(
+                    "User-Agent",
+                    "ShotDeckMusicReconciliation/1.0 (https://www.shotdeck.com; music-id@shotdeck.com)");
         }
 
         public async Task<ReconcileResult> ReconcileAsync(int movieId, CancellationToken cancellationToken)
@@ -113,7 +115,11 @@ namespace AdminPanelAPI.Services
                 }
             }
 
-            await _repository.SetSongConfidenceAsync(movieId, confidenceBySongId, cancellationToken);
+            // Only persist when we actually resolved a soundtrack. If Wikipedia
+            // was unreachable/rate-limited (no pairs), skip the write so we never
+            // clobber existing good tags with a batch of "unverified".
+            if (result.SoundtrackFound)
+                await _repository.SetSongConfidenceAsync(movieId, confidenceBySongId, cancellationToken);
 
             result.ConfirmedCount = result.Confirmed.Count;
             result.ReviewCount = result.Review.Count;
@@ -138,10 +144,6 @@ namespace AdminPanelAPI.Services
                 year.HasValue ? $"{movieTitle} ({year} film)" : $"{movieTitle} (film)"
             };
 
-            foreach (var extra in await SearchCandidatesAsync(movieTitle, cancellationToken))
-                if (!candidates.Contains(extra))
-                    candidates.Add(extra);
-
             foreach (var candidate in candidates)
             {
                 var wikitext = await FetchWikitextAsync(candidate, cancellationToken);
@@ -149,6 +151,18 @@ namespace AdminPanelAPI.Services
                 var pairs = ExtractPairs(wikitext, movieTitle);
                 if (pairs.Count > 0)
                     return (candidate, pairs);
+            }
+
+            // Search fallback only if none of the direct guesses resolved a
+            // tracklist — keeps request volume (and rate-limit risk) down.
+            foreach (var extra in await SearchCandidatesAsync(movieTitle, cancellationToken))
+            {
+                if (candidates.Contains(extra)) continue;
+                var wikitext = await FetchWikitextAsync(extra, cancellationToken);
+                if (string.IsNullOrEmpty(wikitext)) continue;
+                var pairs = ExtractPairs(wikitext, movieTitle);
+                if (pairs.Count > 0)
+                    return (extra, pairs);
             }
 
             return (null, new List<(string, string)>());
@@ -160,7 +174,8 @@ namespace AdminPanelAPI.Services
                 + Uri.EscapeDataString($"{movieTitle} soundtrack") + "&srlimit=5&format=json";
             try
             {
-                var json = await _http.GetStringAsync(url, cancellationToken);
+                var json = await GetStringWithRetryAsync(url, cancellationToken);
+                if (json == null) return new List<string>();
                 using var doc = JsonDocument.Parse(json);
                 var hits = doc.RootElement.GetProperty("query").GetProperty("search");
                 var titles = new List<string>();
@@ -181,7 +196,8 @@ namespace AdminPanelAPI.Services
                 + Uri.EscapeDataString(page) + "&prop=wikitext&format=json&redirects=1";
             try
             {
-                var json = await _http.GetStringAsync(url, cancellationToken);
+                var json = await GetStringWithRetryAsync(url, cancellationToken);
+                if (json == null) return null;
                 using var doc = JsonDocument.Parse(json);
                 if (!doc.RootElement.TryGetProperty("parse", out var parse))
                     return null;
@@ -192,6 +208,42 @@ namespace AdminPanelAPI.Services
                 _logger.LogDebug(ex, "Wikipedia fetch failed for page {Page}", page);
                 return null;
             }
+        }
+
+        /// <summary>
+        /// GET a URL as a string, retrying on transient failures and HTTP 429
+        /// (Wikipedia rate limit) with exponential backoff. Returns null if all
+        /// attempts fail so callers can treat it as "unresolved" rather than throw.
+        /// </summary>
+        private async Task<string?> GetStringWithRetryAsync(string url, CancellationToken cancellationToken)
+        {
+            const int maxAttempts = 4;
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    using var resp = await _http.GetAsync(url, cancellationToken);
+                    if (resp.StatusCode == (System.Net.HttpStatusCode)429
+                        || (int)resp.StatusCode >= 500)
+                    {
+                        if (attempt < maxAttempts)
+                        {
+                            var wait = resp.Headers.RetryAfter?.Delta
+                                ?? TimeSpan.FromMilliseconds(500 * attempt * attempt);
+                            await Task.Delay(wait, cancellationToken);
+                            continue;
+                        }
+                        return null;
+                    }
+                    resp.EnsureSuccessStatusCode();
+                    return await resp.Content.ReadAsStringAsync(cancellationToken);
+                }
+                catch (Exception ex) when (attempt < maxAttempts && ex is not OperationCanceledException)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(500 * attempt * attempt), cancellationToken);
+                }
+            }
+            return null;
         }
 
         /// <summary>
