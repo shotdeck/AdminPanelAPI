@@ -30,6 +30,8 @@ namespace AdminPanelAPI.Models
         public long SongId { get; set; }
         public string? Title { get; set; }
         public string? Artist { get; set; }
+        public string? SpotifyUrl { get; set; }
+        public string? StreamingUrl { get; set; }
     }
 
     /// <summary>
@@ -66,6 +68,7 @@ namespace AdminPanelAPI.Models
         public string? Isrc { get; set; }
         public string? Acrid { get; set; }
         public string? SpotifyUrl { get; set; }
+        public string? StreamingUrl { get; set; }
         public string? Confidence { get; set; }
         public int OccurrenceCount { get; set; }
         public List<MusicTrackOccurrence> Occurrences { get; set; } = new();

@@ -79,6 +79,7 @@ builder.Services.AddSingleton<IMusicJobQueue, MusicJobQueue>();
 builder.Services.AddScoped<IMusicIdentificationJobRepository, MusicIdentificationJobRepository>();
 builder.Services.AddScoped<IMusicIdentificationService, MusicIdentificationService>();
 builder.Services.AddHttpClient<ISoundtrackReconciliationService, SoundtrackReconciliationService>();
+builder.Services.AddHttpClient<IStreamingLinkService, StreamingLinkService>();
 builder.Services.AddHostedService<MusicIdentificationWorker>();
 
 // Keyword warmup at startup (singleton, creates scope manually)
