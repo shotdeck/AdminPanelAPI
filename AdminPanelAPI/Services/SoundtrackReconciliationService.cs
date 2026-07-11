@@ -119,7 +119,20 @@ namespace AdminPanelAPI.Services
             // was unreachable/rate-limited (no pairs), skip the write so we never
             // clobber existing good tags with a batch of "unverified".
             if (result.SoundtrackFound)
+            {
                 await _repository.SetSongConfidenceAsync(movieId, confidenceBySongId, cancellationToken);
+
+                // Persist the resolved Wikipedia soundtrack article so the
+                // movie-level soundtrack card can link to it (COALESCE upsert,
+                // so it never clobbers the Spotify album fields).
+                if (!string.IsNullOrWhiteSpace(article))
+                    await _repository.UpsertMovieSoundtrackAsync(new MovieSoundtrack
+                    {
+                        MovieId = movieId,
+                        WikipediaUrl = "https://en.wikipedia.org/wiki/"
+                            + Uri.EscapeDataString(article.Replace(' ', '_'))
+                    }, cancellationToken);
+            }
 
             result.ConfirmedCount = result.Confirmed.Count;
             result.ReviewCount = result.Review.Count;

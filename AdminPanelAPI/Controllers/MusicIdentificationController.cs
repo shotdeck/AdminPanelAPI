@@ -205,12 +205,14 @@ namespace AdminPanelAPI.Controllers
             CancellationToken cancellationToken)
         {
             var tracks = await _jobRepository.GetMovieTracksAsync(movieId, cancellationToken);
+            var soundtrack = await _jobRepository.GetMovieSoundtrackAsync(movieId, cancellationToken);
 
             return Ok(new
             {
                 movieId,
                 trackCount = tracks.Count,
                 occurrenceCount = tracks.Sum(t => t.OccurrenceCount),
+                soundtrack,
                 tracks
             });
         }
