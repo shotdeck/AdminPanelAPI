@@ -17,6 +17,7 @@ namespace AdminPanelAPI.Models
         public string? Source { get; set; }
         public string? SpotifyUrl { get; set; }
         public string? StreamingUrl { get; set; }
+        public string? ArtworkUrl { get; set; }
         public string? Confidence { get; set; }
     }
 }

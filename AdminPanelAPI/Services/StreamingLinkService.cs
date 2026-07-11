@@ -75,7 +75,12 @@ namespace AdminPanelAPI.Services
 
             // Flush links to the DB in batches so partial progress survives even
             // if the request is cut short. Re-running is idempotent.
-            var pending = new Dictionary<long, (string? spotifyUrl, string? streamingUrl)>();
+            var pending = new Dictionary<long, (string? spotifyUrl, string? streamingUrl, string? artworkUrl)>();
+            void Stage(long id, string? sp, string? st, string? art)
+            {
+                pending.TryGetValue(id, out var cur);
+                pending[id] = (sp ?? cur.spotifyUrl, st ?? cur.streamingUrl, art ?? cur.artworkUrl);
+            }
             async Task FlushAsync()
             {
                 if (pending.Count == 0) return;
@@ -83,25 +88,47 @@ namespace AdminPanelAPI.Services
                 pending.Clear();
             }
 
+            // Resolve the official soundtrack album (name + Spotify album link +
+            // cover art) for the movie once, up front. Cheap (one search) and
+            // independent of the per-track work.
+            if (!string.IsNullOrWhiteSpace(movie?.Title))
+            {
+                var (albumName, albumUrl, albumArt) = await SearchSoundtrackAlbumAsync(movie.Title!, token, cancellationToken);
+                if (!string.IsNullOrWhiteSpace(albumUrl) || !string.IsNullOrWhiteSpace(albumArt))
+                    await _repository.UpsertMovieSoundtrackAsync(new MovieSoundtrack
+                    {
+                        MovieId = movieId,
+                        AlbumName = albumName,
+                        SpotifyUrl = albumUrl,
+                        ArtworkUrl = albumArt
+                    }, cancellationToken);
+            }
+
             // Phase 1 — resolve and persist Spotify links first. This is fast and
             // must never be blocked by Odesli, which is slow/flaky on its free
             // tier: a track with a Spotify link is the primary deliverable.
-            var needUniversal = new List<(long songId, string spotifyUrl, string? title, string? artist)>();
+            var needUniversal = new List<(long songId, string spotifyUrl)>();
+            var needArtwork = new List<(long songId, string spotifyUrl)>();
             foreach (var song in songs)
             {
                 var haveSpotify = !string.IsNullOrWhiteSpace(song.SpotifyUrl);
                 var haveUniversal = !string.IsNullOrWhiteSpace(song.StreamingUrl);
-                if (!force && haveSpotify && haveUniversal)
+                var haveArtwork = !string.IsNullOrWhiteSpace(song.ArtworkUrl);
+                if (!force && haveSpotify && haveUniversal && haveArtwork)
                 {
                     result.Skipped++;
                     continue;
                 }
 
                 // Reuse the stored Spotify link when present; only search when we
-                // don't have one (or force).
-                var spotifyUrl = (!force && haveSpotify)
-                    ? song.SpotifyUrl
-                    : await SearchSpotifyAsync(song.Title, song.Artist, token, cancellationToken);
+                // don't have one (or force). A fresh search also yields cover art.
+                string? spotifyUrl;
+                string? artworkUrl = null;
+                if (!force && haveSpotify)
+                    spotifyUrl = song.SpotifyUrl;
+                else
+                    (spotifyUrl, artworkUrl) = await SearchSpotifyAsync(song.Title, song.Artist, token, cancellationToken);
+
                 if (string.IsNullOrWhiteSpace(spotifyUrl))
                 {
                     result.Unmatched++;
@@ -109,24 +136,37 @@ namespace AdminPanelAPI.Services
                 }
 
                 result.ResolvedSpotify++;
-                if (!haveSpotify)
+                var newSpotify = haveSpotify ? null : spotifyUrl;
+                var newArtwork = (!haveArtwork && !string.IsNullOrWhiteSpace(artworkUrl)) ? artworkUrl : null;
+                if (newSpotify != null || newArtwork != null)
                 {
-                    pending[song.SongId] = (spotifyUrl, null);
-                    result.Linked.Add(new StreamingLinkedTrack
-                    {
-                        SongId = song.SongId,
-                        Title = song.Title,
-                        Artist = song.Artist,
-                        SpotifyUrl = spotifyUrl,
-                        StreamingUrl = null
-                    });
+                    Stage(song.SongId, newSpotify, null, newArtwork);
+                    if (newSpotify != null)
+                        result.Linked.Add(new StreamingLinkedTrack
+                        {
+                            SongId = song.SongId,
+                            Title = song.Title,
+                            Artist = song.Artist,
+                            SpotifyUrl = spotifyUrl,
+                            StreamingUrl = null
+                        });
                     if (pending.Count >= 5)
                         await FlushAsync();
                 }
 
+                // Still missing cover art (had a link, or the search returned
+                // none) — fill it cheaply in a batch lookup below.
+                if (!haveArtwork && string.IsNullOrWhiteSpace(newArtwork))
+                    needArtwork.Add((song.SongId, spotifyUrl!));
+
                 if (force || !haveUniversal)
-                    needUniversal.Add((song.SongId, spotifyUrl!, song.Title, song.Artist));
+                    needUniversal.Add((song.SongId, spotifyUrl!));
             }
+            await FlushAsync();
+
+            // Phase 1b — fill cover art for tracks that have a Spotify link but no
+            // stored artwork, via a batched /tracks lookup (up to 50 ids/call).
+            await FillArtworkAsync(needArtwork, token, Stage, FlushAsync, cancellationToken);
             await FlushAsync();
 
             // Phase 2 — best-effort universal links via Odesli, under a wall-clock
@@ -144,7 +184,7 @@ namespace AdminPanelAPI.Services
                     continue;
 
                 result.ResolvedUniversal++;
-                pending[item.songId] = (item.spotifyUrl, universal);
+                Stage(item.songId, null, universal, null);
                 if (pending.Count >= 5)
                     await FlushAsync();
             }
@@ -190,12 +230,13 @@ namespace AdminPanelAPI.Services
 
         /// <summary>
         /// Search Spotify by "artist title" and return the first hit whose artist
-        /// and title both clear the similarity guard, else null.
+        /// and title both clear the similarity guard: its Spotify URL plus the
+        /// album cover art URL. Both null when nothing clears the guard.
         /// </summary>
-        private async Task<string?> SearchSpotifyAsync(string? title, string? artist, string token, CancellationToken cancellationToken)
+        private async Task<(string? spotifyUrl, string? artworkUrl)> SearchSpotifyAsync(string? title, string? artist, string token, CancellationToken cancellationToken)
         {
             if (string.IsNullOrWhiteSpace(title))
-                return null;
+                return (null, null);
 
             var query = string.IsNullOrWhiteSpace(artist) ? title : $"{artist} {title}";
             var url = "https://api.spotify.com/v1/search?type=track&limit=5&q=" + Uri.EscapeDataString(query);
@@ -206,13 +247,13 @@ namespace AdminPanelAPI.Services
                 if (json == null)
                 {
                     _logger.LogDebug("Spotify search failed for {Query}", query);
-                    return null;
+                    return (null, null);
                 }
 
                 using var doc = JsonDocument.Parse(json);
                 if (!doc.RootElement.TryGetProperty("tracks", out var tracks) ||
                     !tracks.TryGetProperty("items", out var items))
-                    return null;
+                    return (null, null);
 
                 var titleTokens = Tokens(title);
                 var artistTokens = Tokens(artist);
@@ -236,16 +277,145 @@ namespace AdminPanelAPI.Services
                     if (titleOk && artistOk &&
                         item.TryGetProperty("external_urls", out var ext) &&
                         ext.TryGetProperty("spotify", out var sp))
-                        return sp.GetString();
+                        return (sp.GetString(), ExtractAlbumArt(item));
                 }
 
-                return null;
+                return (null, null);
             }
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "Spotify search threw for {Query}", query);
-                return null;
+                return (null, null);
             }
+        }
+
+        /// <summary>
+        /// Find the film's official soundtrack album on Spotify and return its
+        /// name, album URL and cover art. Guarded so an unrelated album isn't
+        /// attached: the album name must reference the film or clearly read as a
+        /// soundtrack/score.
+        /// </summary>
+        private async Task<(string? name, string? spotifyUrl, string? artworkUrl)> SearchSoundtrackAlbumAsync(
+            string movieTitle, string token, CancellationToken cancellationToken)
+        {
+            var query = $"{movieTitle} original motion picture soundtrack";
+            var url = "https://api.spotify.com/v1/search?type=album&limit=5&q=" + Uri.EscapeDataString(query);
+
+            try
+            {
+                var json = await GetWithRetryAsync(url, token, cancellationToken);
+                if (json == null) return (null, null, null);
+
+                using var doc = JsonDocument.Parse(json);
+                if (!doc.RootElement.TryGetProperty("albums", out var albums) ||
+                    !albums.TryGetProperty("items", out var items))
+                    return (null, null, null);
+
+                var movieTokens = Tokens(movieTitle);
+                foreach (var item in items.EnumerateArray())
+                {
+                    var name = item.TryGetProperty("name", out var n) ? n.GetString() : null;
+                    if (string.IsNullOrWhiteSpace(name)) continue;
+
+                    var lower = name.ToLowerInvariant();
+                    var looksLikeOst = lower.Contains("soundtrack") || lower.Contains("motion picture")
+                        || lower.Contains("original score") || lower.Contains("music from");
+                    // Require the album to reference the film title, else only
+                    // accept it when it explicitly reads as a soundtrack.
+                    var nameOk = Overlap(movieTokens, Tokens(name)) >= 0.5 || looksLikeOst;
+                    if (!nameOk) continue;
+
+                    var albumUrl = item.TryGetProperty("external_urls", out var ext)
+                        && ext.TryGetProperty("spotify", out var sp) ? sp.GetString() : null;
+                    return (name, albumUrl, ExtractAlbumArt(item));
+                }
+
+                return (null, null, null);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Spotify album search threw for {Movie}", movieTitle);
+                return (null, null, null);
+            }
+        }
+
+        /// <summary>
+        /// Fill cover art for tracks that already have a Spotify link but no
+        /// stored artwork, using batched GET /v1/tracks?ids= (up to 50 per call)
+        /// so it costs one request per 50 tracks rather than one per track.
+        /// </summary>
+        private async Task FillArtworkAsync(
+            List<(long songId, string spotifyUrl)> need,
+            string token,
+            Action<long, string?, string?, string?> stage,
+            Func<Task> flush,
+            CancellationToken cancellationToken)
+        {
+            if (need.Count == 0) return;
+
+            // Map Spotify track id -> the song rows that use it.
+            var bySpotifyId = new Dictionary<string, List<long>>();
+            foreach (var (songId, spotifyUrl) in need)
+            {
+                var id = ExtractTrackId(spotifyUrl);
+                if (id == null) continue;
+                if (!bySpotifyId.TryGetValue(id, out var list))
+                    bySpotifyId[id] = list = new List<long>();
+                list.Add(songId);
+            }
+
+            var ids = bySpotifyId.Keys.ToList();
+            for (var i = 0; i < ids.Count; i += 50)
+            {
+                var batch = ids.Skip(i).Take(50).ToList();
+                var url = "https://api.spotify.com/v1/tracks?ids=" + string.Join(",", batch);
+                var json = await GetWithRetryAsync(url, token, cancellationToken);
+                if (json == null) continue;
+
+                try
+                {
+                    using var doc = JsonDocument.Parse(json);
+                    if (!doc.RootElement.TryGetProperty("tracks", out var tracks)) continue;
+                    foreach (var t in tracks.EnumerateArray())
+                    {
+                        if (t.ValueKind != JsonValueKind.Object) continue;
+                        var id = t.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
+                        var art = ExtractAlbumArt(t);
+                        if (id == null || string.IsNullOrWhiteSpace(art)) continue;
+                        if (!bySpotifyId.TryGetValue(id, out var songIds)) continue;
+                        foreach (var songId in songIds)
+                            stage(songId, null, null, art);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Spotify batch tracks parse failed");
+                }
+
+                await flush();
+            }
+        }
+
+        private static string? ExtractTrackId(string spotifyUrl)
+        {
+            var m = Regex.Match(spotifyUrl, @"track[/:]([A-Za-z0-9]+)");
+            return m.Success ? m.Groups[1].Value : null;
+        }
+
+        /// <summary>Largest album cover image URL from a track/album JSON element.</summary>
+        private static string? ExtractAlbumArt(JsonElement item)
+        {
+            var album = item;
+            if (item.TryGetProperty("album", out var a))
+                album = a;
+            if (album.TryGetProperty("images", out var imgs) && imgs.ValueKind == JsonValueKind.Array
+                && imgs.GetArrayLength() > 0)
+            {
+                var first = imgs[0];
+                if (first.TryGetProperty("url", out var u))
+                    return u.GetString();
+            }
+            return null;
         }
 
         /// <summary>

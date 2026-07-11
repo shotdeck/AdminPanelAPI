@@ -32,6 +32,17 @@ namespace AdminPanelAPI.Models
         public string? Artist { get; set; }
         public string? SpotifyUrl { get; set; }
         public string? StreamingUrl { get; set; }
+        public string? ArtworkUrl { get; set; }
+    }
+
+    /// <summary>A movie's official soundtrack album (for display at movie level).</summary>
+    public class MovieSoundtrack
+    {
+        public int MovieId { get; set; }
+        public string? AlbumName { get; set; }
+        public string? SpotifyUrl { get; set; }
+        public string? ArtworkUrl { get; set; }
+        public string? WikipediaUrl { get; set; }
     }
 
     /// <summary>
@@ -69,6 +80,7 @@ namespace AdminPanelAPI.Models
         public string? Acrid { get; set; }
         public string? SpotifyUrl { get; set; }
         public string? StreamingUrl { get; set; }
+        public string? ArtworkUrl { get; set; }
         public string? Confidence { get; set; }
         public int OccurrenceCount { get; set; }
         public List<MusicTrackOccurrence> Occurrences { get; set; } = new();

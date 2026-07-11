@@ -20,7 +20,9 @@ public interface IMusicIdentificationJobRepository
     Task<List<MovieSongRow>> GetMovieSongRowsAsync(int movieId, CancellationToken cancellationToken);
     Task SetSongConfidenceAsync(int movieId, IReadOnlyDictionary<long, string> confidenceBySongId, CancellationToken cancellationToken);
     Task<List<MovieSongRow>> GetMovieSongRowsWithLinksAsync(int movieId, CancellationToken cancellationToken);
-    Task SetSongLinksAsync(IReadOnlyDictionary<long, (string? spotifyUrl, string? streamingUrl)> linksBySongId, CancellationToken cancellationToken);
+    Task SetSongLinksAsync(IReadOnlyDictionary<long, (string? spotifyUrl, string? streamingUrl, string? artworkUrl)> linksBySongId, CancellationToken cancellationToken);
+    Task<MovieSoundtrack?> GetMovieSoundtrackAsync(int movieId, CancellationToken cancellationToken);
+    Task UpsertMovieSoundtrackAsync(MovieSoundtrack soundtrack, CancellationToken cancellationToken);
 }
 
 public class MusicIdentificationJobRepository : IMusicIdentificationJobRepository
@@ -286,7 +288,7 @@ RETURNING id;";
         const string sql = @"
 SELECT s.movieid, s.start_time, s.end_time, s.matched,
        so.title, ar.name AS artist, so.acrid, so.isrc, s.score,
-       s.source, so.spotify_url, s.confidence, so.streaming_url
+       s.source, so.spotify_url, s.confidence, so.streaming_url, so.artwork_url
 FROM frl.frl_join_movies_music_segments s
 LEFT JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
@@ -317,7 +319,8 @@ ORDER BY s.start_time;";
                 Source = reader.IsDBNull(9) ? null : reader.GetString(9),
                 SpotifyUrl = reader.IsDBNull(10) ? null : reader.GetString(10),
                 Confidence = reader.IsDBNull(11) ? null : reader.GetString(11),
-                StreamingUrl = reader.IsDBNull(12) ? null : reader.GetString(12)
+                StreamingUrl = reader.IsDBNull(12) ? null : reader.GetString(12),
+                ArtworkUrl = reader.IsDBNull(13) ? null : reader.GetString(13)
             });
         }
 
@@ -329,7 +332,7 @@ ORDER BY s.start_time;";
         const string sql = @"
 SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
        s.movieid, m.title AS movie_title, m.year AS movie_year,
-       s.start_time, s.end_time, s.score, so.spotify_url, s.source, s.confidence, so.streaming_url
+       s.start_time, s.end_time, s.score, so.spotify_url, s.source, s.confidence, so.streaming_url, so.artwork_url
 FROM frl.frl_join_movies_music_segments s
 JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
@@ -354,7 +357,7 @@ LIMIT @limit;";
         const string sql = @"
 SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
        s.movieid, m.title AS movie_title, m.year AS movie_year,
-       s.start_time, s.end_time, s.score, so.spotify_url, s.source, s.confidence, so.streaming_url
+       s.start_time, s.end_time, s.score, so.spotify_url, s.source, s.confidence, so.streaming_url, so.artwork_url
 FROM frl.frl_join_movies_music_segments s
 JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
@@ -549,7 +552,7 @@ WHERE movieid = @movieid AND song_id = @song_id;";
     public async Task<List<MovieSongRow>> GetMovieSongRowsWithLinksAsync(int movieId, CancellationToken cancellationToken)
     {
         const string sql = @"
-SELECT DISTINCT so.id, so.title, ar.name AS artist, so.spotify_url, so.streaming_url
+SELECT DISTINCT so.id, so.title, ar.name AS artist, so.spotify_url, so.streaming_url, so.artwork_url
 FROM frl.frl_join_movies_music_segments s
 JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
@@ -571,7 +574,8 @@ WHERE s.matched = true AND s.movieid = @movieid;";
                 Title = reader.IsDBNull(1) ? null : reader.GetString(1),
                 Artist = reader.IsDBNull(2) ? null : reader.GetString(2),
                 SpotifyUrl = reader.IsDBNull(3) ? null : reader.GetString(3),
-                StreamingUrl = reader.IsDBNull(4) ? null : reader.GetString(4)
+                StreamingUrl = reader.IsDBNull(4) ? null : reader.GetString(4),
+                ArtworkUrl = reader.IsDBNull(5) ? null : reader.GetString(5)
             });
         }
 
@@ -579,7 +583,7 @@ WHERE s.matched = true AND s.movieid = @movieid;";
     }
 
     public async Task SetSongLinksAsync(
-        IReadOnlyDictionary<long, (string? spotifyUrl, string? streamingUrl)> linksBySongId,
+        IReadOnlyDictionary<long, (string? spotifyUrl, string? streamingUrl, string? artworkUrl)> linksBySongId,
         CancellationToken cancellationToken)
     {
         if (linksBySongId.Count == 0)
@@ -588,7 +592,8 @@ WHERE s.matched = true AND s.movieid = @movieid;";
         const string sql = @"
 UPDATE frl.frl_music_songs
 SET spotify_url = COALESCE(@spotify_url, spotify_url),
-    streaming_url = COALESCE(@streaming_url, streaming_url)
+    streaming_url = COALESCE(@streaming_url, streaming_url),
+    artwork_url = COALESCE(@artwork_url, artwork_url)
 WHERE id = @id;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -601,6 +606,7 @@ WHERE id = @id;";
                 await using var cmd = new NpgsqlCommand(sql, conn, tx);
                 cmd.Parameters.AddWithValue("spotify_url", (object?)links.spotifyUrl ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("streaming_url", (object?)links.streamingUrl ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("artwork_url", (object?)links.artworkUrl ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("id", songId);
                 await cmd.ExecuteNonQueryAsync(cancellationToken);
             }
@@ -612,6 +618,61 @@ WHERE id = @id;";
             await tx.RollbackAsync(cancellationToken);
             throw;
         }
+    }
+
+    public async Task<MovieSoundtrack?> GetMovieSoundtrackAsync(int movieId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT movieid, album_name, spotify_url, artwork_url, wikipedia_url
+FROM frl.frl_music_movie_soundtrack
+WHERE movieid = @movieid;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+            return null;
+
+        return new MovieSoundtrack
+        {
+            MovieId = reader.GetInt32(0),
+            AlbumName = reader.IsDBNull(1) ? null : reader.GetString(1),
+            SpotifyUrl = reader.IsDBNull(2) ? null : reader.GetString(2),
+            ArtworkUrl = reader.IsDBNull(3) ? null : reader.GetString(3),
+            WikipediaUrl = reader.IsDBNull(4) ? null : reader.GetString(4)
+        };
+    }
+
+    public async Task UpsertMovieSoundtrackAsync(MovieSoundtrack soundtrack, CancellationToken cancellationToken)
+    {
+        // COALESCE(EXCLUDED, existing) so the two writers never clobber each
+        // other: reconciliation fills the Wikipedia URL, the streaming-link
+        // backfill fills the Spotify album + cover art.
+        const string sql = @"
+INSERT INTO frl.frl_music_movie_soundtrack
+    (movieid, album_name, spotify_url, artwork_url, wikipedia_url, updated_at)
+VALUES (@movieid, @album_name, @spotify_url, @artwork_url, @wikipedia_url, now())
+ON CONFLICT (movieid) DO UPDATE SET
+    album_name    = COALESCE(EXCLUDED.album_name, frl.frl_music_movie_soundtrack.album_name),
+    spotify_url   = COALESCE(EXCLUDED.spotify_url, frl.frl_music_movie_soundtrack.spotify_url),
+    artwork_url   = COALESCE(EXCLUDED.artwork_url, frl.frl_music_movie_soundtrack.artwork_url),
+    wikipedia_url = COALESCE(EXCLUDED.wikipedia_url, frl.frl_music_movie_soundtrack.wikipedia_url),
+    updated_at    = now();";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", soundtrack.MovieId);
+        cmd.Parameters.AddWithValue("album_name", (object?)soundtrack.AlbumName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("spotify_url", (object?)soundtrack.SpotifyUrl ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("artwork_url", (object?)soundtrack.ArtworkUrl ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("wikipedia_url", (object?)soundtrack.WikipediaUrl ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
     /// <summary>
@@ -638,6 +699,7 @@ WHERE id = @id;";
             var acrid = reader.IsDBNull(4) ? null : reader.GetString(4);
             var spotifyUrl = reader.IsDBNull(11) ? null : reader.GetString(11);
             var streamingUrl = reader.IsDBNull(14) ? null : reader.GetString(14);
+            var artworkUrl = reader.IsDBNull(15) ? null : reader.GetString(15);
 
             var key = GroupKey(artist, title);
             if (!byKey.TryGetValue(key, out var group))
@@ -650,7 +712,8 @@ WHERE id = @id;";
                     Isrc = isrc,
                     Acrid = acrid,
                     SpotifyUrl = spotifyUrl,
-                    StreamingUrl = streamingUrl
+                    StreamingUrl = streamingUrl,
+                    ArtworkUrl = artworkUrl
                 };
                 byKey[key] = group;
                 groups.Add(group);
@@ -666,11 +729,13 @@ WHERE id = @id;";
                 group.Acrid = acrid ?? group.Acrid;
                 group.SpotifyUrl = spotifyUrl ?? group.SpotifyUrl;
                 group.StreamingUrl = streamingUrl ?? group.StreamingUrl;
+                group.ArtworkUrl = artworkUrl ?? group.ArtworkUrl;
             }
             else
             {
                 group.SpotifyUrl ??= spotifyUrl;
                 group.StreamingUrl ??= streamingUrl;
+                group.ArtworkUrl ??= artworkUrl;
             }
 
             group.Occurrences.Add(new MusicTrackOccurrence
