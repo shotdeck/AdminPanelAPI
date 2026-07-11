@@ -74,8 +74,7 @@ namespace AdminPanelAPI.Services
             var odesliKey = _configuration["Odesli:ApiKey"] ?? _configuration["ODESLI_API_KEY"];
 
             // Flush links to the DB in batches so partial progress survives even
-            // if the request is cut short (Odesli's free tier is slow enough that
-            // a large movie can otherwise run long). Re-running is idempotent.
+            // if the request is cut short. Re-running is idempotent.
             var pending = new Dictionary<long, (string? spotifyUrl, string? streamingUrl)>();
             async Task FlushAsync()
             {
@@ -84,6 +83,10 @@ namespace AdminPanelAPI.Services
                 pending.Clear();
             }
 
+            // Phase 1 — resolve and persist Spotify links first. This is fast and
+            // must never be blocked by Odesli, which is slow/flaky on its free
+            // tier: a track with a Spotify link is the primary deliverable.
+            var needUniversal = new List<(long songId, string spotifyUrl, string? title, string? artist)>();
             foreach (var song in songs)
             {
                 var haveSpotify = !string.IsNullOrWhiteSpace(song.SpotifyUrl);
@@ -95,8 +98,7 @@ namespace AdminPanelAPI.Services
                 }
 
                 // Reuse the stored Spotify link when present; only search when we
-                // don't have one (or force). This makes universal-link-only
-                // re-runs cheap — no wasted Spotify calls.
+                // don't have one (or force).
                 var spotifyUrl = (!force && haveSpotify)
                     ? song.SpotifyUrl
                     : await SearchSpotifyAsync(song.Title, song.Artist, token, cancellationToken);
@@ -107,26 +109,45 @@ namespace AdminPanelAPI.Services
                 }
 
                 result.ResolvedSpotify++;
-                var universal = (!force && haveUniversal)
-                    ? song.StreamingUrl
-                    : await ResolveUniversalAsync(spotifyUrl, odesliKey, cancellationToken);
-                if (!string.IsNullOrWhiteSpace(universal))
-                    result.ResolvedUniversal++;
-
-                pending[song.SongId] = (spotifyUrl, universal);
-                result.Linked.Add(new StreamingLinkedTrack
+                if (!haveSpotify)
                 {
-                    SongId = song.SongId,
-                    Title = song.Title,
-                    Artist = song.Artist,
-                    SpotifyUrl = spotifyUrl,
-                    StreamingUrl = universal
-                });
+                    pending[song.SongId] = (spotifyUrl, null);
+                    result.Linked.Add(new StreamingLinkedTrack
+                    {
+                        SongId = song.SongId,
+                        Title = song.Title,
+                        Artist = song.Artist,
+                        SpotifyUrl = spotifyUrl,
+                        StreamingUrl = null
+                    });
+                    if (pending.Count >= 5)
+                        await FlushAsync();
+                }
 
-                if (pending.Count >= 3)
+                if (force || !haveUniversal)
+                    needUniversal.Add((song.SongId, spotifyUrl!, song.Title, song.Artist));
+            }
+            await FlushAsync();
+
+            // Phase 2 — best-effort universal links via Odesli, under a wall-clock
+            // budget so the request returns cleanly (200) instead of hitting the
+            // gateway timeout. Whatever doesn't resolve is picked up on the next
+            // (idempotent) run. A configured ODESLI_API_KEY removes the rate limit.
+            var deadline = DateTime.UtcNow.AddSeconds(120);
+            foreach (var item in needUniversal)
+            {
+                if (DateTime.UtcNow >= deadline)
+                    break;
+
+                var universal = await ResolveUniversalAsync(item.spotifyUrl, odesliKey, cancellationToken);
+                if (string.IsNullOrWhiteSpace(universal))
+                    continue;
+
+                result.ResolvedUniversal++;
+                pending[item.songId] = (item.spotifyUrl, universal);
+                if (pending.Count >= 5)
                     await FlushAsync();
             }
-
             await FlushAsync();
             return result;
         }
@@ -238,7 +259,9 @@ namespace AdminPanelAPI.Services
             {
                 using var req = new HttpRequestMessage(HttpMethod.Get, url);
                 req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                using var resp = await _http.SendAsync(req, cancellationToken);
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(10));
+                using var resp = await _http.SendAsync(req, timeout.Token);
                 if (resp.IsSuccessStatusCode)
                     return await resp.Content.ReadAsStringAsync(cancellationToken);
 
@@ -275,7 +298,9 @@ namespace AdminPanelAPI.Services
             {
                 try
                 {
-                    using var resp = await _http.GetAsync(url, cancellationToken);
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    timeout.CancelAfter(TimeSpan.FromSeconds(8));
+                    using var resp = await _http.GetAsync(url, timeout.Token);
                     if (resp.IsSuccessStatusCode)
                     {
                         var json = await resp.Content.ReadAsStringAsync(cancellationToken);
@@ -292,12 +317,13 @@ namespace AdminPanelAPI.Services
                     var delay = suggested > TimeSpan.FromSeconds(3) ? TimeSpan.FromSeconds(3) : suggested;
                     await Task.Delay(delay, cancellationToken);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
                     throw;
                 }
                 catch (Exception ex)
                 {
+                    // Includes our per-call timeout — treat as a miss, never fatal.
                     _logger.LogDebug(ex, "Odesli lookup failed for {Url}", spotifyUrl);
                     return null;
                 }
