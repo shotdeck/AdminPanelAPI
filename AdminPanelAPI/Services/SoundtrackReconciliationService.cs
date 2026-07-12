@@ -148,36 +148,68 @@ namespace AdminPanelAPI.Services
         private async Task<(string? article, List<(string title, string artist)> pairs)> FetchSoundtrackAsync(
             string movieTitle, int? year, CancellationToken cancellationToken)
         {
-            var candidates = new List<string>
+            // A film can have both a songs "soundtrack" album and a separate
+            // "score" album (e.g. American Beauty). Merge the track lists from
+            // every dedicated album page that resolves, rather than stopping at
+            // the first, so score cues get reconciled too.
+            var albumCandidates = new List<string>
             {
                 $"{movieTitle} (soundtrack)",
+                $"{movieTitle} (score)",
                 $"{movieTitle} (film score)",
                 $"{movieTitle}: Original Motion Picture Soundtrack",
                 $"{movieTitle} (Original Motion Picture Soundtrack)",
+                $"{movieTitle} (Original Motion Picture Score)",
                 $"Music of {movieTitle}",
-                $"Music of the {movieTitle} franchise",
-                year.HasValue ? $"{movieTitle} ({year} film)" : $"{movieTitle} (film)"
+                $"Music of the {movieTitle} franchise"
             };
 
-            foreach (var candidate in candidates)
+            var merged = new List<(string title, string artist)>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string? firstArticle = null;
+
+            void Merge(string candidate, List<(string title, string artist)> found)
+            {
+                foreach (var p in found)
+                {
+                    if (seen.Add($"{p.title}|{p.artist}"))
+                        merged.Add(p);
+                }
+                firstArticle ??= candidate;
+            }
+
+            foreach (var candidate in albumCandidates)
             {
                 var wikitext = await FetchWikitextAsync(candidate, cancellationToken);
                 if (string.IsNullOrEmpty(wikitext)) continue;
                 var pairs = ExtractPairs(wikitext, movieTitle);
                 if (pairs.Count > 0)
-                    return (candidate, pairs);
+                    Merge(candidate, pairs);
             }
 
-            // Search fallback only if none of the direct guesses resolved a
-            // tracklist — keeps request volume (and rate-limit risk) down.
+            if (merged.Count > 0)
+                return (firstArticle, merged);
+
+            // Search fallback only if none of the dedicated album pages resolved
+            // a tracklist — keeps request volume (and rate-limit risk) down.
             foreach (var extra in await SearchCandidatesAsync(movieTitle, cancellationToken))
             {
-                if (candidates.Contains(extra)) continue;
+                if (albumCandidates.Contains(extra)) continue;
                 var wikitext = await FetchWikitextAsync(extra, cancellationToken);
                 if (string.IsNullOrEmpty(wikitext)) continue;
                 var pairs = ExtractPairs(wikitext, movieTitle);
                 if (pairs.Count > 0)
                     return (extra, pairs);
+            }
+
+            // Last resort: the film's own page (often lists needle-drops).
+            var filmPage = year.HasValue ? $"{movieTitle} ({year} film)" : $"{movieTitle} (film)";
+            var filmText = await FetchWikitextAsync(filmPage, cancellationToken);
+            if (!string.IsNullOrEmpty(filmText))
+            {
+                var pairs = ExtractPairs(filmText, movieTitle);
+                if (pairs.Count > 0)
+                    return (filmPage, pairs);
             }
 
             return (null, new List<(string, string)>());
