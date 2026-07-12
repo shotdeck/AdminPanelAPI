@@ -106,15 +106,13 @@ namespace AdminPanelAPI.Services
             // of the per-track work.
             if (!string.IsNullOrWhiteSpace(movie?.Title))
             {
-                var (albumName, albumUrl, albumArt) = await SearchSoundtrackAlbumAsync(movie.Title!, token, cancellationToken);
-                if (!string.IsNullOrWhiteSpace(albumUrl) || !string.IsNullOrWhiteSpace(albumArt))
-                    await _repository.UpsertMovieSoundtrackAsync(new MovieSoundtrack
-                    {
-                        MovieId = movieId,
-                        AlbumName = albumName,
-                        SpotifyUrl = albumUrl,
-                        ArtworkUrl = albumArt
-                    }, cancellationToken);
+                var (searched, albumName, albumUrl, albumArt) = await SearchSoundtrackAlbumAsync(movie.Title!, token, cancellationToken);
+                // Only write once the search actually ran: set the matched album,
+                // or clear a stale/wrong one (null) — while preserving the
+                // reconciliation-owned Wikipedia URL. A transient failure leaves
+                // any existing album untouched.
+                if (searched)
+                    await _repository.SetMovieSoundtrackAlbumAsync(movieId, albumName, albumUrl, albumArt, cancellationToken);
             }
 
             // Phase 1 — resolve and persist Spotify links. Must never be blocked
@@ -296,47 +294,67 @@ namespace AdminPanelAPI.Services
         /// attached: the album name must reference the film or clearly read as a
         /// soundtrack/score.
         /// </summary>
-        private async Task<(string? name, string? spotifyUrl, string? artworkUrl)> SearchSoundtrackAlbumAsync(
+        // Filler words that appear in album titles but not film titles; ignored
+        // when matching an album name against the movie title (unless the movie
+        // title itself contains the word).
+        private static readonly HashSet<string> AlbumFiller = new(StringComparer.Ordinal)
+        {
+            "music", "motion", "picture", "score", "deluxe", "edition", "expanded",
+            "complete", "collection", "vol", "volume", "songs", "film", "movie",
+            "anniversary", "inspired", "by", "presents"
+        };
+
+        /// <returns>
+        /// searched=true once the album search actually completed (so a null name
+        /// authoritatively means "no valid match" and the caller may clear a
+        /// stale album); searched=false on a transient failure (rate limit /
+        /// exception) so the caller leaves any existing album untouched.
+        /// </returns>
+        private async Task<(bool searched, string? name, string? spotifyUrl, string? artworkUrl)> SearchSoundtrackAlbumAsync(
             string movieTitle, string token, CancellationToken cancellationToken)
         {
             var query = $"{movieTitle} original motion picture soundtrack";
-            var url = "https://api.spotify.com/v1/search?type=album&limit=5&q=" + Uri.EscapeDataString(query);
+            var url = "https://api.spotify.com/v1/search?type=album&limit=10&q=" + Uri.EscapeDataString(query);
 
             try
             {
                 var json = await GetWithRetryAsync(url, token, cancellationToken);
-                if (json == null) return (null, null, null);
+                if (json == null) return (false, null, null, null);
 
                 using var doc = JsonDocument.Parse(json);
                 if (!doc.RootElement.TryGetProperty("albums", out var albums) ||
                     !albums.TryGetProperty("items", out var items))
-                    return (null, null, null);
+                    return (true, null, null, null);
 
-                var movieTokens = Tokens(movieTitle);
+                var movieTokens = TitleTokens(movieTitle);
                 foreach (var item in items.EnumerateArray())
                 {
                     var name = item.TryGetProperty("name", out var n) ? n.GetString() : null;
                     if (string.IsNullOrWhiteSpace(name)) continue;
 
-                    var lower = name.ToLowerInvariant();
-                    var looksLikeOst = lower.Contains("soundtrack") || lower.Contains("motion picture")
-                        || lower.Contains("original score") || lower.Contains("music from");
-                    // Require the album to reference the film title, else only
-                    // accept it when it explicitly reads as a soundtrack.
-                    var nameOk = Overlap(movieTokens, Tokens(name)) >= 0.5 || looksLikeOst;
-                    if (!nameOk) continue;
+                    // The album's title tokens (parentheticals stripped) must EQUAL
+                    // the movie's, once album-only filler words are removed. This
+                    // rejects same-franchise siblings and similarly-named albums —
+                    // e.g. "Frozen 2", "Ocean's Twelve", "Badlapur Boys", "Big
+                    // Little Lies" — which the old "looks like a soundtrack"
+                    // heuristic accepted. Sequel numbers ("2", "7") are kept as
+                    // distinguishing tokens, unlike the base Tokens tokenizer.
+                    var albumTokens = TitleTokens(name);
+                    albumTokens.ExceptWith(AlbumFiller.Where(f => !movieTokens.Contains(f)));
+                    if (albumTokens.Count == 0 || !albumTokens.SetEquals(movieTokens))
+                        continue;
 
                     var albumUrl = item.TryGetProperty("external_urls", out var ext)
                         && ext.TryGetProperty("spotify", out var sp) ? sp.GetString() : null;
-                    return (name, albumUrl, ExtractAlbumArt(item));
+                    return (true, name, albumUrl, ExtractAlbumArt(item));
                 }
 
-                return (null, null, null);
+                return (true, null, null, null);
             }
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "Spotify album search threw for {Movie}", movieTitle);
-                return (null, null, null);
+                return (false, null, null, null);
             }
         }
 
@@ -519,6 +537,26 @@ namespace AdminPanelAPI.Services
             s = Regex.Replace(s, @"[^a-z0-9 ]", " ");
             foreach (var t in s.Split(' ', StringSplitOptions.RemoveEmptyEntries))
                 if (t.Length > 1 && !StopWords.Contains(t))
+                    set.Add(t);
+            return set;
+        }
+
+        /// <summary>
+        /// Like Tokens, but keeps standalone numbers (e.g. sequel "2", "7") so
+        /// "Frozen" and "Frozen 2" don't collapse to the same token set. Used for
+        /// title-vs-title equality in the soundtrack-album guard.
+        /// </summary>
+        private static HashSet<string> TitleTokens(string? value)
+        {
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            if (string.IsNullOrWhiteSpace(value)) return set;
+            var s = value.ToLowerInvariant();
+            s = Regex.Replace(s, @"\(.*?\)", " ");
+            s = Regex.Replace(s, @"\[.*?\]", " ");
+            s = s.Replace("&", " and ");
+            s = Regex.Replace(s, @"[^a-z0-9 ]", " ");
+            foreach (var t in s.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                if ((t.Length > 1 || char.IsDigit(t[0])) && !StopWords.Contains(t))
                     set.Add(t);
             return set;
         }
