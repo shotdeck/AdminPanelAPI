@@ -910,7 +910,7 @@ WHERE so.id = @id;";
     {
         const string sql = @"
 SELECT description, description_source, wikipedia_url, writers, composers, producers,
-       album, release_date, label, preview_url, musicbrainz_url
+       album, release_date, label, preview_url, musicbrainz_url, publishers
 FROM frl.frl_music_track_details
 WHERE song_id = @id;";
 
@@ -940,7 +940,8 @@ WHERE song_id = @id;";
             ReleaseDate = reader.IsDBNull(7) ? null : reader.GetString(7),
             Label = reader.IsDBNull(8) ? null : reader.GetString(8),
             PreviewUrl = reader.IsDBNull(9) ? null : reader.GetString(9),
-            MusicbrainzUrl = reader.IsDBNull(10) ? null : reader.GetString(10)
+            MusicbrainzUrl = reader.IsDBNull(10) ? null : reader.GetString(10),
+            Publishers = ParseCredits(reader.IsDBNull(11) ? null : reader.GetString(11))
         };
     }
 
@@ -949,10 +950,10 @@ WHERE song_id = @id;";
         const string sql = @"
 INSERT INTO frl.frl_music_track_details
     (song_id, description, description_source, wikipedia_url, writers, composers,
-     producers, album, release_date, label, preview_url, musicbrainz_url, fetched_at)
+     producers, album, release_date, label, preview_url, musicbrainz_url, publishers, fetched_at)
 VALUES
     (@song_id, @description, @description_source, @wikipedia_url, @writers, @composers,
-     @producers, @album, @release_date, @label, @preview_url, @musicbrainz_url, now())
+     @producers, @album, @release_date, @label, @preview_url, @musicbrainz_url, @publishers, now())
 ON CONFLICT (song_id) DO UPDATE SET
     description        = EXCLUDED.description,
     description_source = EXCLUDED.description_source,
@@ -965,6 +966,7 @@ ON CONFLICT (song_id) DO UPDATE SET
     label              = EXCLUDED.label,
     preview_url        = EXCLUDED.preview_url,
     musicbrainz_url    = EXCLUDED.musicbrainz_url,
+    publishers         = EXCLUDED.publishers,
     fetched_at         = now();";
 
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -977,6 +979,7 @@ ON CONFLICT (song_id) DO UPDATE SET
         cmd.Parameters.Add(new NpgsqlParameter("writers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Writers) });
         cmd.Parameters.Add(new NpgsqlParameter("composers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Composers) });
         cmd.Parameters.Add(new NpgsqlParameter("producers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Producers) });
+        cmd.Parameters.Add(new NpgsqlParameter("publishers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Publishers) });
         cmd.Parameters.AddWithValue("album", (object?)details.Album ?? DBNull.Value);
         cmd.Parameters.AddWithValue("release_date", (object?)details.ReleaseDate ?? DBNull.Value);
         cmd.Parameters.AddWithValue("label", (object?)details.Label ?? DBNull.Value);

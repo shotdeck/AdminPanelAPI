@@ -192,7 +192,7 @@ namespace AdminPanelAPI.Services
         private async Task EnrichFromWorkAsync(TrackDetails details, string workId, CancellationToken cancellationToken)
         {
             var json = await GetStringAsync(
-                $"https://musicbrainz.org/ws/2/work/{workId}?inc=artist-rels&fmt=json",
+                $"https://musicbrainz.org/ws/2/work/{workId}?inc=artist-rels+label-rels&fmt=json",
                 cancellationToken);
             if (json == null) return;
 
@@ -203,6 +203,15 @@ namespace AdminPanelAPI.Services
             foreach (var rel in rels.EnumerateArray())
             {
                 var type = rel.TryGetProperty("type", out var t) ? t.GetString() : null;
+
+                // Publishers are the music-publishing companies on the work,
+                // credited as label relationships (not artists).
+                if (type == "publishing" && rel.TryGetProperty("label", out var label))
+                {
+                    AddCredit(details.Publishers, label);
+                    continue;
+                }
+
                 if (!rel.TryGetProperty("artist", out var artist)) continue;
                 switch (type)
                 {
