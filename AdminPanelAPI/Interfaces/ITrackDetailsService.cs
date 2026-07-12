@@ -7,5 +7,5 @@ using AdminPanelAPI.Models;
 /// </summary>
 public interface ITrackDetailsService
 {
-    Task<TrackDetails?> GetOrFetchAsync(long songId, bool refresh, CancellationToken cancellationToken);
+    Task<TrackDetails?> GetOrFetchAsync(long songId, int? movieId, bool refresh, CancellationToken cancellationToken);
 }

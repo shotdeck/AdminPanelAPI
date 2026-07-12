@@ -29,6 +29,8 @@ public interface IMusicIdentificationJobRepository
     Task<MovieSongRow?> GetSongForDetailsAsync(long songId, CancellationToken cancellationToken);
     Task<TrackDetails?> GetTrackDetailsAsync(long songId, CancellationToken cancellationToken);
     Task UpsertTrackDetailsAsync(TrackDetails details, CancellationToken cancellationToken);
+    Task<AiDescription?> GetAiDescriptionAsync(long songId, int movieId, CancellationToken cancellationToken);
+    Task UpsertAiDescriptionAsync(long songId, int movieId, AiDescription description, string? model, CancellationToken cancellationToken);
 }
 
 public class MusicIdentificationJobRepository : IMusicIdentificationJobRepository
@@ -980,6 +982,54 @@ ON CONFLICT (song_id) DO UPDATE SET
         cmd.Parameters.AddWithValue("label", (object?)details.Label ?? DBNull.Value);
         cmd.Parameters.AddWithValue("preview_url", (object?)details.PreviewUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("musicbrainz_url", (object?)details.MusicbrainzUrl ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<AiDescription?> GetAiDescriptionAsync(long songId, int movieId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT description, sources
+FROM frl.frl_music_track_ai_description
+WHERE song_id = @song_id AND movieid = @movieid;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("song_id", songId);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return null;
+
+        var sourcesJson = reader.IsDBNull(1) ? null : reader.GetString(1);
+        return new AiDescription
+        {
+            Description = reader.IsDBNull(0) ? null : reader.GetString(0),
+            Sources = string.IsNullOrWhiteSpace(sourcesJson)
+                ? new List<LinkRef>()
+                : JsonSerializer.Deserialize<List<LinkRef>>(sourcesJson) ?? new List<LinkRef>()
+        };
+    }
+
+    public async Task UpsertAiDescriptionAsync(long songId, int movieId, AiDescription description, string? model, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+INSERT INTO frl.frl_music_track_ai_description (song_id, movieid, description, sources, model, fetched_at)
+VALUES (@song_id, @movieid, @description, @sources, @model, now())
+ON CONFLICT (song_id, movieid) DO UPDATE SET
+    description = EXCLUDED.description,
+    sources     = EXCLUDED.sources,
+    model       = EXCLUDED.model,
+    fetched_at  = now();";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("song_id", songId);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        cmd.Parameters.AddWithValue("description", (object?)description.Description ?? DBNull.Value);
+        cmd.Parameters.Add(new NpgsqlParameter("sources", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(description.Sources) });
+        cmd.Parameters.AddWithValue("model", (object?)model ?? DBNull.Value);
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 }
