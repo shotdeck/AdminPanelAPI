@@ -69,6 +69,19 @@ namespace AdminPanelAPI.Models
     {
         public string? Description { get; set; }
         public List<LinkRef> Sources { get; set; } = new();
+
+        /// <summary>
+        /// True when the description was manually edited by an admin. A locked
+        /// (edited) description is never overwritten by AI regeneration.
+        /// </summary>
+        public bool Edited { get; set; }
+    }
+
+    /// <summary>Request body for saving a manual (locked) track description.</summary>
+    public class SaveDescriptionRequest
+    {
+        public int MovieId { get; set; }
+        public string? Description { get; set; }
     }
 
     /// <summary>
@@ -83,6 +96,8 @@ namespace AdminPanelAPI.Models
         public string? Description { get; set; }
         public string? DescriptionSource { get; set; }
         public List<LinkRef> DescriptionSources { get; set; } = new();
+        /// <summary>True when the shown description was manually edited/locked.</summary>
+        public bool DescriptionEdited { get; set; }
         public string? WikipediaUrl { get; set; }
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();
