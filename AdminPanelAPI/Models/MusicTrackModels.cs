@@ -57,6 +57,13 @@ namespace AdminPanelAPI.Models
         public string? Mbid { get; set; }
     }
 
+    /// <summary>One playback segment file's index and real start offset (seconds).</summary>
+    public class VideoSegment
+    {
+        public int Index { get; set; }
+        public double Start { get; set; }
+    }
+
     /// <summary>A titled external link (e.g. a web citation for a description).</summary>
     public class LinkRef
     {
