@@ -57,6 +57,20 @@ namespace AdminPanelAPI.Models
         public string? Mbid { get; set; }
     }
 
+    /// <summary>A titled external link (e.g. a web citation for a description).</summary>
+    public class LinkRef
+    {
+        public string? Title { get; set; }
+        public string Url { get; set; } = "";
+    }
+
+    /// <summary>An AI-generated, web-grounded description with its citations.</summary>
+    public class AiDescription
+    {
+        public string? Description { get; set; }
+        public List<LinkRef> Sources { get; set; } = new();
+    }
+
     /// <summary>
     /// Enrichment for a single identified track (description + credits +
     /// release metadata), cached after the first lookup.
@@ -68,6 +82,7 @@ namespace AdminPanelAPI.Models
         public string? Artist { get; set; }
         public string? Description { get; set; }
         public string? DescriptionSource { get; set; }
+        public List<LinkRef> DescriptionSources { get; set; } = new();
         public string? WikipediaUrl { get; set; }
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();

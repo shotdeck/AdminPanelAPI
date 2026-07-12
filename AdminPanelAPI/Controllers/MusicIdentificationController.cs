@@ -228,10 +228,11 @@ namespace AdminPanelAPI.Controllers
         [HttpGet("song/{songId:long}/details")]
         public async Task<IActionResult> GetTrackDetails(
             long songId,
+            [FromQuery] int? movieId,
             [FromQuery] bool refresh,
             CancellationToken cancellationToken)
         {
-            var details = await _trackDetailsService.GetOrFetchAsync(songId, refresh, cancellationToken);
+            var details = await _trackDetailsService.GetOrFetchAsync(songId, movieId, refresh, cancellationToken);
             if (details == null)
                 return NotFound();
             return Ok(details);
