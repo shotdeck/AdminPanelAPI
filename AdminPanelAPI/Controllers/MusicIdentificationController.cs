@@ -239,6 +239,48 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
+        /// Save a human-authored description for a track in a specific movie and
+        /// lock it, so AI regeneration/backfill never overwrites it.
+        /// </summary>
+        [HttpPut("song/{songId:long}/description")]
+        public async Task<IActionResult> SaveTrackDescription(
+            long songId,
+            [FromBody] SaveDescriptionRequest request,
+            CancellationToken cancellationToken)
+        {
+            if (request == null || request.MovieId <= 0)
+                return BadRequest("movieId is required.");
+            if (string.IsNullOrWhiteSpace(request.Description))
+                return BadRequest("description is required.");
+
+            var details = await _trackDetailsService.SaveDescriptionAsync(
+                songId, request.MovieId, request.Description, cancellationToken);
+            if (details == null)
+                return NotFound();
+            return Ok(details);
+        }
+
+        /// <summary>
+        /// Revert a track's description in a movie back to AI-generated (drops
+        /// the manual/cached row and regenerates).
+        /// </summary>
+        [HttpDelete("song/{songId:long}/description")]
+        public async Task<IActionResult> RevertTrackDescription(
+            long songId,
+            [FromQuery] int movieId,
+            CancellationToken cancellationToken)
+        {
+            if (movieId <= 0)
+                return BadRequest("movieId is required.");
+
+            var details = await _trackDetailsService.RevertDescriptionAsync(
+                songId, movieId, cancellationToken);
+            if (details == null)
+                return NotFound();
+            return Ok(details);
+        }
+
+        /// <summary>
         /// Reconcile a movie's identified tracks against its known soundtrack
         /// (Wikipedia): tags each occurrence confirmed / review / unverified and
         /// returns the report. Non-destructive — nothing is deleted.

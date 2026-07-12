@@ -96,6 +96,25 @@ namespace AdminPanelAPI.Services
             return details;
         }
 
+        public async Task<TrackDetails?> SaveDescriptionAsync(long songId, int movieId, string description, CancellationToken cancellationToken)
+        {
+            var song = await _repository.GetSongForDetailsAsync(songId, cancellationToken);
+            if (song == null) return null;
+
+            await _repository.SaveManualDescriptionAsync(songId, movieId, description.Trim(), cancellationToken);
+            return await GetOrFetchAsync(songId, movieId, refresh: false, cancellationToken);
+        }
+
+        public async Task<TrackDetails?> RevertDescriptionAsync(long songId, int movieId, CancellationToken cancellationToken)
+        {
+            var song = await _repository.GetSongForDetailsAsync(songId, cancellationToken);
+            if (song == null) return null;
+
+            // Drop the stored (edited/cached) row and regenerate a fresh one.
+            await _repository.DeleteAiDescriptionAsync(songId, movieId, cancellationToken);
+            return await GetOrFetchAsync(songId, movieId, refresh: true, cancellationToken);
+        }
+
         // ---- MusicBrainz -----------------------------------------------------
 
         private async Task EnrichFromMusicBrainzAsync(TrackDetails details, MovieSongRow song, CancellationToken cancellationToken)
@@ -361,22 +380,32 @@ namespace AdminPanelAPI.Services
 
         private async Task ApplyAiDescriptionAsync(TrackDetails details, int movieId, bool refresh, CancellationToken cancellationToken)
         {
-            var apiKey = _configuration["OpenAI:ApiKey"] ?? _configuration["OPENAI_API_KEY"];
-            if (string.IsNullOrWhiteSpace(apiKey)) return;
-
             try
             {
-                if (!refresh)
+                var cached = await _repository.GetAiDescriptionAsync(details.SongId, movieId, cancellationToken);
+
+                // A manually-edited description is locked: always use it as-is
+                // and never regenerate over it, even on refresh, and regardless
+                // of whether an OpenAI key is configured.
+                if (cached != null && cached.Edited && !string.IsNullOrWhiteSpace(cached.Description))
                 {
-                    var cached = await _repository.GetAiDescriptionAsync(details.SongId, movieId, cancellationToken);
-                    if (cached != null && !string.IsNullOrWhiteSpace(cached.Description))
-                    {
-                        details.Description = CleanDescription(cached.Description);
-                        details.DescriptionSource = "openai";
-                        details.DescriptionSources = cached.Sources;
-                        return;
-                    }
+                    details.Description = cached.Description;
+                    details.DescriptionSource = "manual";
+                    details.DescriptionSources = cached.Sources;
+                    details.DescriptionEdited = true;
+                    return;
                 }
+
+                if (!refresh && cached != null && !string.IsNullOrWhiteSpace(cached.Description))
+                {
+                    details.Description = CleanDescription(cached.Description);
+                    details.DescriptionSource = "openai";
+                    details.DescriptionSources = cached.Sources;
+                    return;
+                }
+
+                var apiKey = _configuration["OpenAI:ApiKey"] ?? _configuration["OPENAI_API_KEY"];
+                if (string.IsNullOrWhiteSpace(apiKey)) return;
 
                 var movie = await _repository.GetMovieInfoAsync(movieId, cancellationToken);
                 var generated = await GenerateAiDescriptionAsync(details, movie, apiKey, cancellationToken);
