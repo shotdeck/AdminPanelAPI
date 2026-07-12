@@ -989,8 +989,29 @@ ON CONFLICT (song_id) DO UPDATE SET
 
     public async Task<AiDescription?> GetAiDescriptionAsync(long songId, int movieId, CancellationToken cancellationToken)
     {
-        const string sql = @"
-SELECT description, sources, edited
+        // The `edited` column is added by migration 022. If the code is deployed
+        // before the migration runs, selecting it throws undefined_column
+        // (42703). Fall back to reading without it so cached AI descriptions
+        // still show (just never treated as locked) instead of vanishing.
+        try
+        {
+            return await ReadAiDescriptionAsync(songId, movieId, withEdited: true, cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+        {
+            // migration 022 not applied yet — read without `edited` so cached
+            // AI descriptions still show instead of vanishing.
+            return await ReadAiDescriptionAsync(songId, movieId, withEdited: false, cancellationToken);
+        }
+    }
+
+    private async Task<AiDescription?> ReadAiDescriptionAsync(long songId, int movieId, bool withEdited, CancellationToken cancellationToken)
+    {
+        var sql = withEdited
+            ? @"SELECT description, sources, edited
+FROM frl.frl_music_track_ai_description
+WHERE song_id = @song_id AND movieid = @movieid;"
+            : @"SELECT description, sources
 FROM frl.frl_music_track_ai_description
 WHERE song_id = @song_id AND movieid = @movieid;";
 
@@ -1010,7 +1031,7 @@ WHERE song_id = @song_id AND movieid = @movieid;";
             Sources = string.IsNullOrWhiteSpace(sourcesJson)
                 ? new List<LinkRef>()
                 : JsonSerializer.Deserialize<List<LinkRef>>(sourcesJson) ?? new List<LinkRef>(),
-            Edited = !reader.IsDBNull(2) && reader.GetBoolean(2)
+            Edited = withEdited && !reader.IsDBNull(2) && reader.GetBoolean(2)
         };
     }
 
