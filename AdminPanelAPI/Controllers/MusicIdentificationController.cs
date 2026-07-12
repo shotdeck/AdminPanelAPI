@@ -356,6 +356,46 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
+        /// Return the movie's playback segment manifest (distinct segment index +
+        /// its real start offset), derived from the dialogue transcript. Used by
+        /// the frontend to map a music clip's time to the segment file that the
+        /// /export endpoint cuts from. Every movie is dialogue-processed, so the
+        /// segments exist for all movies that have identified music.
+        /// </summary>
+        [HttpGet("video-segments/{movieId:int}")]
+        public async Task<IActionResult> GetVideoSegments(
+            int movieId,
+            CancellationToken cancellationToken)
+        {
+            const string sql = @"
+SELECT DISTINCT segment_index, segment_start
+FROM frl.frl_transcript_words
+WHERE movieid = @movieid
+  AND segment_index IS NOT NULL
+  AND segment_start IS NOT NULL
+ORDER BY segment_index;";
+
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken);
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("movieid", movieId);
+
+            var segments = new List<VideoSegment>();
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                segments.Add(new VideoSegment
+                {
+                    Index = reader.GetInt32(0),
+                    Start = reader.GetDouble(1)
+                });
+            }
+
+            return Ok(new { movieId, segments });
+        }
+
+        /// <summary>
         /// Resolve a movie's r2_key from its most recent dialogue transcription job.
         /// Every movie is dialogue-processed before music, so this is the cheapest,
         /// most authoritative source. Returns null if the movie has no dialogue job.
