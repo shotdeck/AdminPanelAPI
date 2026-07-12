@@ -30,6 +30,7 @@ namespace AdminPanelAPI.Models
         public long SongId { get; set; }
         public string? Title { get; set; }
         public string? Artist { get; set; }
+        public string? Isrc { get; set; }
         public string? SpotifyUrl { get; set; }
         public string? StreamingUrl { get; set; }
         public string? ArtworkUrl { get; set; }
@@ -43,6 +44,40 @@ namespace AdminPanelAPI.Models
         public string? SpotifyUrl { get; set; }
         public string? ArtworkUrl { get; set; }
         public string? WikipediaUrl { get; set; }
+    }
+
+    /// <summary>
+    /// A credited person on a track (writer / composer / producer). Carries the
+    /// MusicBrainz artist id so a future "more tracks by this person" link can
+    /// resolve by id rather than by name.
+    /// </summary>
+    public class MusicCredit
+    {
+        public string Name { get; set; } = "";
+        public string? Mbid { get; set; }
+    }
+
+    /// <summary>
+    /// Enrichment for a single identified track (description + credits +
+    /// release metadata), cached after the first lookup.
+    /// </summary>
+    public class TrackDetails
+    {
+        public long SongId { get; set; }
+        public string? Title { get; set; }
+        public string? Artist { get; set; }
+        public string? Description { get; set; }
+        public string? DescriptionSource { get; set; }
+        public string? WikipediaUrl { get; set; }
+        public List<MusicCredit> Writers { get; set; } = new();
+        public List<MusicCredit> Composers { get; set; } = new();
+        public List<MusicCredit> Producers { get; set; } = new();
+        public string? Album { get; set; }
+        public string? ReleaseDate { get; set; }
+        public string? Label { get; set; }
+        public string? PreviewUrl { get; set; }
+        public string? SpotifyUrl { get; set; }
+        public string? MusicbrainzUrl { get; set; }
     }
 
     /// <summary>

@@ -80,6 +80,7 @@ builder.Services.AddScoped<IMusicIdentificationJobRepository, MusicIdentificatio
 builder.Services.AddScoped<IMusicIdentificationService, MusicIdentificationService>();
 builder.Services.AddHttpClient<ISoundtrackReconciliationService, SoundtrackReconciliationService>();
 builder.Services.AddHttpClient<IStreamingLinkService, StreamingLinkService>();
+builder.Services.AddHttpClient<ITrackDetailsService, TrackDetailsService>();
 builder.Services.AddHostedService<MusicIdentificationWorker>();
 
 // Keyword warmup at startup (singleton, creates scope manually)

@@ -1,6 +1,8 @@
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using AdminPanelAPI.Models;
 using Npgsql;
+using NpgsqlTypes;
 
 public interface IMusicIdentificationJobRepository
 {
@@ -24,6 +26,9 @@ public interface IMusicIdentificationJobRepository
     Task<MovieSoundtrack?> GetMovieSoundtrackAsync(int movieId, CancellationToken cancellationToken);
     Task UpsertMovieSoundtrackAsync(MovieSoundtrack soundtrack, CancellationToken cancellationToken);
     Task SetMovieSoundtrackAlbumAsync(int movieId, string? albumName, string? spotifyUrl, string? artworkUrl, CancellationToken cancellationToken);
+    Task<MovieSongRow?> GetSongForDetailsAsync(long songId, CancellationToken cancellationToken);
+    Task<TrackDetails?> GetTrackDetailsAsync(long songId, CancellationToken cancellationToken);
+    Task UpsertTrackDetailsAsync(TrackDetails details, CancellationToken cancellationToken);
 }
 
 public class MusicIdentificationJobRepository : IMusicIdentificationJobRepository
@@ -868,6 +873,113 @@ ON CONFLICT (movieid) DO UPDATE SET
         if (sql.Contains("@error"))
             cmd.Parameters.AddWithValue("error", (object?)error ?? DBNull.Value);
 
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<MovieSongRow?> GetSongForDetailsAsync(long songId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT so.id, so.title, ar.name AS artist, so.spotify_url, so.streaming_url, so.artwork_url, so.isrc
+FROM frl.frl_music_songs so
+LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
+WHERE so.id = @id;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("id", songId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return null;
+
+        return new MovieSongRow
+        {
+            SongId = reader.GetInt64(0),
+            Title = reader.IsDBNull(1) ? null : reader.GetString(1),
+            Artist = reader.IsDBNull(2) ? null : reader.GetString(2),
+            SpotifyUrl = reader.IsDBNull(3) ? null : reader.GetString(3),
+            StreamingUrl = reader.IsDBNull(4) ? null : reader.GetString(4),
+            ArtworkUrl = reader.IsDBNull(5) ? null : reader.GetString(5),
+            Isrc = reader.IsDBNull(6) ? null : reader.GetString(6)
+        };
+    }
+
+    public async Task<TrackDetails?> GetTrackDetailsAsync(long songId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT description, description_source, wikipedia_url, writers, composers, producers,
+       album, release_date, label, preview_url, musicbrainz_url
+FROM frl.frl_music_track_details
+WHERE song_id = @id;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("id", songId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return null;
+
+        static List<MusicCredit> ParseCredits(string? json) =>
+            string.IsNullOrWhiteSpace(json)
+                ? new List<MusicCredit>()
+                : JsonSerializer.Deserialize<List<MusicCredit>>(json) ?? new List<MusicCredit>();
+
+        return new TrackDetails
+        {
+            SongId = songId,
+            Description = reader.IsDBNull(0) ? null : reader.GetString(0),
+            DescriptionSource = reader.IsDBNull(1) ? null : reader.GetString(1),
+            WikipediaUrl = reader.IsDBNull(2) ? null : reader.GetString(2),
+            Writers = ParseCredits(reader.IsDBNull(3) ? null : reader.GetString(3)),
+            Composers = ParseCredits(reader.IsDBNull(4) ? null : reader.GetString(4)),
+            Producers = ParseCredits(reader.IsDBNull(5) ? null : reader.GetString(5)),
+            Album = reader.IsDBNull(6) ? null : reader.GetString(6),
+            ReleaseDate = reader.IsDBNull(7) ? null : reader.GetString(7),
+            Label = reader.IsDBNull(8) ? null : reader.GetString(8),
+            PreviewUrl = reader.IsDBNull(9) ? null : reader.GetString(9),
+            MusicbrainzUrl = reader.IsDBNull(10) ? null : reader.GetString(10)
+        };
+    }
+
+    public async Task UpsertTrackDetailsAsync(TrackDetails details, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+INSERT INTO frl.frl_music_track_details
+    (song_id, description, description_source, wikipedia_url, writers, composers,
+     producers, album, release_date, label, preview_url, musicbrainz_url, fetched_at)
+VALUES
+    (@song_id, @description, @description_source, @wikipedia_url, @writers, @composers,
+     @producers, @album, @release_date, @label, @preview_url, @musicbrainz_url, now())
+ON CONFLICT (song_id) DO UPDATE SET
+    description        = EXCLUDED.description,
+    description_source = EXCLUDED.description_source,
+    wikipedia_url      = EXCLUDED.wikipedia_url,
+    writers            = EXCLUDED.writers,
+    composers          = EXCLUDED.composers,
+    producers          = EXCLUDED.producers,
+    album              = EXCLUDED.album,
+    release_date       = EXCLUDED.release_date,
+    label              = EXCLUDED.label,
+    preview_url        = EXCLUDED.preview_url,
+    musicbrainz_url    = EXCLUDED.musicbrainz_url,
+    fetched_at         = now();";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("song_id", details.SongId);
+        cmd.Parameters.AddWithValue("description", (object?)details.Description ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("description_source", (object?)details.DescriptionSource ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("wikipedia_url", (object?)details.WikipediaUrl ?? DBNull.Value);
+        cmd.Parameters.Add(new NpgsqlParameter("writers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Writers) });
+        cmd.Parameters.Add(new NpgsqlParameter("composers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Composers) });
+        cmd.Parameters.Add(new NpgsqlParameter("producers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Producers) });
+        cmd.Parameters.AddWithValue("album", (object?)details.Album ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("release_date", (object?)details.ReleaseDate ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("label", (object?)details.Label ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("preview_url", (object?)details.PreviewUrl ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("musicbrainz_url", (object?)details.MusicbrainzUrl ?? DBNull.Value);
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 }
