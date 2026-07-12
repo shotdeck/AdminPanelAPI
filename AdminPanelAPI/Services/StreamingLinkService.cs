@@ -88,9 +88,22 @@ namespace AdminPanelAPI.Services
                 pending.Clear();
             }
 
+            // Phase 0 — fill cover art for tracks that already have a Spotify link
+            // but no stored artwork, via a batched /tracks lookup (up to 50
+            // ids/call). Done FIRST, on fresh Spotify quota: it's the single most
+            // rate-limit-sensitive call, so running it before the per-track
+            // search burst (and Odesli) keeps it from being starved / 429'd.
+            var haveLinkNoArt = songs
+                .Where(s => !string.IsNullOrWhiteSpace(s.SpotifyUrl)
+                    && (force || string.IsNullOrWhiteSpace(s.ArtworkUrl)))
+                .Select(s => (s.SongId, s.SpotifyUrl!))
+                .ToList();
+            await FillArtworkAsync(haveLinkNoArt, token, Stage, FlushAsync, cancellationToken);
+            await FlushAsync();
+
             // Resolve the official soundtrack album (name + Spotify album link +
-            // cover art) for the movie once, up front. Cheap (one search) and
-            // independent of the per-track work.
+            // cover art) for the movie once. Cheap (one search) and independent
+            // of the per-track work.
             if (!string.IsNullOrWhiteSpace(movie?.Title))
             {
                 var (albumName, albumUrl, albumArt) = await SearchSoundtrackAlbumAsync(movie.Title!, token, cancellationToken);
@@ -104,24 +117,23 @@ namespace AdminPanelAPI.Services
                     }, cancellationToken);
             }
 
-            // Phase 1 — resolve and persist Spotify links first. This is fast and
-            // must never be blocked by Odesli, which is slow/flaky on its free
-            // tier: a track with a Spotify link is the primary deliverable.
+            // Phase 1 — resolve and persist Spotify links. Must never be blocked
+            // by Odesli, which is slow/flaky on its free tier: a track with a
+            // Spotify link is the primary deliverable. A fresh search also yields
+            // cover art inline (for tracks that had no stored link).
             var needUniversal = new List<(long songId, string spotifyUrl)>();
-            var needArtwork = new List<(long songId, string spotifyUrl)>();
             foreach (var song in songs)
             {
                 var haveSpotify = !string.IsNullOrWhiteSpace(song.SpotifyUrl);
                 var haveUniversal = !string.IsNullOrWhiteSpace(song.StreamingUrl);
-                var haveArtwork = !string.IsNullOrWhiteSpace(song.ArtworkUrl);
-                if (!force && haveSpotify && haveUniversal && haveArtwork)
+                if (!force && haveSpotify && haveUniversal)
                 {
                     result.Skipped++;
                     continue;
                 }
 
                 // Reuse the stored Spotify link when present; only search when we
-                // don't have one (or force). A fresh search also yields cover art.
+                // don't have one (or force).
                 string? spotifyUrl;
                 string? artworkUrl = null;
                 if (!force && haveSpotify)
@@ -137,10 +149,9 @@ namespace AdminPanelAPI.Services
 
                 result.ResolvedSpotify++;
                 var newSpotify = haveSpotify ? null : spotifyUrl;
-                var newArtwork = (!haveArtwork && !string.IsNullOrWhiteSpace(artworkUrl)) ? artworkUrl : null;
-                if (newSpotify != null || newArtwork != null)
+                if (newSpotify != null || !string.IsNullOrWhiteSpace(artworkUrl))
                 {
-                    Stage(song.SongId, newSpotify, null, newArtwork);
+                    Stage(song.SongId, newSpotify, null, artworkUrl);
                     if (newSpotify != null)
                         result.Linked.Add(new StreamingLinkedTrack
                         {
@@ -154,19 +165,9 @@ namespace AdminPanelAPI.Services
                         await FlushAsync();
                 }
 
-                // Still missing cover art (had a link, or the search returned
-                // none) — fill it cheaply in a batch lookup below.
-                if (!haveArtwork && string.IsNullOrWhiteSpace(newArtwork))
-                    needArtwork.Add((song.SongId, spotifyUrl!));
-
                 if (force || !haveUniversal)
                     needUniversal.Add((song.SongId, spotifyUrl!));
             }
-            await FlushAsync();
-
-            // Phase 1b — fill cover art for tracks that have a Spotify link but no
-            // stored artwork, via a batched /tracks lookup (up to 50 ids/call).
-            await FillArtworkAsync(needArtwork, token, Stage, FlushAsync, cancellationToken);
             await FlushAsync();
 
             // Phase 2 — best-effort universal links via Odesli, under a wall-clock
