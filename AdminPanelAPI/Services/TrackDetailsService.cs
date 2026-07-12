@@ -371,7 +371,7 @@ namespace AdminPanelAPI.Services
                     var cached = await _repository.GetAiDescriptionAsync(details.SongId, movieId, cancellationToken);
                     if (cached != null && !string.IsNullOrWhiteSpace(cached.Description))
                     {
-                        details.Description = cached.Description;
+                        details.Description = CleanDescription(cached.Description);
                         details.DescriptionSource = "openai";
                         details.DescriptionSources = cached.Sources;
                         return;
@@ -470,14 +470,33 @@ namespace AdminPanelAPI.Services
                 }
             }
 
-            var final = text.ToString().Trim();
-            return final.Length == 0 ? null : new AiDescription { Description = final, Sources = sources };
+            var final = CleanDescription(text.ToString());
+            return string.IsNullOrEmpty(final) ? null : new AiDescription { Description = final, Sources = sources };
         }
 
         private static void AppendCredits(StringBuilder sb, string label, List<MusicCredit> credits)
         {
             if (credits.Count == 0) return;
             sb.Append(label).Append(": ").AppendLine(string.Join(", ", credits.Select(c => c.Name)));
+        }
+
+        // The model tends to leave inline markdown citations like
+        // "([en.wikipedia.org](https://...))" and emphasis markers (*text*,
+        // **text**) in the prose. Sources are shown separately, so strip both
+        // to keep the displayed text clean.
+        private static string CleanDescription(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return "";
+            var s = text;
+            // Inline markdown link, optionally wrapped in parentheses:
+            //   ([label](url))  or  [label](url)
+            s = Regex.Replace(s, @"\s*\(?\[[^\]]*\]\((?:https?:)?[^)]*\)\)?", "");
+            // Bold/italic emphasis markers around words.
+            s = Regex.Replace(s, @"(\*{1,3}|_{1,3})(?=\S)(.+?)(?<=\S)\1", "$2");
+            // Collapse any doubled spaces left behind and tidy space-before-punct.
+            s = Regex.Replace(s, @"[ \t]{2,}", " ");
+            s = Regex.Replace(s, @" +([.,;:!?])", "$1");
+            return s.Trim();
         }
 
         private async Task<string?> GetSpotifyTokenAsync(string clientId, string clientSecret, CancellationToken cancellationToken)
