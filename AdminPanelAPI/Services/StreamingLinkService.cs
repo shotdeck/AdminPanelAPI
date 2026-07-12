@@ -342,8 +342,10 @@ namespace AdminPanelAPI.Services
 
         /// <summary>
         /// Fill cover art for tracks that already have a Spotify link but no
-        /// stored artwork, using batched GET /v1/tracks?ids= (up to 50 per call)
-        /// so it costs one request per 50 tracks rather than one per track.
+        /// stored artwork, via GET /v1/tracks/{id}. The batch endpoint
+        /// (/v1/tracks?ids=) is 403-Forbidden for development-mode apps, so we
+        /// fetch one id at a time (deduped) — GetWithRetryAsync absorbs 429s and
+        /// results are flushed every few tracks so progress persists.
         /// </summary>
         private async Task FillArtworkAsync(
             List<(long songId, string spotifyUrl)> need,
@@ -354,7 +356,7 @@ namespace AdminPanelAPI.Services
         {
             if (need.Count == 0) return;
 
-            // Map Spotify track id -> the song rows that use it.
+            // Map Spotify track id -> the song rows that use it (dedup ids).
             var bySpotifyId = new Dictionary<string, List<long>>();
             foreach (var (songId, spotifyUrl) in need)
             {
@@ -365,36 +367,33 @@ namespace AdminPanelAPI.Services
                 list.Add(songId);
             }
 
-            var ids = bySpotifyId.Keys.ToList();
-            for (var i = 0; i < ids.Count; i += 50)
+            var staged = 0;
+            foreach (var (id, songIds) in bySpotifyId)
             {
-                var batch = ids.Skip(i).Take(50).ToList();
-                var url = "https://api.spotify.com/v1/tracks?ids=" + string.Join(",", batch);
-                var json = await GetWithRetryAsync(url, token, cancellationToken);
+                var json = await GetWithRetryAsync("https://api.spotify.com/v1/tracks/" + id, token, cancellationToken);
                 if (json == null) continue;
 
                 try
                 {
                     using var doc = JsonDocument.Parse(json);
-                    if (!doc.RootElement.TryGetProperty("tracks", out var tracks)) continue;
-                    foreach (var t in tracks.EnumerateArray())
-                    {
-                        if (t.ValueKind != JsonValueKind.Object) continue;
-                        var id = t.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
-                        var art = ExtractAlbumArt(t);
-                        if (id == null || string.IsNullOrWhiteSpace(art)) continue;
-                        if (!bySpotifyId.TryGetValue(id, out var songIds)) continue;
-                        foreach (var songId in songIds)
-                            stage(songId, null, null, art);
-                    }
+                    var art = ExtractAlbumArt(doc.RootElement);
+                    if (string.IsNullOrWhiteSpace(art)) continue;
+                    foreach (var songId in songIds)
+                        stage(songId, null, null, art);
+                    staged += songIds.Count;
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogDebug(ex, "Spotify batch tracks parse failed");
+                    _logger.LogDebug(ex, "Spotify track fetch parse failed for {Id}", id);
                 }
 
-                await flush();
+                if (staged >= 10)
+                {
+                    await flush();
+                    staged = 0;
+                }
             }
+            await flush();
         }
 
         private static string? ExtractTrackId(string spotifyUrl)
