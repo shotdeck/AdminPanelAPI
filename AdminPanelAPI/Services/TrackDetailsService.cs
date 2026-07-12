@@ -218,37 +218,62 @@ namespace AdminPanelAPI.Services
             {
                 var srsearch = song.Title + (string.IsNullOrWhiteSpace(song.Artist) ? "" : " " + song.Artist) + " song";
                 var searchJson = await GetStringAsync(
-                    "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=1&srsearch="
+                    "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=5&srsearch="
                     + Uri.EscapeDataString(srsearch),
                     cancellationToken);
                 if (searchJson == null) return;
 
-                string? pageTitle;
+                var pageTitles = new List<string>();
                 using (var sdoc = JsonDocument.Parse(searchJson))
                 {
                     var hits = sdoc.RootElement.GetProperty("query").GetProperty("search");
-                    if (hits.GetArrayLength() == 0) return;
-                    pageTitle = hits[0].GetProperty("title").GetString();
+                    foreach (var hit in hits.EnumerateArray())
+                    {
+                        var pt = hit.TryGetProperty("title", out var ptEl) ? ptEl.GetString() : null;
+                        if (!string.IsNullOrWhiteSpace(pt)) pageTitles.Add(pt);
+                    }
                 }
-                if (string.IsNullOrWhiteSpace(pageTitle)) return;
+                if (pageTitles.Count == 0) return;
 
-                var summaryJson = await GetStringAsync(
-                    "https://en.wikipedia.org/api/rest_v1/page/summary/"
-                    + Uri.EscapeDataString(pageTitle.Replace(' ', '_')),
-                    cancellationToken);
-                if (summaryJson == null) return;
+                // The top text hit is often an unrelated article that merely
+                // shares words (e.g. a generic cue title like "Blood Red"
+                // matching an unrelated song). Only accept a page that is
+                // clearly about this track: its title contains the track's
+                // title tokens, or its summary mentions the artist.
+                var titleTokens = Tokenize(song.Title);
+                var artistNorm = Normalize(song.Artist);
 
-                using var doc = JsonDocument.Parse(summaryJson);
-                var root = doc.RootElement;
-                var extract = root.TryGetProperty("extract", out var e) ? e.GetString() : null;
-                if (string.IsNullOrWhiteSpace(extract)) return;
+                foreach (var pageTitle in pageTitles)
+                {
+                    var summaryJson = await GetStringAsync(
+                        "https://en.wikipedia.org/api/rest_v1/page/summary/"
+                        + Uri.EscapeDataString(pageTitle.Replace(' ', '_')),
+                        cancellationToken);
+                    if (summaryJson == null) continue;
 
-                details.Description = extract;
-                details.DescriptionSource = "wikipedia";
-                if (root.TryGetProperty("content_urls", out var cu) &&
-                    cu.TryGetProperty("desktop", out var desk) &&
-                    desk.TryGetProperty("page", out var pageUrl))
-                    details.WikipediaUrl = pageUrl.GetString();
+                    using var doc = JsonDocument.Parse(summaryJson);
+                    var root = doc.RootElement;
+
+                    var type = root.TryGetProperty("type", out var ty) ? ty.GetString() : null;
+                    if (type == "disambiguation") continue;
+
+                    var extract = root.TryGetProperty("extract", out var e) ? e.GetString() : null;
+                    if (string.IsNullOrWhiteSpace(extract)) continue;
+
+                    var pageTitleTokens = Tokenize(pageTitle);
+                    var titleMatch = titleTokens.Count > 0 && titleTokens.All(pageTitleTokens.Contains);
+                    var artistMatch = !string.IsNullOrEmpty(artistNorm) &&
+                                      Normalize(extract).Contains(artistNorm);
+                    if (!titleMatch && !artistMatch) continue;
+
+                    details.Description = extract;
+                    details.DescriptionSource = "wikipedia";
+                    if (root.TryGetProperty("content_urls", out var cu) &&
+                        cu.TryGetProperty("desktop", out var desk) &&
+                        desk.TryGetProperty("page", out var pageUrl))
+                        details.WikipediaUrl = pageUrl.GetString();
+                    return;
+                }
             }
             catch (Exception ex)
             {
@@ -320,6 +345,23 @@ namespace AdminPanelAPI.Services
             var expiresIn = doc.RootElement.TryGetProperty("expires_in", out var e) ? e.GetInt32() : 3600;
             _tokenExpiry = DateTimeOffset.UtcNow.AddSeconds(expiresIn - 60);
             return _accessToken;
+        }
+
+        private static string Normalize(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return "";
+            var s = value.ToLowerInvariant();
+            s = Regex.Replace(s, @"\s*[\(\[].*?[\)\]]", " ");   // drop (...) / [...]
+            s = Regex.Replace(s, @"[^a-z0-9]+", " ");           // strip punctuation/diacritics-adjacent
+            return s.Trim();
+        }
+
+        private static HashSet<string> Tokenize(string? value)
+        {
+            var norm = Normalize(value);
+            return norm.Length == 0
+                ? new HashSet<string>()
+                : norm.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToHashSet();
         }
 
         private static string? ExtractTrackId(string? spotifyUrl)
