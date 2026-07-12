@@ -15,6 +15,7 @@ namespace AdminPanelAPI.Controllers
         private readonly IMusicJobQueue _jobQueue;
         private readonly ISoundtrackReconciliationService _reconciliationService;
         private readonly IStreamingLinkService _streamingLinkService;
+        private readonly ITrackDetailsService _trackDetailsService;
         private readonly IConfiguration _configuration;
         private readonly ILogger<MusicIdentificationController> _logger;
         private readonly string _connectionString;
@@ -31,6 +32,7 @@ namespace AdminPanelAPI.Controllers
             IMusicJobQueue jobQueue,
             ISoundtrackReconciliationService reconciliationService,
             IStreamingLinkService streamingLinkService,
+            ITrackDetailsService trackDetailsService,
             IConfiguration configuration,
             ILogger<MusicIdentificationController> logger)
         {
@@ -38,6 +40,7 @@ namespace AdminPanelAPI.Controllers
             _jobQueue = jobQueue;
             _reconciliationService = reconciliationService;
             _streamingLinkService = streamingLinkService;
+            _trackDetailsService = trackDetailsService;
             _configuration = configuration;
             _logger = logger;
             _connectionString = configuration.GetConnectionString("Default")
@@ -215,6 +218,23 @@ namespace AdminPanelAPI.Controllers
                 soundtrack,
                 tracks
             });
+        }
+
+        /// <summary>
+        /// Rich metadata for a single identified track (description, writers,
+        /// composers, producers, album/release info). Fetched from public
+        /// sources on first request and cached; pass refresh=true to re-fetch.
+        /// </summary>
+        [HttpGet("song/{songId:long}/details")]
+        public async Task<IActionResult> GetTrackDetails(
+            long songId,
+            [FromQuery] bool refresh,
+            CancellationToken cancellationToken)
+        {
+            var details = await _trackDetailsService.GetOrFetchAsync(songId, refresh, cancellationToken);
+            if (details == null)
+                return NotFound();
+            return Ok(details);
         }
 
         /// <summary>
