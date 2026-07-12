@@ -23,6 +23,7 @@ public interface IMusicIdentificationJobRepository
     Task SetSongLinksAsync(IReadOnlyDictionary<long, (string? spotifyUrl, string? streamingUrl, string? artworkUrl)> linksBySongId, CancellationToken cancellationToken);
     Task<MovieSoundtrack?> GetMovieSoundtrackAsync(int movieId, CancellationToken cancellationToken);
     Task UpsertMovieSoundtrackAsync(MovieSoundtrack soundtrack, CancellationToken cancellationToken);
+    Task SetMovieSoundtrackAlbumAsync(int movieId, string? albumName, string? spotifyUrl, string? artworkUrl, CancellationToken cancellationToken);
 }
 
 public class MusicIdentificationJobRepository : IMusicIdentificationJobRepository
@@ -672,6 +673,35 @@ ON CONFLICT (movieid) DO UPDATE SET
         cmd.Parameters.AddWithValue("spotify_url", (object?)soundtrack.SpotifyUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("artwork_url", (object?)soundtrack.ArtworkUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("wikipedia_url", (object?)soundtrack.WikipediaUrl ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task SetMovieSoundtrackAlbumAsync(int movieId, string? albumName, string? spotifyUrl, string? artworkUrl, CancellationToken cancellationToken)
+    {
+        // Authoritatively set the album fields (overwriting, including to NULL to
+        // clear a previously-attached wrong album) while preserving the
+        // reconciliation-owned wikipedia_url. Unlike UpsertMovieSoundtrackAsync
+        // this does NOT COALESCE the album columns — the caller only invokes it
+        // once the album search has actually run, so a null means "no match",
+        // not "unknown".
+        const string sql = @"
+INSERT INTO frl.frl_music_movie_soundtrack
+    (movieid, album_name, spotify_url, artwork_url, updated_at)
+VALUES (@movieid, @album_name, @spotify_url, @artwork_url, now())
+ON CONFLICT (movieid) DO UPDATE SET
+    album_name  = EXCLUDED.album_name,
+    spotify_url = EXCLUDED.spotify_url,
+    artwork_url = EXCLUDED.artwork_url,
+    updated_at  = now();";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        cmd.Parameters.AddWithValue("album_name", (object?)albumName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("spotify_url", (object?)spotifyUrl ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("artwork_url", (object?)artworkUrl ?? DBNull.Value);
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
