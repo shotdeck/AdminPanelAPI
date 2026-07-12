@@ -27,6 +27,15 @@ namespace AdminPanelAPI.Services
         private string? _accessToken;
         private DateTimeOffset _tokenExpiry = DateTimeOffset.MinValue;
 
+        // Generic album words that don't distinguish one soundtrack from
+        // another, so they shouldn't count as track/album context.
+        private static readonly HashSet<string> AlbumFiller = new(StringComparer.Ordinal)
+        {
+            "original", "motion", "picture", "soundtrack", "score", "music",
+            "from", "the", "of", "and", "a", "an", "ost", "deluxe", "edition",
+            "expanded", "complete", "volume", "vol"
+        };
+
         public TrackDetailsService(
             IMusicIdentificationJobRepository repository,
             HttpClient http,
@@ -242,6 +251,15 @@ namespace AdminPanelAPI.Services
                 // title tokens, or its summary mentions the artist.
                 var titleTokens = Tokenize(song.Title);
                 var artistNorm = Normalize(song.Artist);
+                // Context tokens a page must touch when we only have an artist
+                // match: the distinctive words of the track title + album
+                // (album set by the MusicBrainz pass above), minus album filler.
+                // Without this, a prolific composer (e.g. Thomas Newman) matches
+                // ANY of his soundtrack pages — an American Beauty cue was
+                // pulling the "Road to Perdition" score article.
+                var contextTokens = new HashSet<string>(titleTokens);
+                foreach (var tok in Tokenize(details.Album))
+                    if (!AlbumFiller.Contains(tok)) contextTokens.Add(tok);
 
                 foreach (var pageTitle in pageTitles)
                 {
@@ -262,8 +280,12 @@ namespace AdminPanelAPI.Services
 
                     var pageTitleTokens = Tokenize(pageTitle);
                     var titleMatch = titleTokens.Count > 0 && titleTokens.All(pageTitleTokens.Contains);
+                    // Artist match alone is too loose for prolific composers, so
+                    // also require the page title to overlap the track/album
+                    // context (e.g. "Joker" for a Joker cue).
                     var artistMatch = !string.IsNullOrEmpty(artistNorm) &&
-                                      Normalize(extract).Contains(artistNorm);
+                                      Normalize(extract).Contains(artistNorm) &&
+                                      pageTitleTokens.Any(contextTokens.Contains);
                     if (!titleMatch && !artistMatch) continue;
 
                     details.Description = extract;
