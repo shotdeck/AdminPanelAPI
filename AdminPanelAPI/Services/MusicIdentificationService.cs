@@ -9,6 +9,8 @@ namespace AdminPanelAPI.Services
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<MusicIdentificationService> _logger;
         private readonly IMusicIdentificationJobRepository _repo;
+        private readonly IStreamingLinkService _streamingLinkService;
+        private readonly ISoundtrackReconciliationService _reconciliationService;
 
         private readonly string _musicApiBaseUrl;
 
@@ -16,12 +18,16 @@ namespace AdminPanelAPI.Services
             IConfiguration configuration,
             IHttpClientFactory httpClientFactory,
             ILogger<MusicIdentificationService> logger,
-            IMusicIdentificationJobRepository repo)
+            IMusicIdentificationJobRepository repo,
+            IStreamingLinkService streamingLinkService,
+            ISoundtrackReconciliationService reconciliationService)
         {
             _configuration = configuration;
             _httpClientFactory = httpClientFactory;
             _logger = logger;
             _repo = repo;
+            _streamingLinkService = streamingLinkService;
+            _reconciliationService = reconciliationService;
 
             _musicApiBaseUrl = _configuration["MusicIdentification:MusicApiBaseUrl"]
                 ?? "http://localhost:8000";
@@ -85,6 +91,29 @@ namespace AdminPanelAPI.Services
             await _repo.UpdateProgressAsync(jobId, "Storing segments in database", 85, cancellationToken);
 
             await _repo.StoreSegmentsAsync(movieId, result, cancellationToken);
+
+            // Enrichment runs as part of the same job so a single upload yields a
+            // fully linked + statused movie. Both are best-effort: a failure here
+            // must not fail identification (the segments are already stored).
+            try
+            {
+                await _repo.UpdateProgressAsync(jobId, "Finding streaming links", 90, cancellationToken);
+                await _streamingLinkService.BackfillAsync(movieId, false, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Streaming-link backfill failed for movie {MovieId}.", movieId);
+            }
+
+            try
+            {
+                await _repo.UpdateProgressAsync(jobId, "Reconciling soundtrack", 95, cancellationToken);
+                await _reconciliationService.ReconcileAsync(movieId, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Soundtrack reconciliation failed for movie {MovieId}.", movieId);
+            }
 
             await _repo.MarkCompletedAsync(
                 jobId,
