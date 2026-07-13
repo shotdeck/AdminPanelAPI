@@ -112,6 +112,17 @@ namespace AdminPanelAPI.Models
         public List<LinkRef> DescriptionSources { get; set; } = new();
         /// <summary>True when the shown description was manually edited/locked.</summary>
         public bool DescriptionEdited { get; set; }
+        /// <summary>
+        /// The factual Wikipedia blurb about the track, kept separately so the UI
+        /// can show it alongside the (film-specific) AI description in
+        /// <see cref="Description"/>, which otherwise overrides it.
+        /// </summary>
+        public string? WikipediaDescription { get; set; }
+        /// <summary>
+        /// Set when film-specific AI description generation was attempted but
+        /// failed (e.g. OpenAI quota exceeded). Transient — not persisted.
+        /// </summary>
+        public string? AiDescriptionError { get; set; }
         public string? WikipediaUrl { get; set; }
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();
