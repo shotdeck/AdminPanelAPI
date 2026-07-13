@@ -11,6 +11,7 @@ namespace AdminPanelAPI.Services
         private readonly IMusicIdentificationJobRepository _repo;
         private readonly IStreamingLinkService _streamingLinkService;
         private readonly ISoundtrackReconciliationService _reconciliationService;
+        private readonly ITrackDetailsService _trackDetailsService;
 
         private readonly string _musicApiBaseUrl;
 
@@ -20,7 +21,8 @@ namespace AdminPanelAPI.Services
             ILogger<MusicIdentificationService> logger,
             IMusicIdentificationJobRepository repo,
             IStreamingLinkService streamingLinkService,
-            ISoundtrackReconciliationService reconciliationService)
+            ISoundtrackReconciliationService reconciliationService,
+            ITrackDetailsService trackDetailsService)
         {
             _configuration = configuration;
             _httpClientFactory = httpClientFactory;
@@ -28,6 +30,7 @@ namespace AdminPanelAPI.Services
             _repo = repo;
             _streamingLinkService = streamingLinkService;
             _reconciliationService = reconciliationService;
+            _trackDetailsService = trackDetailsService;
 
             _musicApiBaseUrl = _configuration["MusicIdentification:MusicApiBaseUrl"]
                 ?? "http://localhost:8000";
@@ -107,12 +110,41 @@ namespace AdminPanelAPI.Services
 
             try
             {
-                await _repo.UpdateProgressAsync(jobId, "Reconciling soundtrack", 95, cancellationToken);
+                await _repo.UpdateProgressAsync(jobId, "Reconciling soundtrack", 93, cancellationToken);
                 await _reconciliationService.ReconcileAsync(movieId, cancellationToken);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Soundtrack reconciliation failed for movie {MovieId}.", movieId);
+            }
+
+            // Pre-warm each track's details (MusicBrainz + Wikipedia + Spotify)
+            // and its film-specific AI description so the popup opens instantly
+            // instead of fetching on first click. Best-effort and sequential to
+            // respect MusicBrainz/OpenAI rate limits.
+            try
+            {
+                await _repo.UpdateProgressAsync(jobId, "Generating track descriptions", 96, cancellationToken);
+                var tracks = await _repo.GetMovieTracksAsync(movieId, false, cancellationToken);
+                foreach (var track in tracks)
+                {
+                    if (cancellationToken.IsCancellationRequested) break;
+                    try
+                    {
+                        await _trackDetailsService.GetOrFetchAsync(
+                            track.SongId, movieId, false, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(
+                            ex, "Pre-warming details failed for song {SongId} (movie {MovieId}).",
+                            track.SongId, movieId);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Track-details pre-warm failed for movie {MovieId}.", movieId);
             }
 
             await _repo.MarkCompletedAsync(
