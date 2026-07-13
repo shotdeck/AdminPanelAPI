@@ -111,7 +111,7 @@ LIMIT @limit;";
             if (limit > 500) limit = 500;
 
             var cameraMotionApiUrl = _configuration["CameraMotion:ApiUrl"]
-                ?? "https://colin-bracey--camera-motion-api-fastapi-app.modal.run";
+                ?? "https://semanticsearch--camera-motion-api-fastapi-app.modal.run";
 
             await EnsureOpenAsync(ct);
 
@@ -302,7 +302,7 @@ LIMIT @limit;";
             if (limit > 500) limit = 500;
 
             var cameraMotionApiUrl = _configuration["CameraMotion:ApiUrl"]
-                ?? "https://colin-bracey--camera-motion-api-fastapi-app.modal.run";
+                ?? "https://semanticsearch--camera-motion-api-fastapi-app.modal.run";
 
             await EnsureOpenAsync(ct);
 
