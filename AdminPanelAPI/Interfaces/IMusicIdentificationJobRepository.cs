@@ -494,7 +494,7 @@ LIMIT @limit;";
 
     public async Task<MovieInfo?> GetMovieInfoAsync(int movieId, CancellationToken cancellationToken)
     {
-        const string sql = @"SELECT idnum, title, year FROM frl.frl_movies WHERE idnum = @movieid;";
+        const string sql = @"SELECT idnum, title, year, poster FROM frl.frl_movies WHERE idnum = @movieid;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);
@@ -510,7 +510,8 @@ LIMIT @limit;";
         {
             MovieId = reader.GetInt32(0),
             Title = reader.IsDBNull(1) ? null : reader.GetString(1),
-            Year = reader.IsDBNull(2) ? null : reader.GetInt32(2)
+            Year = reader.IsDBNull(2) ? null : reader.GetInt32(2),
+            PosterUrl = reader.IsDBNull(3) ? null : MoviePosterBaseUrl + reader.GetString(3)
         };
     }
 

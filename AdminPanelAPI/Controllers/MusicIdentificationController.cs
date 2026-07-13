@@ -223,6 +223,23 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
+        /// Basic movie metadata (title, year, poster) by id. Available as soon
+        /// as the movie exists, so the upload UI can show the poster before
+        /// music identification finishes.
+        /// </summary>
+        [HttpGet("movie/{movieId:int}/info")]
+        public async Task<IActionResult> GetMovieInfo(
+            int movieId,
+            CancellationToken cancellationToken = default)
+        {
+            var info = await _jobRepository.GetMovieInfoAsync(movieId, cancellationToken);
+            if (info == null)
+                return NotFound(new { message = $"Movie {movieId} not found." });
+
+            return Ok(info);
+        }
+
+        /// <summary>
         /// Rich metadata for a single identified track (description, writers,
         /// composers, producers, album/release info). Fetched from public
         /// sources on first request and cached; pass refresh=true to re-fetch.

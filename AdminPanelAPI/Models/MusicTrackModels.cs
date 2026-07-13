@@ -22,6 +22,7 @@ namespace AdminPanelAPI.Models
         public int MovieId { get; set; }
         public string? Title { get; set; }
         public int? Year { get; set; }
+        public string? PosterUrl { get; set; }
     }
 
     /// <summary>A distinct identified song in a movie (for reconciliation).</summary>
