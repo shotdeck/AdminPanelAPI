@@ -128,6 +128,7 @@ namespace AdminPanelAPI.Models
         public int? Year { get; set; }
         public int TrackCount { get; set; }
         public int OccurrenceCount { get; set; }
+        public string? PosterUrl { get; set; }
     }
 
     /// <summary>

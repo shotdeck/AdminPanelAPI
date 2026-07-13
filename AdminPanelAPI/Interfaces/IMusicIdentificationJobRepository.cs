@@ -38,6 +38,7 @@ public interface IMusicIdentificationJobRepository
 public class MusicIdentificationJobRepository : IMusicIdentificationJobRepository
 {
     private readonly string _connectionString;
+    private const string MoviePosterBaseUrl = "https://image.tmdb.org/t/p/w154";
 
     public MusicIdentificationJobRepository(IConfiguration configuration)
     {
@@ -389,14 +390,14 @@ ORDER BY so.title, s.start_time;";
     {
         // Movies whose title matches and that have at least one identified song.
         const string sql = @"
-SELECT m.idnum, m.title, m.year,
+SELECT m.idnum, m.title, m.year, m.poster,
        COUNT(DISTINCT s.song_id) AS track_count,
        COUNT(*) AS occurrence_count
 FROM frl.frl_movies m
 JOIN frl.frl_join_movies_music_segments s
      ON s.movieid = m.idnum AND s.matched = true
 WHERE m.title ILIKE @q
-GROUP BY m.idnum, m.title, m.year
+GROUP BY m.idnum, m.title, m.year, m.poster
 ORDER BY m.title
 LIMIT @limit;";
 
@@ -416,8 +417,9 @@ LIMIT @limit;";
                 MovieId = reader.GetInt32(0),
                 Title = reader.IsDBNull(1) ? null : reader.GetString(1),
                 Year = reader.IsDBNull(2) ? null : reader.GetInt32(2),
-                TrackCount = Convert.ToInt32(reader.GetInt64(3)),
-                OccurrenceCount = Convert.ToInt32(reader.GetInt64(4))
+                PosterUrl = reader.IsDBNull(3) ? null : MoviePosterBaseUrl + reader.GetString(3),
+                TrackCount = Convert.ToInt32(reader.GetInt64(4)),
+                OccurrenceCount = Convert.ToInt32(reader.GetInt64(5))
             });
         }
 
