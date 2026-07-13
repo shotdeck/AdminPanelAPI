@@ -59,7 +59,7 @@ namespace AdminPanelAPI.Controllers
             IFormFile file,
             CancellationToken cancellationToken = default)
         {
-            return await UploadToR2AndQueueAsync(movieId, file, cancellationToken);
+            return await UploadToR2AndQueueAsync(movieId, file, true, cancellationToken);
         }
 
         /// <summary>
@@ -73,6 +73,7 @@ namespace AdminPanelAPI.Controllers
         [RequestFormLimits(MultipartBodyLengthLimit = MaxUploadSizeBytes)]
         public async Task<IActionResult> UploadAndTranscribeByFileName(
             IFormFile file,
+            [FromQuery] bool transcribe = true,
             CancellationToken cancellationToken = default)
         {
             if (file == null || file.Length == 0)
@@ -92,12 +93,13 @@ namespace AdminPanelAPI.Controllers
                     error = $"No movie found in frl_movies matching title '{title}' and year {year}."
                 });
 
-            return await UploadToR2AndQueueAsync(movieId.Value, file, cancellationToken);
+            return await UploadToR2AndQueueAsync(movieId.Value, file, transcribe, cancellationToken);
         }
 
         private async Task<IActionResult> UploadToR2AndQueueAsync(
             int movieId,
             IFormFile file,
+            bool queueTranscription,
             CancellationToken cancellationToken)
         {
             if (file == null || file.Length == 0)
@@ -160,6 +162,22 @@ namespace AdminPanelAPI.Controllers
                 _logger.LogInformation(
                     "Upload complete. MovieId={MovieId}, R2Key={R2Key}",
                     movieId, r2Key);
+            }
+
+            if (!queueTranscription)
+            {
+                // Store the movie in R2 only (e.g. so music identification can
+                // resolve it by movieId) without running dialogue transcription.
+                return Ok(new
+                {
+                    jobId = (int?)null,
+                    movieId,
+                    r2Key,
+                    r2Bucket = _r2BucketName,
+                    fileSizeBytes = file.Length,
+                    skippedUpload = alreadyExists,
+                    status = "Uploaded"
+                });
             }
 
             var jobId = await _jobRepository.CreateJobAsync(
