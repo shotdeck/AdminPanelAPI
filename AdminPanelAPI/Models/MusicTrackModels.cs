@@ -131,14 +131,20 @@ namespace AdminPanelAPI.Models
         /// </summary>
         public string? AiInFilm { get; set; }
         /// <summary>
-        /// True when the track's original (first) release year is later than the
-        /// film's release year — i.e. the song didn't exist yet, so the match is
-        /// almost certainly a false positive. Transient. Set only when a movie is
-        /// in scope and both years are known.
+        /// True when the track's original release year is later than the film's
+        /// release year — i.e. the song didn't exist yet, so the match is almost
+        /// certainly a false positive. Transient; only a flagging tie-breaker
+        /// when the AI verdict is not a positive "in_film".
         /// </summary>
         public bool ReleasedAfterMovie { get; set; }
         /// <summary>The film's release year, when a movie is in scope.</summary>
         public int? MovieYear { get; set; }
+        /// <summary>
+        /// The song's original (debut) release year as determined by the
+        /// web-search agent. More reliable than the matched recording's date,
+        /// which is often a later compilation/remaster. Transient.
+        /// </summary>
+        public int? OriginalReleaseYear { get; set; }
         public string? WikipediaUrl { get; set; }
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();

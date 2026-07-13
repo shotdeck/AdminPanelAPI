@@ -1,4 +1,5 @@
 using AdminPanelAPI.Models;
+using AdminPanelAPI.Services;
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -255,12 +256,9 @@ namespace AdminPanelAPI.Controllers
             if (details == null)
                 return NotFound();
 
-            // If the web-search agent judges the track is not in this film, or it
-            // was released after the film, flag it for review (likely a
-            // false-positive match).
-            if (movieId.HasValue &&
-                (string.Equals(details.AiInFilm, "not_in_film", StringComparison.OrdinalIgnoreCase)
-                 || details.ReleasedAfterMovie))
+            // If the track looks like a false-positive match (agent says it's not
+            // in the film, or it was released after the film), flag it for review.
+            if (movieId.HasValue && TrackDetailsService.ShouldFlagForReview(details))
             {
                 await _jobRepository.SetSongConfidenceAsync(
                     movieId.Value,

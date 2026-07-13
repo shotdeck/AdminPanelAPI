@@ -140,9 +140,7 @@ namespace AdminPanelAPI.Services
                             track.SongId, movieId, false, cancellationToken);
                         if (aiWarning == null && !string.IsNullOrWhiteSpace(details?.AiDescriptionError))
                             aiWarning = details!.AiDescriptionError;
-                        if (details != null &&
-                            (string.Equals(details.AiInFilm, "not_in_film", StringComparison.OrdinalIgnoreCase)
-                             || details.ReleasedAfterMovie))
+                        if (details != null && TrackDetailsService.ShouldFlagForReview(details))
                             flagForReview[track.SongId] = "review";
                     }
                     catch (Exception ex)
