@@ -101,11 +101,26 @@ namespace AdminPanelAPI.Services
             {
                 await ApplyAiDescriptionAsync(details, movieId.Value, refresh, cancellationToken);
 
+                // The matched recording's date is often a later remaster/
+                // compilation. When the agent found the song's true debut year and
+                // it's earlier than the stored date, correct the displayed date and
+                // persist it so the fix sticks across cached loads.
+                if (details.OriginalReleaseYear is int oy)
+                {
+                    var storedYear = ParseYear(details.ReleaseDate);
+                    if (storedYear == null || oy < storedYear)
+                    {
+                        details.ReleaseDate = oy.ToString();
+                        await _repository.UpsertTrackDetailsAsync(details, cancellationToken);
+                    }
+                }
+
                 // Anachronism check: a song released after the film came out
-                // cannot really be in it — flag it as a likely false positive.
+                // cannot really be in it. Prefer the agent's original year over the
+                // matched pressing's date.
                 var movie = await _repository.GetMovieInfoAsync(movieId.Value, cancellationToken);
                 details.MovieYear = movie?.Year;
-                var releaseYear = ParseYear(details.ReleaseDate);
+                var releaseYear = details.OriginalReleaseYear ?? ParseYear(details.ReleaseDate);
                 if (movie?.Year is int my && releaseYear is int ry && ry > my)
                     details.ReleasedAfterMovie = true;
             }
@@ -489,9 +504,13 @@ namespace AdminPanelAPI.Services
                 "Only state things you can verify; if you are unsure, leave it out rather than guessing. Do not fabricate.\n\n" +
                 "This track was auto-identified by audio fingerprinting, which sometimes produces false positives. " +
                 "If the film is given, determine whether this specific track actually appears in that film (on its " +
-                "soundtrack, score, or otherwise heard on screen). After the prose, on a new final line, output exactly " +
-                "one verdict tag and nothing else: 'VERDICT: in_film' if it does appear, 'VERDICT: not_in_film' if it " +
-                "clearly does not, or 'VERDICT: unclear' if you cannot tell. If no film is given, use 'VERDICT: unclear'.\n\n" +
+                "soundtrack, score, or otherwise heard on screen). Note the matched audio may be a later remaster or " +
+                "compilation, so judge by the song itself, not by which pressing was matched.\n\n" +
+                "After the prose, output exactly these two tag lines and nothing else:\n" +
+                "'VERDICT: in_film' if it does appear, 'VERDICT: not_in_film' if it clearly does not, or 'VERDICT: unclear' " +
+                "if you cannot tell (use 'unclear' if no film is given).\n" +
+                "'FIRST_RELEASED: <year>' with the 4-digit year the song was ORIGINALLY released/recorded (its debut, not a " +
+                "reissue/compilation), or 'FIRST_RELEASED: unknown' if you cannot determine it.\n\n" +
                 "Known facts (already verified, use them):\n" + facts;
 
             var payload = new
@@ -548,8 +567,10 @@ namespace AdminPanelAPI.Services
 
             var raw = text.ToString();
             details.AiInFilm = ExtractInFilmVerdict(raw);
-            // Drop the machine-readable verdict tag so it never shows in prose.
+            details.OriginalReleaseYear = ExtractFirstReleasedYear(raw);
+            // Drop the machine-readable tags so they never show in prose.
             raw = Regex.Replace(raw, @"(?im)^\s*VERDICT:\s*(in_film|not_in_film|unclear)\s*$", "").Trim();
+            raw = Regex.Replace(raw, @"(?im)^\s*FIRST_RELEASED:\s*\S+\s*$", "").Trim();
 
             var final = CleanDescription(raw);
             return string.IsNullOrEmpty(final) ? null : new AiDescription { Description = final, Sources = sources };
@@ -564,6 +585,22 @@ namespace AdminPanelAPI.Services
             return m.Success && int.TryParse(m.Groups[1].Value, out var y) ? y : null;
         }
 
+        /// <summary>
+        /// Whether a track should be flagged for review as a likely false
+        /// positive. The AI in-film verdict is authoritative: a positive
+        /// "in_film" is never flagged (even if the matched pressing looks newer
+        /// than the film). Otherwise flag when the agent says "not_in_film", or
+        /// when it's not "in_film" and the song was released after the film.
+        /// </summary>
+        public static bool ShouldFlagForReview(TrackDetails details)
+        {
+            if (string.Equals(details.AiInFilm, "in_film", StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (string.Equals(details.AiInFilm, "not_in_film", StringComparison.OrdinalIgnoreCase))
+                return true;
+            return details.ReleasedAfterMovie;
+        }
+
         // Pulls the "VERDICT: ..." tag the agent appends to say whether the
         // track actually appears in the film. Returns null if absent.
         private static string? ExtractInFilmVerdict(string? text)
@@ -571,6 +608,17 @@ namespace AdminPanelAPI.Services
             if (string.IsNullOrWhiteSpace(text)) return null;
             var m = Regex.Match(text, @"(?i)VERDICT:\s*(in_film|not_in_film|unclear)");
             return m.Success ? m.Groups[1].Value.ToLowerInvariant() : null;
+        }
+
+        // Pulls the "FIRST_RELEASED: <year>" tag — the song's original release
+        // year per the agent's web search. Returns null if absent/unknown or
+        // implausible (outside 1850..current year + 1).
+        private static int? ExtractFirstReleasedYear(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            var m = Regex.Match(text, @"(?i)FIRST_RELEASED:\s*(\d{4})");
+            if (!m.Success || !int.TryParse(m.Groups[1].Value, out var y)) return null;
+            return (y >= 1850 && y <= DateTime.UtcNow.Year + 1) ? y : null;
         }
 
         // Turns an OpenAI failure into a short, user-facing reason so the upload
