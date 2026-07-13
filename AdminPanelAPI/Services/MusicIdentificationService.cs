@@ -127,6 +127,10 @@ namespace AdminPanelAPI.Services
             {
                 await _repo.UpdateProgressAsync(jobId, "Generating track descriptions", 96, cancellationToken);
                 var tracks = await _repo.GetMovieTracksAsync(movieId, false, cancellationToken);
+                // Tracks the web-search agent judges are NOT in the film, or that
+                // were released after the film, are likely fingerprint false
+                // positives; flag them for review.
+                var flagForReview = new Dictionary<long, string>();
                 foreach (var track in tracks)
                 {
                     if (cancellationToken.IsCancellationRequested) break;
@@ -136,6 +140,10 @@ namespace AdminPanelAPI.Services
                             track.SongId, movieId, false, cancellationToken);
                         if (aiWarning == null && !string.IsNullOrWhiteSpace(details?.AiDescriptionError))
                             aiWarning = details!.AiDescriptionError;
+                        if (details != null &&
+                            (string.Equals(details.AiInFilm, "not_in_film", StringComparison.OrdinalIgnoreCase)
+                             || details.ReleasedAfterMovie))
+                            flagForReview[track.SongId] = "review";
                     }
                     catch (Exception ex)
                     {
@@ -143,6 +151,14 @@ namespace AdminPanelAPI.Services
                             ex, "Pre-warming details failed for song {SongId} (movie {MovieId}).",
                             track.SongId, movieId);
                     }
+                }
+
+                if (flagForReview.Count > 0)
+                {
+                    _logger.LogInformation(
+                        "Flagging {Count} track(s) as review for movie {MovieId} (agent: not in film).",
+                        flagForReview.Count, movieId);
+                    await _repo.SetSongConfidenceAsync(movieId, flagForReview, cancellationToken);
                 }
             }
             catch (Exception ex)

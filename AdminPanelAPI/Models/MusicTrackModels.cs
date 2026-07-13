@@ -124,6 +124,21 @@ namespace AdminPanelAPI.Models
         /// failed (e.g. OpenAI quota exceeded). Transient — not persisted.
         /// </summary>
         public string? AiDescriptionError { get; set; }
+        /// <summary>
+        /// The web-search agent's verdict on whether this track actually
+        /// appears in the film: "in_film", "not_in_film", or "unclear".
+        /// Transient — used to flag likely false-positive matches for review.
+        /// </summary>
+        public string? AiInFilm { get; set; }
+        /// <summary>
+        /// True when the track's original (first) release year is later than the
+        /// film's release year — i.e. the song didn't exist yet, so the match is
+        /// almost certainly a false positive. Transient. Set only when a movie is
+        /// in scope and both years are known.
+        /// </summary>
+        public bool ReleasedAfterMovie { get; set; }
+        /// <summary>The film's release year, when a movie is in scope.</summary>
+        public int? MovieYear { get; set; }
         public string? WikipediaUrl { get; set; }
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();
