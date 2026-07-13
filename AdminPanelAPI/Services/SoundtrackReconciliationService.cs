@@ -20,9 +20,11 @@ namespace AdminPanelAPI.Services
         // MusicBrainz asks anonymous clients to stay under ~1 request/second.
         private DateTimeOffset _mbNextAllowed = DateTimeOffset.MinValue;
         private static readonly TimeSpan MusicBrainzSpacing = TimeSpan.FromMilliseconds(1100);
+        // Hard per-call timeout so one stalled MusicBrainz response can't block.
+        private static readonly TimeSpan MusicBrainzCallTimeout = TimeSpan.FromSeconds(8);
         // Cap total time spent on the MusicBrainz cross-check so a manual
         // reconcile of a large movie can't hang on rate-limited requests.
-        private static readonly TimeSpan MusicBrainzBudget = TimeSpan.FromSeconds(90);
+        private static readonly TimeSpan MusicBrainzBudget = TimeSpan.FromSeconds(120);
 
         private static readonly HashSet<string> StopWords = new(StringComparer.Ordinal)
         {
@@ -108,12 +110,17 @@ namespace AdminPanelAPI.Services
             var mbConfirmedSongIds = new HashSet<long>();
             if (movieTitleTokens.Count > 0)
             {
-                var deadline = DateTimeOffset.UtcNow.Add(MusicBrainzBudget);
+                // A single linked token bounds the whole cross-check: once the
+                // budget elapses (or the request is aborted) every in-flight and
+                // subsequent MusicBrainz call cancels promptly, so reconcile can
+                // never hang on a stalled/rate-limited MusicBrainz response.
+                using var mbCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                mbCts.CancelAfter(MusicBrainzBudget);
                 foreach (var song in songs)
                 {
                     if (confidenceBySongId[song.SongId] == "confirmed") continue;
-                    if (DateTimeOffset.UtcNow >= deadline) break;
-                    if (await MusicBrainzConfirmsSoundtrackAsync(song, movieTitleTokens, cancellationToken))
+                    if (mbCts.IsCancellationRequested) break;
+                    if (await MusicBrainzConfirmsSoundtrackAsync(song, movieTitleTokens, mbCts.Token))
                     {
                         confidenceBySongId[song.SongId] = "confirmed";
                         mbConfirmedSongIds.Add(song.SongId);
@@ -437,14 +444,31 @@ namespace AdminPanelAPI.Services
             return null;
         }
 
-        /// <summary>GET honoring MusicBrainz's ~1 req/sec rate limit.</summary>
+        /// <summary>
+        /// GET honoring MusicBrainz's ~1 req/sec rate limit, with a hard per-call
+        /// timeout so one stalled response can't blow the cross-check budget.
+        /// A single failed attempt just returns null (skip the track) rather than
+        /// retrying with long backoff, which would compound the rate limiting.
+        /// </summary>
         private async Task<string?> MbGetAsync(string url, CancellationToken cancellationToken)
         {
-            var now = DateTimeOffset.UtcNow;
-            if (_mbNextAllowed > now)
-                await Task.Delay(_mbNextAllowed - now, cancellationToken);
-            _mbNextAllowed = DateTimeOffset.UtcNow.Add(MusicBrainzSpacing);
-            return await GetStringWithRetryAsync(url, cancellationToken);
+            try
+            {
+                var now = DateTimeOffset.UtcNow;
+                if (_mbNextAllowed > now)
+                    await Task.Delay(_mbNextAllowed - now, cancellationToken);
+                _mbNextAllowed = DateTimeOffset.UtcNow.Add(MusicBrainzSpacing);
+
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                cts.CancelAfter(MusicBrainzCallTimeout);
+                using var resp = await _http.GetAsync(url, cts.Token);
+                if (!resp.IsSuccessStatusCode) return null;
+                return await resp.Content.ReadAsStringAsync(cts.Token);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         // A soundtrack release/group belongs to this film only if every
