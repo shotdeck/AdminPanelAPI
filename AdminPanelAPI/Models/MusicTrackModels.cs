@@ -91,6 +91,13 @@ namespace AdminPanelAPI.Models
         public string? Description { get; set; }
     }
 
+    /// <summary>Request body for setting a track's confidence status in a movie.</summary>
+    public class SetStatusRequest
+    {
+        public int MovieId { get; set; }
+        public string? Status { get; set; }
+    }
+
     /// <summary>
     /// Enrichment for a single identified track (description + credits +
     /// release metadata), cached after the first lookup.

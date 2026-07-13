@@ -295,6 +295,36 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
+        /// Set the confidence status of a track's occurrences in a movie
+        /// (confirmed / review / unverified / rejected). Rejected tracks are
+        /// excluded from search and movie-track results.
+        /// </summary>
+        [HttpPut("song/{songId:long}/status")]
+        public async Task<IActionResult> SetTrackStatus(
+            long songId,
+            [FromBody] SetStatusRequest request,
+            CancellationToken cancellationToken)
+        {
+            if (request == null || request.MovieId <= 0)
+                return BadRequest(new { error = "movieId is required." });
+
+            var status = (request.Status ?? string.Empty).Trim().ToLowerInvariant();
+            var allowed = new[] { "confirmed", "review", "unverified", "rejected" };
+            if (!allowed.Contains(status))
+                return BadRequest(new
+                {
+                    error = "status must be one of: confirmed, review, unverified, rejected."
+                });
+
+            await _jobRepository.SetSongConfidenceAsync(
+                request.MovieId,
+                new Dictionary<long, string> { [songId] = status },
+                cancellationToken);
+
+            return Ok(new { songId, movieId = request.MovieId, status });
+        }
+
+        /// <summary>
         /// Backfill streaming links on a movie's identified tracks: search Spotify
         /// for each (title, artist) with a similarity guard, store the matched
         /// Spotify URL, and derive a universal all-services link (song.link).

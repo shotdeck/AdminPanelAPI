@@ -349,6 +349,7 @@ JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
 LEFT JOIN frl.frl_movies m ON m.idnum = s.movieid
 WHERE s.matched = true
+  AND s.confidence IS DISTINCT FROM 'rejected'
   AND (so.title ILIKE @q OR ar.name ILIKE @q)
 ORDER BY so.title, s.movieid, s.start_time
 LIMIT @limit;";
@@ -375,6 +376,7 @@ LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
 LEFT JOIN frl.frl_movies m ON m.idnum = s.movieid
 WHERE s.matched = true
   AND s.movieid = @movieid
+  AND s.confidence IS DISTINCT FROM 'rejected'
 ORDER BY so.title, s.start_time;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -396,6 +398,7 @@ SELECT m.idnum, m.title, m.year, m.poster,
 FROM frl.frl_movies m
 JOIN frl.frl_join_movies_music_segments s
      ON s.movieid = m.idnum AND s.matched = true
+     AND s.confidence IS DISTINCT FROM 'rejected'
 WHERE m.title ILIKE @q
 GROUP BY m.idnum, m.title, m.year, m.poster
 ORDER BY m.title
