@@ -122,6 +122,7 @@ namespace AdminPanelAPI.Services
             // and its film-specific AI description so the popup opens instantly
             // instead of fetching on first click. Best-effort and sequential to
             // respect MusicBrainz/OpenAI rate limits.
+            string? aiWarning = null;
             try
             {
                 await _repo.UpdateProgressAsync(jobId, "Generating track descriptions", 96, cancellationToken);
@@ -131,8 +132,10 @@ namespace AdminPanelAPI.Services
                     if (cancellationToken.IsCancellationRequested) break;
                     try
                     {
-                        await _trackDetailsService.GetOrFetchAsync(
+                        var details = await _trackDetailsService.GetOrFetchAsync(
                             track.SongId, movieId, false, cancellationToken);
+                        if (aiWarning == null && !string.IsNullOrWhiteSpace(details?.AiDescriptionError))
+                            aiWarning = details!.AiDescriptionError;
                     }
                     catch (Exception ex)
                     {
@@ -151,6 +154,7 @@ namespace AdminPanelAPI.Services
                 jobId,
                 result.MatchedSegments.Count,
                 result.UnmatchedWindows.Count,
+                aiWarning,
                 cancellationToken);
 
             _logger.LogInformation(

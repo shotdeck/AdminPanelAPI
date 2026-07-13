@@ -118,6 +118,11 @@ namespace AdminPanelAPI.Models
         /// <see cref="Description"/>, which otherwise overrides it.
         /// </summary>
         public string? WikipediaDescription { get; set; }
+        /// <summary>
+        /// Set when film-specific AI description generation was attempted but
+        /// failed (e.g. OpenAI quota exceeded). Transient — not persisted.
+        /// </summary>
+        public string? AiDescriptionError { get; set; }
         public string? WikipediaUrl { get; set; }
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();

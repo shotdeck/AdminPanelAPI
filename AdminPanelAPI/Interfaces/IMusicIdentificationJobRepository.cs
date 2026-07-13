@@ -9,7 +9,7 @@ public interface IMusicIdentificationJobRepository
     Task<long> CreateJobAsync(int movieId, string? r2Key, string? r2Url, CancellationToken cancellationToken);
     Task<MusicIdentificationJobStatusResponse?> GetJobAsync(long jobId, CancellationToken cancellationToken);
     Task MarkRunningAsync(long jobId, CancellationToken cancellationToken);
-    Task MarkCompletedAsync(long jobId, int matchedCount, int unmatchedCount, CancellationToken cancellationToken);
+    Task MarkCompletedAsync(long jobId, int matchedCount, int unmatchedCount, string? warning, CancellationToken cancellationToken);
     Task MarkFailedAsync(long jobId, string error, CancellationToken cancellationToken);
     Task UpdateProgressAsync(long jobId, string step, int progressPct, CancellationToken cancellationToken);
     Task StoreSegmentsAsync(int movieId, MusicApiResponse response, CancellationToken cancellationToken);
@@ -125,7 +125,7 @@ WHERE id = @id;";
         if (!await reader.ReadAsync(cancellationToken))
             return null;
 
-        return new MusicIdentificationJobStatusResponse
+        var response = new MusicIdentificationJobStatusResponse
         {
             JobId = reader.GetInt64(0),
             MovieId = reader.GetInt32(1),
@@ -139,8 +139,17 @@ WHERE id = @id;";
             CreatedAt = reader.GetDateTime(9),
             StartedAt = reader.IsDBNull(10) ? null : reader.GetDateTime(10),
             CompletedAt = reader.IsDBNull(11) ? null : reader.GetDateTime(11),
-            Error = reader.IsDBNull(12) ? null : reader.GetString(12)
         };
+
+        var message = reader.IsDBNull(12) ? null : reader.GetString(12);
+        // A completed job that still carries a message is a non-fatal warning
+        // (e.g. AI descriptions skipped); on any other status it's a real error.
+        if (string.Equals(response.Status, "Completed", StringComparison.OrdinalIgnoreCase))
+            response.Warning = message;
+        else
+            response.Error = message;
+
+        return response;
     }
 
     public async Task MarkRunningAsync(long jobId, CancellationToken cancellationToken)
@@ -155,7 +164,7 @@ WHERE id = @id;";
         await ExecuteNonQueryAsync(sql, jobId, null, cancellationToken);
     }
 
-    public async Task MarkCompletedAsync(long jobId, int matchedCount, int unmatchedCount, CancellationToken cancellationToken)
+    public async Task MarkCompletedAsync(long jobId, int matchedCount, int unmatchedCount, string? warning, CancellationToken cancellationToken)
     {
         const string sql = @"
 UPDATE frl.frl_join_movies_music_identification_jobs
@@ -164,7 +173,7 @@ SET status = 'Completed',
     matched_count = @matched_count,
     unmatched_count = @unmatched_count,
     progress_pct = 100,
-    error = null
+    error = @warning
 WHERE id = @id;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -174,6 +183,7 @@ WHERE id = @id;";
         cmd.Parameters.AddWithValue("id", jobId);
         cmd.Parameters.AddWithValue("matched_count", matchedCount);
         cmd.Parameters.AddWithValue("unmatched_count", unmatchedCount);
+        cmd.Parameters.AddWithValue("warning", (object?)warning ?? DBNull.Value);
 
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }

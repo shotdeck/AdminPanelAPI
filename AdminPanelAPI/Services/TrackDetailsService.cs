@@ -469,6 +469,7 @@ namespace AdminPanelAPI.Services
             if (!resp.IsSuccessStatusCode)
             {
                 _logger.LogDebug("OpenAI responses call returned {Status}", resp.StatusCode);
+                details.AiDescriptionError = DescribeOpenAiError(resp.StatusCode, errorBody: await resp.Content.ReadAsStringAsync(cancellationToken));
                 return null;
             }
 
@@ -508,6 +509,30 @@ namespace AdminPanelAPI.Services
 
             var final = CleanDescription(text.ToString());
             return string.IsNullOrEmpty(final) ? null : new AiDescription { Description = final, Sources = sources };
+        }
+
+        // Turns an OpenAI failure into a short, user-facing reason so the upload
+        // flow can explain why film-specific descriptions are missing.
+        private static string DescribeOpenAiError(System.Net.HttpStatusCode status, string? errorBody)
+        {
+            var code = "";
+            if (!string.IsNullOrWhiteSpace(errorBody))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(errorBody);
+                    if (doc.RootElement.TryGetProperty("error", out var err) &&
+                        err.TryGetProperty("code", out var c) && c.ValueKind == JsonValueKind.String)
+                        code = c.GetString() ?? "";
+                }
+                catch { /* non-JSON body */ }
+            }
+
+            if (code == "insufficient_quota" || (int)status == 429)
+                return "OpenAI quota exceeded — add credits to the OpenAI account to enable AI descriptions.";
+            if ((int)status == 401)
+                return "OpenAI rejected the API key — check the configured OpenAI key.";
+            return $"OpenAI request failed ({(int)status}).";
         }
 
         private static void AppendCredits(StringBuilder sb, string label, List<MusicCredit> credits)
