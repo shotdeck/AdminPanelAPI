@@ -453,6 +453,11 @@ namespace AdminPanelAPI.Services
                 "(who wrote it, when, what it's about) and, if the film is given, how the track is used in that film " +
                 "and why it fits. Write 120-200 words of plain prose (no markdown, no headings, no bullet points). " +
                 "Only state things you can verify; if you are unsure, leave it out rather than guessing. Do not fabricate.\n\n" +
+                "This track was auto-identified by audio fingerprinting, which sometimes produces false positives. " +
+                "If the film is given, determine whether this specific track actually appears in that film (on its " +
+                "soundtrack, score, or otherwise heard on screen). After the prose, on a new final line, output exactly " +
+                "one verdict tag and nothing else: 'VERDICT: in_film' if it does appear, 'VERDICT: not_in_film' if it " +
+                "clearly does not, or 'VERDICT: unclear' if you cannot tell. If no film is given, use 'VERDICT: unclear'.\n\n" +
                 "Known facts (already verified, use them):\n" + facts;
 
             var payload = new
@@ -507,8 +512,22 @@ namespace AdminPanelAPI.Services
                 }
             }
 
-            var final = CleanDescription(text.ToString());
+            var raw = text.ToString();
+            details.AiInFilm = ExtractInFilmVerdict(raw);
+            // Drop the machine-readable verdict tag so it never shows in prose.
+            raw = Regex.Replace(raw, @"(?im)^\s*VERDICT:\s*(in_film|not_in_film|unclear)\s*$", "").Trim();
+
+            var final = CleanDescription(raw);
             return string.IsNullOrEmpty(final) ? null : new AiDescription { Description = final, Sources = sources };
+        }
+
+        // Pulls the "VERDICT: ..." tag the agent appends to say whether the
+        // track actually appears in the film. Returns null if absent.
+        private static string? ExtractInFilmVerdict(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            var m = Regex.Match(text, @"(?i)VERDICT:\s*(in_film|not_in_film|unclear)");
+            return m.Success ? m.Groups[1].Value.ToLowerInvariant() : null;
         }
 
         // Turns an OpenAI failure into a short, user-facing reason so the upload

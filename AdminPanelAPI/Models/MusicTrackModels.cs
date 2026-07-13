@@ -124,6 +124,12 @@ namespace AdminPanelAPI.Models
         /// failed (e.g. OpenAI quota exceeded). Transient — not persisted.
         /// </summary>
         public string? AiDescriptionError { get; set; }
+        /// <summary>
+        /// The web-search agent's verdict on whether this track actually
+        /// appears in the film: "in_film", "not_in_film", or "unclear".
+        /// Transient — used to flag likely false-positive matches for review.
+        /// </summary>
+        public string? AiInFilm { get; set; }
         public string? WikipediaUrl { get; set; }
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();

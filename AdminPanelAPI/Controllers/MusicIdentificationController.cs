@@ -254,6 +254,18 @@ namespace AdminPanelAPI.Controllers
             var details = await _trackDetailsService.GetOrFetchAsync(songId, movieId, refresh, cancellationToken);
             if (details == null)
                 return NotFound();
+
+            // On a fresh generation, if the web-search agent judges the track is
+            // not in this film, flag it for review (likely a false-positive match).
+            if (movieId.HasValue &&
+                string.Equals(details.AiInFilm, "not_in_film", StringComparison.OrdinalIgnoreCase))
+            {
+                await _jobRepository.SetSongConfidenceAsync(
+                    movieId.Value,
+                    new Dictionary<long, string> { [songId] = "review" },
+                    cancellationToken);
+            }
+
             return Ok(details);
         }
 
