@@ -17,6 +17,13 @@ namespace AdminPanelAPI.Services
         private readonly HttpClient _http;
         private readonly ILogger<SoundtrackReconciliationService> _logger;
 
+        // MusicBrainz asks anonymous clients to stay under ~1 request/second.
+        private DateTimeOffset _mbNextAllowed = DateTimeOffset.MinValue;
+        private static readonly TimeSpan MusicBrainzSpacing = TimeSpan.FromMilliseconds(1100);
+        // Cap total time spent on the MusicBrainz cross-check so a manual
+        // reconcile of a large movie can't hang on rate-limited requests.
+        private static readonly TimeSpan MusicBrainzBudget = TimeSpan.FromSeconds(90);
+
         private static readonly HashSet<string> StopWords = new(StringComparer.Ordinal)
         {
             "the", "a", "an", "of", "and", "feat", "featuring", "from", "version",
@@ -88,6 +95,35 @@ namespace AdminPanelAPI.Services
                 if (pairs.Count == 0) confidence = "unverified";
 
                 confidenceBySongId[song.SongId] = confidence;
+            }
+
+            // MusicBrainz cross-check. Wikipedia tracklists are incomplete, so a
+            // real needle-drop can still read "unverified" (e.g. "Psycho Boy Jack"
+            // on the Fight Club score). MusicBrainz's authoritative "appears on
+            // releases" data confirms it: if the recording is on a Soundtrack
+            // release-group whose title matches the film, mark it confirmed.
+            // Only checked for tracks Wikipedia didn't already confirm, and time-
+            // boxed so a manual reconcile can't hang on MusicBrainz rate limits.
+            var movieTitleTokens = Tokens(movie.Title);
+            var mbConfirmedSongIds = new HashSet<long>();
+            if (movieTitleTokens.Count > 0)
+            {
+                var deadline = DateTimeOffset.UtcNow.Add(MusicBrainzBudget);
+                foreach (var song in songs)
+                {
+                    if (confidenceBySongId[song.SongId] == "confirmed") continue;
+                    if (DateTimeOffset.UtcNow >= deadline) break;
+                    if (await MusicBrainzConfirmsSoundtrackAsync(song, movieTitleTokens, cancellationToken))
+                    {
+                        confidenceBySongId[song.SongId] = "confirmed";
+                        mbConfirmedSongIds.Add(song.SongId);
+                    }
+                }
+            }
+
+            foreach (var song in songs)
+            {
+                var confidence = confidenceBySongId[song.SongId];
                 var track = new ReconciledTrack
                 {
                     SongId = song.SongId,
@@ -115,9 +151,11 @@ namespace AdminPanelAPI.Services
                 }
             }
 
-            // Only persist when we actually resolved a soundtrack. If Wikipedia
-            // was unreachable/rate-limited (no pairs), skip the write so we never
-            // clobber existing good tags with a batch of "unverified".
+            // Only persist a full pass when we actually resolved a soundtrack. If
+            // Wikipedia was unreachable/rate-limited (no pairs), skip the full
+            // write so we never clobber existing good tags with a batch of
+            // "unverified" — but still persist any tracks MusicBrainz upgraded to
+            // confirmed, since those are authoritative regardless of Wikipedia.
             if (result.SoundtrackFound)
             {
                 await _repository.SetSongConfidenceAsync(movieId, confidenceBySongId, cancellationToken);
@@ -132,6 +170,11 @@ namespace AdminPanelAPI.Services
                         WikipediaUrl = "https://en.wikipedia.org/wiki/"
                             + Uri.EscapeDataString(article.Replace(' ', '_'))
                     }, cancellationToken);
+            }
+            else if (mbConfirmedSongIds.Count > 0)
+            {
+                var mbOnly = mbConfirmedSongIds.ToDictionary(id => id, _ => "confirmed");
+                await _repository.SetSongConfidenceAsync(movieId, mbOnly, cancellationToken);
             }
 
             result.ConfirmedCount = result.Confirmed.Count;
@@ -297,6 +340,120 @@ namespace AdminPanelAPI.Services
                 }
             }
             return null;
+        }
+
+        // ---- MusicBrainz soundtrack cross-check ------------------------------
+
+        /// <summary>
+        /// True when the identified recording appears on a Soundtrack
+        /// release-group whose title matches this film — MusicBrainz's
+        /// authoritative confirmation that the needle-drop is a real soundtrack
+        /// track, even when Wikipedia's tracklist omitted it.
+        /// </summary>
+        private async Task<bool> MusicBrainzConfirmsSoundtrackAsync(
+            MovieSongRow song, HashSet<string> movieTitleTokens, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var recordingId = await ResolveRecordingIdAsync(song, cancellationToken);
+                if (recordingId == null) return false;
+
+                var json = await MbGetAsync(
+                    $"https://musicbrainz.org/ws/2/recording/{recordingId}?inc=releases+release-groups&fmt=json",
+                    cancellationToken);
+                if (json == null) return false;
+
+                using var doc = JsonDocument.Parse(json);
+                if (!doc.RootElement.TryGetProperty("releases", out var releases) ||
+                    releases.ValueKind != JsonValueKind.Array)
+                    return false;
+
+                foreach (var rel in releases.EnumerateArray())
+                {
+                    var relTitle = rel.TryGetProperty("title", out var rt) ? rt.GetString() : null;
+                    string? rgTitle = null;
+                    var isSoundtrack = false;
+                    if (rel.TryGetProperty("release-group", out var rg))
+                    {
+                        if (rg.TryGetProperty("title", out var gt)) rgTitle = gt.GetString();
+                        if (rg.TryGetProperty("primary-type", out var pt) &&
+                            string.Equals(pt.GetString(), "Soundtrack", StringComparison.OrdinalIgnoreCase))
+                            isSoundtrack = true;
+                        if (rg.TryGetProperty("secondary-types", out var st) &&
+                            st.ValueKind == JsonValueKind.Array)
+                            foreach (var s in st.EnumerateArray())
+                                if (string.Equals(s.GetString(), "Soundtrack", StringComparison.OrdinalIgnoreCase))
+                                    isSoundtrack = true;
+                    }
+                    if (!isSoundtrack) continue;
+
+                    if (TitleMatchesMovie(Tokens(relTitle), movieTitleTokens) ||
+                        TitleMatchesMovie(Tokens(rgTitle), movieTitleTokens))
+                        return true;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "MusicBrainz soundtrack check failed for song {SongId}", song.SongId);
+                return false;
+            }
+        }
+
+        /// <summary>Resolve a MusicBrainz recording id by ISRC, else title+artist.</summary>
+        private async Task<string?> ResolveRecordingIdAsync(MovieSongRow song, CancellationToken cancellationToken)
+        {
+            if (!string.IsNullOrWhiteSpace(song.Isrc))
+            {
+                var json = await MbGetAsync(
+                    $"https://musicbrainz.org/ws/2/isrc/{Uri.EscapeDataString(song.Isrc)}?inc=recordings&fmt=json",
+                    cancellationToken);
+                var id = FirstRecordingId(json);
+                if (id != null) return id;
+            }
+
+            if (!string.IsNullOrWhiteSpace(song.Title))
+            {
+                var query = $"recording:\"{song.Title}\"";
+                if (!string.IsNullOrWhiteSpace(song.Artist))
+                    query += $" AND artist:\"{song.Artist}\"";
+                var json = await MbGetAsync(
+                    $"https://musicbrainz.org/ws/2/recording?query={Uri.EscapeDataString(query)}&fmt=json&limit=1",
+                    cancellationToken);
+                return FirstRecordingId(json);
+            }
+
+            return null;
+        }
+
+        private static string? FirstRecordingId(string? json)
+        {
+            if (json == null) return null;
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("recordings", out var recs) &&
+                recs.ValueKind == JsonValueKind.Array && recs.GetArrayLength() > 0 &&
+                recs[0].TryGetProperty("id", out var id))
+                return id.GetString();
+            return null;
+        }
+
+        /// <summary>GET honoring MusicBrainz's ~1 req/sec rate limit.</summary>
+        private async Task<string?> MbGetAsync(string url, CancellationToken cancellationToken)
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (_mbNextAllowed > now)
+                await Task.Delay(_mbNextAllowed - now, cancellationToken);
+            _mbNextAllowed = DateTimeOffset.UtcNow.Add(MusicBrainzSpacing);
+            return await GetStringWithRetryAsync(url, cancellationToken);
+        }
+
+        // A soundtrack release/group belongs to this film only if every
+        // distinctive word of the movie title is present in its title (e.g.
+        // "Fight Club" ⊆ "Fight Club"); guards against unrelated compilations.
+        private static bool TitleMatchesMovie(HashSet<string> titleTokens, HashSet<string> movieTitleTokens)
+        {
+            if (movieTitleTokens.Count == 0 || titleTokens.Count == 0) return false;
+            return movieTitleTokens.All(titleTokens.Contains);
         }
 
         /// <summary>
