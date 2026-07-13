@@ -255,10 +255,12 @@ namespace AdminPanelAPI.Controllers
             if (details == null)
                 return NotFound();
 
-            // On a fresh generation, if the web-search agent judges the track is
-            // not in this film, flag it for review (likely a false-positive match).
+            // If the web-search agent judges the track is not in this film, or it
+            // was released after the film, flag it for review (likely a
+            // false-positive match).
             if (movieId.HasValue &&
-                string.Equals(details.AiInFilm, "not_in_film", StringComparison.OrdinalIgnoreCase))
+                (string.Equals(details.AiInFilm, "not_in_film", StringComparison.OrdinalIgnoreCase)
+                 || details.ReleasedAfterMovie))
             {
                 await _jobRepository.SetSongConfidenceAsync(
                     movieId.Value,
