@@ -14,8 +14,8 @@ public interface IMusicIdentificationJobRepository
     Task UpdateProgressAsync(long jobId, string step, int progressPct, CancellationToken cancellationToken);
     Task StoreSegmentsAsync(int movieId, MusicApiResponse response, CancellationToken cancellationToken);
     Task<List<MusicSegmentResult>> GetSegmentsAsync(int movieId, CancellationToken cancellationToken);
-    Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, CancellationToken cancellationToken);
-    Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, CancellationToken cancellationToken);
+    Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, bool includeRejected, CancellationToken cancellationToken);
+    Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, bool includeRejected, CancellationToken cancellationToken);
     Task<List<MovieMusicSummary>> SearchMoviesByTitleAsync(string query, int limit, CancellationToken cancellationToken);
     Task<MusicSearchOptions> GetSearchOptionsAsync(string query, int limit, CancellationToken cancellationToken);
     Task<MovieInfo?> GetMovieInfoAsync(int movieId, CancellationToken cancellationToken);
@@ -338,9 +338,12 @@ ORDER BY s.start_time;";
         return results;
     }
 
-    public async Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, CancellationToken cancellationToken)
+    public async Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, bool includeRejected, CancellationToken cancellationToken)
     {
-        const string sql = @"
+        var rejectedFilter = includeRejected
+            ? ""
+            : "  AND s.confidence IS DISTINCT FROM 'rejected'\n";
+        var sql = $@"
 SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
        s.movieid, m.title AS movie_title, m.year AS movie_year,
        s.start_time, s.end_time, s.score, so.spotify_url, s.source, s.confidence, so.streaming_url, so.artwork_url
@@ -349,8 +352,7 @@ JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
 LEFT JOIN frl.frl_movies m ON m.idnum = s.movieid
 WHERE s.matched = true
-  AND s.confidence IS DISTINCT FROM 'rejected'
-  AND (so.title ILIKE @q OR ar.name ILIKE @q)
+{rejectedFilter}  AND (so.title ILIKE @q OR ar.name ILIKE @q)
 ORDER BY so.title, s.movieid, s.start_time
 LIMIT @limit;";
 
@@ -364,9 +366,12 @@ LIMIT @limit;";
         return await ReadTrackGroupsAsync(cmd, cancellationToken);
     }
 
-    public async Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, CancellationToken cancellationToken)
+    public async Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, bool includeRejected, CancellationToken cancellationToken)
     {
-        const string sql = @"
+        var rejectedFilter = includeRejected
+            ? ""
+            : "  AND s.confidence IS DISTINCT FROM 'rejected'\n";
+        var sql = $@"
 SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
        s.movieid, m.title AS movie_title, m.year AS movie_year,
        s.start_time, s.end_time, s.score, so.spotify_url, s.source, s.confidence, so.streaming_url, so.artwork_url
@@ -376,8 +381,7 @@ LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
 LEFT JOIN frl.frl_movies m ON m.idnum = s.movieid
 WHERE s.matched = true
   AND s.movieid = @movieid
-  AND s.confidence IS DISTINCT FROM 'rejected'
-ORDER BY so.title, s.start_time;";
+{rejectedFilter}ORDER BY so.title, s.start_time;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);

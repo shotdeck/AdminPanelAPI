@@ -135,13 +135,14 @@ namespace AdminPanelAPI.Controllers
         public async Task<IActionResult> Search(
             [FromQuery] string q,
             [FromQuery] int limit = 500,
+            [FromQuery] bool includeRejected = false,
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(q))
                 return BadRequest(new { error = "Query parameter 'q' is required." });
 
             limit = Math.Clamp(limit, 1, 2000);
-            var tracks = await _jobRepository.SearchTracksAsync(q.Trim(), limit, cancellationToken);
+            var tracks = await _jobRepository.SearchTracksAsync(q.Trim(), limit, includeRejected, cancellationToken);
 
             return Ok(new
             {
@@ -205,9 +206,10 @@ namespace AdminPanelAPI.Controllers
         [HttpGet("movie/{movieId:int}/tracks")]
         public async Task<IActionResult> GetMovieTracks(
             int movieId,
-            CancellationToken cancellationToken)
+            [FromQuery] bool includeRejected = false,
+            CancellationToken cancellationToken = default)
         {
-            var tracks = await _jobRepository.GetMovieTracksAsync(movieId, cancellationToken);
+            var tracks = await _jobRepository.GetMovieTracksAsync(movieId, includeRejected, cancellationToken);
             var soundtrack = await _jobRepository.GetMovieSoundtrackAsync(movieId, cancellationToken);
 
             return Ok(new
