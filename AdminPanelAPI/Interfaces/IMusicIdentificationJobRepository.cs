@@ -23,6 +23,7 @@ public interface IMusicIdentificationJobRepository
     Task SetSongConfidenceAsync(int movieId, IReadOnlyDictionary<long, string> confidenceBySongId, CancellationToken cancellationToken);
     Task<double?> GetSongMaxScoreAsync(int movieId, long songId, CancellationToken cancellationToken);
     Task<bool> PromoteUnverifiedToConfirmedAsync(int movieId, long songId, CancellationToken cancellationToken);
+    Task<bool> BaselineNullToUnverifiedAsync(int movieId, long songId, CancellationToken cancellationToken);
     Task<bool> UpdateSongTrackAsync(long songId, string title, string? artist, CancellationToken cancellationToken);
     Task<List<MovieSongRow>> GetMovieSongRowsWithLinksAsync(int movieId, CancellationToken cancellationToken);
     Task SetSongLinksAsync(IReadOnlyDictionary<long, (string? spotifyUrl, string? streamingUrl, string? artworkUrl)> linksBySongId, CancellationToken cancellationToken);
@@ -601,16 +602,38 @@ WHERE movieid = @movieid AND song_id = @song_id AND matched = true;";
         return result is null || result is DBNull ? null : Convert.ToDouble(result);
     }
 
-    // Upgrade a track from "unverified" to "confirmed" for a movie, but only if
-    // it is currently unverified — never overrides a review/rejected/confirmed
-    // decision. Returns true if a row was upgraded.
+    // Upgrade a track to "confirmed" for a movie, but only if it hasn't been
+    // reconciled/decided yet — i.e. it is currently "unverified" or has no
+    // confidence (null). Never overrides a review/rejected/confirmed decision.
+    // Returns true if a row was upgraded.
     public async Task<bool> PromoteUnverifiedToConfirmedAsync(
         int movieId, long songId, CancellationToken cancellationToken)
     {
         const string sql = @"
 UPDATE frl.frl_join_movies_music_segments
 SET confidence = 'confirmed'
-WHERE movieid = @movieid AND song_id = @song_id AND confidence = 'unverified';";
+WHERE movieid = @movieid AND song_id = @song_id
+  AND (confidence = 'unverified' OR confidence IS NULL);";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        cmd.Parameters.AddWithValue("song_id", songId);
+        var rows = await cmd.ExecuteNonQueryAsync(cancellationToken);
+        return rows > 0;
+    }
+
+    // Give any still-unreconciled (null-confidence) track a baseline
+    // "unverified" status so it always renders with a badge instead of nothing.
+    // Never touches rows that already have a decision.
+    public async Task<bool> BaselineNullToUnverifiedAsync(
+        int movieId, long songId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+UPDATE frl.frl_join_movies_music_segments
+SET confidence = 'unverified'
+WHERE movieid = @movieid AND song_id = @song_id AND confidence IS NULL;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);

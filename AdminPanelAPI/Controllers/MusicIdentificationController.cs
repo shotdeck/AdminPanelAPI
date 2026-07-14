@@ -271,15 +271,20 @@ namespace AdminPanelAPI.Controllers
                         new Dictionary<long, string> { [songId] = "review" },
                         cancellationToken);
                 }
-                else if (TrackDetailsService.AiConfirmsInFilm(details))
+                else if (TrackDetailsService.AiConfirmsInFilm(details) &&
+                         await _jobRepository.GetSongMaxScoreAsync(
+                             movieId.Value, songId, cancellationToken)
+                         >= TrackDetailsService.ConfirmScoreThreshold)
                 {
-                    var maxScore = await _jobRepository.GetSongMaxScoreAsync(
+                    await _jobRepository.PromoteUnverifiedToConfirmedAsync(
                         movieId.Value, songId, cancellationToken);
-                    if (maxScore >= TrackDetailsService.ConfirmScoreThreshold)
-                    {
-                        await _jobRepository.PromoteUnverifiedToConfirmedAsync(
-                            movieId.Value, songId, cancellationToken);
-                    }
+                }
+                else
+                {
+                    // Not a false positive and not strong enough to auto-confirm:
+                    // ensure an unreconciled track still gets a visible status.
+                    await _jobRepository.BaselineNullToUnverifiedAsync(
+                        movieId.Value, songId, cancellationToken);
                 }
             }
 
