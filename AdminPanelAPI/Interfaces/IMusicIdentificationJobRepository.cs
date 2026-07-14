@@ -830,7 +830,9 @@ ON CONFLICT (movieid) DO UPDATE SET
     }
 
     // A track's group-level confidence is the strongest across its occurrences
-    // (confirmed > review > unverified). Null when the movie isn't reconciled.
+    // (confirmed > review > unverified > rejected). Null when the movie isn't
+    // reconciled. Rejected must be reported (not left null) so the UI can badge
+    // it and the status filter can hide/show it.
     private static string? BestConfidence(IEnumerable<MusicTrackOccurrence> occurrences)
     {
         string? best = null;
@@ -838,7 +840,8 @@ ON CONFLICT (movieid) DO UPDATE SET
         {
             if (o.Confidence == "confirmed") return "confirmed";
             if (o.Confidence == "review") best = "review";
-            else if (o.Confidence == "unverified" && best == null) best = "unverified";
+            else if (o.Confidence == "unverified" && best is null or "rejected") best = "unverified";
+            else if (o.Confidence == "rejected" && best == null) best = "rejected";
         }
         return best;
     }
