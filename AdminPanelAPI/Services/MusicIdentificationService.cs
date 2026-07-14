@@ -133,8 +133,7 @@ namespace AdminPanelAPI.Services
                 // The soundtrack cross-check can't corroborate every real
                 // needle-drop/score cue, so when the agent confirms a track is
                 // in the film and its match is solid, promote it to confirmed.
-                var flagForReview = new Dictionary<long, string>();
-                var confirmFromAi = new Dictionary<long, string>();
+                var confidenceUpdates = new Dictionary<long, string>();
                 foreach (var track in tracks)
                 {
                     if (cancellationToken.IsCancellationRequested) break;
@@ -145,16 +144,28 @@ namespace AdminPanelAPI.Services
                         if (aiWarning == null && !string.IsNullOrWhiteSpace(details?.AiDescriptionError))
                             aiWarning = details!.AiDescriptionError;
                         if (details == null) continue;
+
+                        // Only decide for tracks the soundtrack cross-check left
+                        // undecided (unverified or no status); never override a
+                        // confirmed/review/rejected decision.
+                        var undecided = string.IsNullOrEmpty(track.Confidence) ||
+                            string.Equals(track.Confidence, "unverified", StringComparison.OrdinalIgnoreCase);
+                        if (!undecided) continue;
+
                         if (TrackDetailsService.ShouldFlagForReview(details))
                         {
-                            flagForReview[track.SongId] = "review";
+                            confidenceUpdates[track.SongId] = "review";
                         }
                         else if (TrackDetailsService.AiConfirmsInFilm(details) &&
-                                 string.Equals(track.Confidence, "unverified", StringComparison.OrdinalIgnoreCase))
+                                 track.Occurrences.Max(o => o.Score ?? 0) >= TrackDetailsService.ConfirmScoreThreshold)
                         {
-                            var maxScore = track.Occurrences.Max(o => o.Score ?? 0);
-                            if (maxScore >= TrackDetailsService.ConfirmScoreThreshold)
-                                confirmFromAi[track.SongId] = "confirmed";
+                            confidenceUpdates[track.SongId] = "confirmed";
+                        }
+                        else if (string.IsNullOrEmpty(track.Confidence))
+                        {
+                            // Unreconciled and not (yet) confirmable: give it a
+                            // visible baseline instead of a null/blank status.
+                            confidenceUpdates[track.SongId] = "unverified";
                         }
                     }
                     catch (Exception ex)
@@ -165,20 +176,12 @@ namespace AdminPanelAPI.Services
                     }
                 }
 
-                if (flagForReview.Count > 0)
+                if (confidenceUpdates.Count > 0)
                 {
                     _logger.LogInformation(
-                        "Flagging {Count} track(s) as review for movie {MovieId} (agent: not in film).",
-                        flagForReview.Count, movieId);
-                    await _repo.SetSongConfidenceAsync(movieId, flagForReview, cancellationToken);
-                }
-
-                if (confirmFromAi.Count > 0)
-                {
-                    _logger.LogInformation(
-                        "Confirming {Count} track(s) for movie {MovieId} (agent: in film + solid match).",
-                        confirmFromAi.Count, movieId);
-                    await _repo.SetSongConfidenceAsync(movieId, confirmFromAi, cancellationToken);
+                        "AI verdict updated {Count} track status(es) for movie {MovieId}.",
+                        confidenceUpdates.Count, movieId);
+                    await _repo.SetSongConfidenceAsync(movieId, confidenceUpdates, cancellationToken);
                 }
             }
             catch (Exception ex)
