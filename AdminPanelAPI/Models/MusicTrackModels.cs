@@ -152,6 +152,13 @@ namespace AdminPanelAPI.Models
         /// which is often a later compilation/remaster. Transient.
         /// </summary>
         public int? OriginalReleaseYear { get; set; }
+        /// <summary>
+        /// The canonical (original/primary) recording artist of the song per the
+        /// web-search agent. Used to auto-correct a fingerprint mis-attribution
+        /// where the matched recording is a cover/tribute by a different artist
+        /// than the version actually in the film. Transient.
+        /// </summary>
+        public string? AiCanonicalArtist { get; set; }
         public string? WikipediaUrl { get; set; }
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();
