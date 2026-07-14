@@ -516,9 +516,12 @@ namespace AdminPanelAPI.Services
                 "if you cannot tell (use 'unclear' if no film is given).\n" +
                 "'FIRST_RELEASED: <year>' with the 4-digit year the song was ORIGINALLY released/recorded (its debut, not a " +
                 "reissue/compilation), or 'FIRST_RELEASED: unknown' if you cannot determine it.\n" +
-                "'CANONICAL_ARTIST: <name>' with the original/primary recording artist of the version actually used in the " +
-                "film (the fingerprint sometimes matches a cover/tribute/karaoke recording by a different artist — give the " +
-                "real artist), or 'CANONICAL_ARTIST: unknown' if you cannot determine it.\n\n" +
+                "'CANONICAL_ARTIST: <name>' with the artist who PERFORMED THE SPECIFIC RECORDING HEARD IN THE FILM. This is " +
+                "NOT necessarily the song's original artist: a film often uses a cover or a later re-recording, so if the " +
+                "version in this film is by a different performer than whoever first recorded the song, name the performer of " +
+                "the version in the film (e.g. a Danzig re-recording used in a film even though the song was originally a " +
+                "Johnny Cash recording). The fingerprint also sometimes mis-tags it as a cover/tribute artist — give the real " +
+                "performer of the film's version. Use 'CANONICAL_ARTIST: unknown' only if you cannot determine it.\n\n" +
                 "Known facts (already verified, use them):\n" + facts;
 
             var payload = new
