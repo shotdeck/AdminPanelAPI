@@ -24,7 +24,8 @@ public interface IMusicIdentificationJobRepository
     Task<double?> GetSongMaxScoreAsync(int movieId, long songId, CancellationToken cancellationToken);
     Task<bool> PromoteUnverifiedToConfirmedAsync(int movieId, long songId, CancellationToken cancellationToken);
     Task<bool> BaselineNullToUnverifiedAsync(int movieId, long songId, CancellationToken cancellationToken);
-    Task<bool> UpdateSongTrackAsync(long songId, string title, string? artist, CancellationToken cancellationToken);
+    Task<SongTrackUpdate> UpdateSongTrackAsync(long songId, string title, string? artist, CancellationToken cancellationToken);
+    Task DeleteUnlockedAiDescriptionsForSongAsync(long songId, CancellationToken cancellationToken);
     Task<List<MovieSongRow>> GetMovieSongRowsWithLinksAsync(int movieId, CancellationToken cancellationToken);
     Task SetSongLinksAsync(IReadOnlyDictionary<long, (string? spotifyUrl, string? streamingUrl, string? artworkUrl)> linksBySongId, CancellationToken cancellationToken);
     Task<MovieSoundtrack?> GetMovieSoundtrackAsync(int movieId, CancellationToken cancellationToken);
@@ -646,9 +647,16 @@ WHERE movieid = @movieid AND song_id = @song_id AND confidence IS NULL;";
 
     // Edit a track's title and artist. An empty/blank artist clears it; a
     // non-blank artist is found-or-created in frl_music_artists so admins can
-    // enter a brand-new name or reuse an existing one. Returns false if the
-    // song row doesn't exist.
-    public async Task<bool> UpdateSongTrackAsync(
+    // enter a brand-new name or reuse an existing one.
+    //
+    // When the edit actually changes the title/artist, the song's cached
+    // enrichment is invalidated in the same transaction: the streaming links
+    // and artwork are cleared (they were resolved for the old, wrong song) and
+    // the song-level track_details cache row is dropped, so both are re-fetched
+    // for the corrected song. The per-(song,movie) AI description is handled by
+    // the caller (kept when the AI itself just generated it; cleared on a
+    // manual edit). Returns NotFound / Unchanged / Changed.
+    public async Task<SongTrackUpdate> UpdateSongTrackAsync(
         long songId, string title, string? artist, CancellationToken cancellationToken)
     {
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -656,8 +664,38 @@ WHERE movieid = @movieid AND song_id = @song_id AND confidence IS NULL;";
         await using var tx = await conn.BeginTransactionAsync(cancellationToken);
         try
         {
-            long? artistId = null;
+            // Read the current title/artist so we can tell whether this edit is
+            // a real change (and thus whether cached enrichment is now stale).
+            string? currentTitle = null;
+            string? currentArtist = null;
+            var exists = false;
+            const string readSql = @"
+SELECT so.title, ar.name
+FROM frl.frl_music_songs so
+LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
+WHERE so.id = @song_id;";
+            await using (var readCmd = new NpgsqlCommand(readSql, conn, tx))
+            {
+                readCmd.Parameters.AddWithValue("song_id", songId);
+                await using var reader = await readCmd.ExecuteReaderAsync(cancellationToken);
+                if (await reader.ReadAsync(cancellationToken))
+                {
+                    exists = true;
+                    currentTitle = reader.IsDBNull(0) ? null : reader.GetString(0);
+                    currentArtist = reader.IsDBNull(1) ? null : reader.GetString(1);
+                }
+            }
+
+            if (!exists)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return SongTrackUpdate.NotFound;
+            }
+
+            var newTitle = title.Trim();
             var trimmedArtist = artist?.Trim();
+
+            long? artistId = null;
             if (!string.IsNullOrEmpty(trimmedArtist))
             {
                 const string artistSql = @"
@@ -674,26 +712,75 @@ RETURNING id;";
 UPDATE frl.frl_music_songs
 SET title = @title, artist_id = @artist_id
 WHERE id = @song_id;";
-            await using var songCmd = new NpgsqlCommand(songSql, conn, tx);
-            songCmd.Parameters.AddWithValue("title", title.Trim());
-            songCmd.Parameters.AddWithValue("artist_id", (object?)artistId ?? DBNull.Value);
-            songCmd.Parameters.AddWithValue("song_id", songId);
-            var rows = await songCmd.ExecuteNonQueryAsync(cancellationToken);
-
-            if (rows == 0)
+            await using (var songCmd = new NpgsqlCommand(songSql, conn, tx))
             {
-                // Song doesn't exist: don't leave a just-created orphan artist.
-                await tx.RollbackAsync(cancellationToken);
-                return false;
+                songCmd.Parameters.AddWithValue("title", newTitle);
+                songCmd.Parameters.AddWithValue("artist_id", (object?)artistId ?? DBNull.Value);
+                songCmd.Parameters.AddWithValue("song_id", songId);
+                await songCmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            static bool SameText(string? a, string? b) =>
+                string.Equals((a ?? "").Trim(), (b ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
+            var changed = !SameText(currentTitle, newTitle) || !SameText(currentArtist, trimmedArtist);
+
+            if (changed)
+            {
+                // The stored links/artwork and song-level details belong to the
+                // previous (wrong) song — drop them so they're re-fetched.
+                const string clearLinksSql = @"
+UPDATE frl.frl_music_songs
+SET spotify_url = NULL, streaming_url = NULL, artwork_url = NULL
+WHERE id = @song_id;";
+                await using (var clearCmd = new NpgsqlCommand(clearLinksSql, conn, tx))
+                {
+                    clearCmd.Parameters.AddWithValue("song_id", songId);
+                    await clearCmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                await using (var delDetails = new NpgsqlCommand(
+                    "DELETE FROM frl.frl_music_track_details WHERE song_id = @song_id;", conn, tx))
+                {
+                    delDetails.Parameters.AddWithValue("song_id", songId);
+                    await delDetails.ExecuteNonQueryAsync(cancellationToken);
+                }
             }
 
             await tx.CommitAsync(cancellationToken);
-            return true;
+            return changed ? SongTrackUpdate.Changed : SongTrackUpdate.Unchanged;
         }
         catch
         {
             await tx.RollbackAsync(cancellationToken);
             throw;
+        }
+    }
+
+    // Drop cached AI descriptions for a song (all movies) so they regenerate
+    // against the corrected title/artist. Manually-edited/locked descriptions
+    // (edited = true) are preserved. Used after a manual track edit.
+    public async Task DeleteUnlockedAiDescriptionsForSongAsync(
+        long songId, CancellationToken cancellationToken)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        try
+        {
+            const string sql = @"
+DELETE FROM frl.frl_music_track_ai_description
+WHERE song_id = @song_id AND NOT edited;";
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("song_id", songId);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+        {
+            // migration 022 (the `edited` column) not applied yet: there are no
+            // locked rows to preserve, so drop all cached descriptions.
+            await using var cmd = new NpgsqlCommand(
+                "DELETE FROM frl.frl_music_track_ai_description WHERE song_id = @song_id;", conn);
+            cmd.Parameters.AddWithValue("song_id", songId);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
         }
     }
 

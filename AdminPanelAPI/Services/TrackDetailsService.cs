@@ -690,14 +690,19 @@ namespace AdminPanelAPI.Services
             if (ArtistNamesMatch(details.Artist, canonical)) return;
             if (string.IsNullOrWhiteSpace(details.Title)) return;
 
-            var updated = await _repository.UpdateSongTrackAsync(
+            var result = await _repository.UpdateSongTrackAsync(
                 details.SongId, details.Title!.Trim(), canonical, cancellationToken);
-            if (updated)
+            if (result == SongTrackUpdate.Changed)
             {
                 _logger.LogInformation(
                     "Auto-corrected artist for song {SongId}: '{Old}' -> '{New}' (canonical, AI in_film).",
                     details.SongId, details.Artist, canonical);
                 details.Artist = canonical;
+                // The rename cleared this song's now-stale links/artwork (they
+                // pointed at the wrong recording). They're re-resolved by the
+                // streaming-link backfill that runs after description generation
+                // in the identify job / catalog re-run — not here, to avoid a
+                // whole-movie backfill per track during the prewarm loop.
             }
         }
 
