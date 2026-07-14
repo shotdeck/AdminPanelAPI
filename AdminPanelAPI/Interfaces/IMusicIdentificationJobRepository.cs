@@ -21,6 +21,8 @@ public interface IMusicIdentificationJobRepository
     Task<MovieInfo?> GetMovieInfoAsync(int movieId, CancellationToken cancellationToken);
     Task<List<MovieSongRow>> GetMovieSongRowsAsync(int movieId, CancellationToken cancellationToken);
     Task SetSongConfidenceAsync(int movieId, IReadOnlyDictionary<long, string> confidenceBySongId, CancellationToken cancellationToken);
+    Task<double?> GetSongMaxScoreAsync(int movieId, long songId, CancellationToken cancellationToken);
+    Task<bool> PromoteUnverifiedToConfirmedAsync(int movieId, long songId, CancellationToken cancellationToken);
     Task<bool> UpdateSongTrackAsync(long songId, string title, string? artist, CancellationToken cancellationToken);
     Task<List<MovieSongRow>> GetMovieSongRowsWithLinksAsync(int movieId, CancellationToken cancellationToken);
     Task SetSongLinksAsync(IReadOnlyDictionary<long, (string? spotifyUrl, string? streamingUrl, string? artworkUrl)> linksBySongId, CancellationToken cancellationToken);
@@ -578,6 +580,45 @@ WHERE movieid = @movieid AND song_id = @song_id;";
             await tx.RollbackAsync(cancellationToken);
             throw;
         }
+    }
+
+    // Best (highest) fingerprint match score across a song's matched segments
+    // in a movie. Used to gate AI-based auto-confirmation on match strength.
+    public async Task<double?> GetSongMaxScoreAsync(
+        int movieId, long songId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT MAX(score)
+FROM frl.frl_join_movies_music_segments
+WHERE movieid = @movieid AND song_id = @song_id AND matched = true;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        cmd.Parameters.AddWithValue("song_id", songId);
+        var result = await cmd.ExecuteScalarAsync(cancellationToken);
+        return result is null || result is DBNull ? null : Convert.ToDouble(result);
+    }
+
+    // Upgrade a track from "unverified" to "confirmed" for a movie, but only if
+    // it is currently unverified — never overrides a review/rejected/confirmed
+    // decision. Returns true if a row was upgraded.
+    public async Task<bool> PromoteUnverifiedToConfirmedAsync(
+        int movieId, long songId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+UPDATE frl.frl_join_movies_music_segments
+SET confidence = 'confirmed'
+WHERE movieid = @movieid AND song_id = @song_id AND confidence = 'unverified';";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        cmd.Parameters.AddWithValue("song_id", songId);
+        var rows = await cmd.ExecuteNonQueryAsync(cancellationToken);
+        return rows > 0;
     }
 
     // Edit a track's title and artist. An empty/blank artist clears it; a

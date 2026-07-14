@@ -258,12 +258,29 @@ namespace AdminPanelAPI.Controllers
 
             // If the track looks like a false-positive match (agent says it's not
             // in the film, or it was released after the film), flag it for review.
-            if (movieId.HasValue && TrackDetailsService.ShouldFlagForReview(details))
+            // Otherwise, if the AI confirms it's in the film and the fingerprint
+            // match is solid, promote it from unverified to confirmed — the
+            // soundtrack cross-check often can't corroborate real needle-drops
+            // and score cues, so the AI verdict is a second way to confirm.
+            if (movieId.HasValue)
             {
-                await _jobRepository.SetSongConfidenceAsync(
-                    movieId.Value,
-                    new Dictionary<long, string> { [songId] = "review" },
-                    cancellationToken);
+                if (TrackDetailsService.ShouldFlagForReview(details))
+                {
+                    await _jobRepository.SetSongConfidenceAsync(
+                        movieId.Value,
+                        new Dictionary<long, string> { [songId] = "review" },
+                        cancellationToken);
+                }
+                else if (TrackDetailsService.AiConfirmsInFilm(details))
+                {
+                    var maxScore = await _jobRepository.GetSongMaxScoreAsync(
+                        movieId.Value, songId, cancellationToken);
+                    if (maxScore >= TrackDetailsService.ConfirmScoreThreshold)
+                    {
+                        await _jobRepository.PromoteUnverifiedToConfirmedAsync(
+                            movieId.Value, songId, cancellationToken);
+                    }
+                }
             }
 
             return Ok(details);
