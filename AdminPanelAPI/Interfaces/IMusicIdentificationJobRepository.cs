@@ -616,8 +616,15 @@ WHERE id = @song_id;";
             songCmd.Parameters.AddWithValue("song_id", songId);
             var rows = await songCmd.ExecuteNonQueryAsync(cancellationToken);
 
+            if (rows == 0)
+            {
+                // Song doesn't exist: don't leave a just-created orphan artist.
+                await tx.RollbackAsync(cancellationToken);
+                return false;
+            }
+
             await tx.CommitAsync(cancellationToken);
-            return rows > 0;
+            return true;
         }
         catch
         {
