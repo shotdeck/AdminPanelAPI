@@ -606,7 +606,7 @@ namespace AdminPanelAPI.Services
         /// an AI "in_film" verdict. High enough that only solid matches promote;
         /// weaker matches stay unverified even when the AI vouches for the song.
         /// </summary>
-        public const double ConfirmScoreThreshold = 80;
+        public const double ConfirmScoreThreshold = 70;
 
         /// <summary>
         /// Whether the AI verdict says the track is in the film, making it
