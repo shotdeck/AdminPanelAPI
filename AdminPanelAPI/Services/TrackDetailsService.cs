@@ -471,6 +471,11 @@ namespace AdminPanelAPI.Services
                 details.Description = generated.Description;
                 details.DescriptionSource = "openai";
                 details.DescriptionSources = generated.Sources;
+
+                // Fix cover/tribute mis-attribution: if the AI confirms the song
+                // is in the film but names a different canonical artist than the
+                // matched recording, correct the stored artist to the real one.
+                await AutoCorrectArtistAsync(details, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -506,11 +511,14 @@ namespace AdminPanelAPI.Services
                 "If the film is given, determine whether this specific track actually appears in that film (on its " +
                 "soundtrack, score, or otherwise heard on screen). Note the matched audio may be a later remaster or " +
                 "compilation, so judge by the song itself, not by which pressing was matched.\n\n" +
-                "After the prose, output exactly these two tag lines and nothing else:\n" +
+                "After the prose, output exactly these three tag lines and nothing else:\n" +
                 "'VERDICT: in_film' if it does appear, 'VERDICT: not_in_film' if it clearly does not, or 'VERDICT: unclear' " +
                 "if you cannot tell (use 'unclear' if no film is given).\n" +
                 "'FIRST_RELEASED: <year>' with the 4-digit year the song was ORIGINALLY released/recorded (its debut, not a " +
-                "reissue/compilation), or 'FIRST_RELEASED: unknown' if you cannot determine it.\n\n" +
+                "reissue/compilation), or 'FIRST_RELEASED: unknown' if you cannot determine it.\n" +
+                "'CANONICAL_ARTIST: <name>' with the original/primary recording artist of the version actually used in the " +
+                "film (the fingerprint sometimes matches a cover/tribute/karaoke recording by a different artist — give the " +
+                "real artist), or 'CANONICAL_ARTIST: unknown' if you cannot determine it.\n\n" +
                 "Known facts (already verified, use them):\n" + facts;
 
             var payload = new
@@ -568,9 +576,11 @@ namespace AdminPanelAPI.Services
             var raw = text.ToString();
             details.AiInFilm = ExtractInFilmVerdict(raw);
             details.OriginalReleaseYear = ExtractFirstReleasedYear(raw);
+            details.AiCanonicalArtist = ExtractCanonicalArtist(raw);
             // Drop the machine-readable tags so they never show in prose.
             raw = Regex.Replace(raw, @"(?im)^\s*VERDICT:\s*(in_film|not_in_film|unclear)\s*$", "").Trim();
             raw = Regex.Replace(raw, @"(?im)^\s*FIRST_RELEASED:\s*\S+\s*$", "").Trim();
+            raw = Regex.Replace(raw, @"(?im)^\s*CANONICAL_ARTIST:\s*.*$", "").Trim();
 
             var final = CleanDescription(raw);
             return string.IsNullOrEmpty(final) ? null : new AiDescription { Description = final, Sources = sources };
@@ -634,6 +644,58 @@ namespace AdminPanelAPI.Services
             var m = Regex.Match(text, @"(?i)FIRST_RELEASED:\s*(\d{4})");
             if (!m.Success || !int.TryParse(m.Groups[1].Value, out var y)) return null;
             return (y >= 1850 && y <= DateTime.UtcNow.Year + 1) ? y : null;
+        }
+
+        // Pulls the "CANONICAL_ARTIST: <name>" tag — the song's original/primary
+        // recording artist per the agent. Returns null if absent/unknown.
+        private static string? ExtractCanonicalArtist(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            var m = Regex.Match(text, @"(?im)^\s*CANONICAL_ARTIST:\s*(.+?)\s*$");
+            if (!m.Success) return null;
+            var name = m.Groups[1].Value.Trim().Trim('"', '\'', '.');
+            return (name.Length == 0 || string.Equals(name, "unknown", StringComparison.OrdinalIgnoreCase))
+                ? null
+                : name;
+        }
+
+        // Loose name comparison for artist auto-correction: case/space/punct
+        // insensitive, and treats one name containing the other as a match (so
+        // "Phil Collins" ~ "Phil Collins" and "Prince" ~ "Prince & The Revolution"
+        // don't trigger a needless rename).
+        private static bool ArtistNamesMatch(string? a, string? b)
+        {
+            static string Norm(string? s) => Regex.Replace((s ?? "").ToLowerInvariant(), @"[^a-z0-9]", "");
+            var na = Norm(a);
+            var nb = Norm(b);
+            if (na.Length == 0 || nb.Length == 0) return false;
+            return na == nb || na.Contains(nb) || nb.Contains(na);
+        }
+
+        /// <summary>
+        /// When the AI says the track is in the film but the fingerprint matched
+        /// a different artist than the song's canonical artist (a cover/tribute
+        /// mis-attribution), correct the stored artist to the canonical one so
+        /// the real performer is shown. Only fires on a positive in_film verdict
+        /// with a known canonical artist that differs from the current one.
+        /// </summary>
+        private async Task AutoCorrectArtistAsync(TrackDetails details, CancellationToken cancellationToken)
+        {
+            if (!AiConfirmsInFilm(details)) return;
+            var canonical = details.AiCanonicalArtist;
+            if (string.IsNullOrWhiteSpace(canonical)) return;
+            if (ArtistNamesMatch(details.Artist, canonical)) return;
+            if (string.IsNullOrWhiteSpace(details.Title)) return;
+
+            var updated = await _repository.UpdateSongTrackAsync(
+                details.SongId, details.Title!.Trim(), canonical, cancellationToken);
+            if (updated)
+            {
+                _logger.LogInformation(
+                    "Auto-corrected artist for song {SongId}: '{Old}' -> '{New}' (canonical, AI in_film).",
+                    details.SongId, details.Artist, canonical);
+                details.Artist = canonical;
+            }
         }
 
         // Turns an OpenAI failure into a short, user-facing reason so the upload
