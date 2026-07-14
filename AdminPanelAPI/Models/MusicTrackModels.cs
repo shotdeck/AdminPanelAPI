@@ -99,6 +99,13 @@ namespace AdminPanelAPI.Models
         public string? Status { get; set; }
     }
 
+    /// <summary>Request body for editing a track's title and artist.</summary>
+    public class UpdateTrackRequest
+    {
+        public string? Title { get; set; }
+        public string? Artist { get; set; }
+    }
+
     /// <summary>
     /// Enrichment for a single identified track (description + credits +
     /// release metadata), cached after the first lookup.

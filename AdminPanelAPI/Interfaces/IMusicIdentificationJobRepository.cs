@@ -21,6 +21,7 @@ public interface IMusicIdentificationJobRepository
     Task<MovieInfo?> GetMovieInfoAsync(int movieId, CancellationToken cancellationToken);
     Task<List<MovieSongRow>> GetMovieSongRowsAsync(int movieId, CancellationToken cancellationToken);
     Task SetSongConfidenceAsync(int movieId, IReadOnlyDictionary<long, string> confidenceBySongId, CancellationToken cancellationToken);
+    Task<bool> UpdateSongTrackAsync(long songId, string title, string? artist, CancellationToken cancellationToken);
     Task<List<MovieSongRow>> GetMovieSongRowsWithLinksAsync(int movieId, CancellationToken cancellationToken);
     Task SetSongLinksAsync(IReadOnlyDictionary<long, (string? spotifyUrl, string? streamingUrl, string? artworkUrl)> linksBySongId, CancellationToken cancellationToken);
     Task<MovieSoundtrack?> GetMovieSoundtrackAsync(int movieId, CancellationToken cancellationToken);
@@ -571,6 +572,52 @@ WHERE movieid = @movieid AND song_id = @song_id;";
             }
 
             await tx.CommitAsync(cancellationToken);
+        }
+        catch
+        {
+            await tx.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    // Edit a track's title and artist. An empty/blank artist clears it; a
+    // non-blank artist is found-or-created in frl_music_artists so admins can
+    // enter a brand-new name or reuse an existing one. Returns false if the
+    // song row doesn't exist.
+    public async Task<bool> UpdateSongTrackAsync(
+        long songId, string title, string? artist, CancellationToken cancellationToken)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            long? artistId = null;
+            var trimmedArtist = artist?.Trim();
+            if (!string.IsNullOrEmpty(trimmedArtist))
+            {
+                const string artistSql = @"
+INSERT INTO frl.frl_music_artists (name)
+VALUES (@name)
+ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+RETURNING id;";
+                await using var artistCmd = new NpgsqlCommand(artistSql, conn, tx);
+                artistCmd.Parameters.AddWithValue("name", trimmedArtist);
+                artistId = Convert.ToInt64(await artistCmd.ExecuteScalarAsync(cancellationToken));
+            }
+
+            const string songSql = @"
+UPDATE frl.frl_music_songs
+SET title = @title, artist_id = @artist_id
+WHERE id = @song_id;";
+            await using var songCmd = new NpgsqlCommand(songSql, conn, tx);
+            songCmd.Parameters.AddWithValue("title", title.Trim());
+            songCmd.Parameters.AddWithValue("artist_id", (object?)artistId ?? DBNull.Value);
+            songCmd.Parameters.AddWithValue("song_id", songId);
+            var rows = await songCmd.ExecuteNonQueryAsync(cancellationToken);
+
+            await tx.CommitAsync(cancellationToken);
+            return rows > 0;
         }
         catch
         {

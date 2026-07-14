@@ -356,6 +356,32 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
+        /// Edit a track's title and artist (admin). A blank artist clears it;
+        /// a non-blank artist is found-or-created so a brand-new or existing
+        /// name can be used.
+        /// </summary>
+        [HttpPut("song/{songId:long}/track")]
+        public async Task<IActionResult> UpdateTrack(
+            long songId,
+            [FromBody] UpdateTrackRequest request,
+            CancellationToken cancellationToken)
+        {
+            var title = (request?.Title ?? string.Empty).Trim();
+            if (string.IsNullOrEmpty(title))
+                return BadRequest(new { error = "title is required." });
+
+            var updated = await _jobRepository.UpdateSongTrackAsync(
+                songId, title, request?.Artist, cancellationToken);
+            if (!updated)
+                return NotFound();
+
+            var artist = string.IsNullOrWhiteSpace(request?.Artist)
+                ? null
+                : request!.Artist!.Trim();
+            return Ok(new { songId, title, artist });
+        }
+
+        /// <summary>
         /// Backfill streaming links on a movie's identified tracks: search Spotify
         /// for each (title, artist) with a similarity guard, store the matched
         /// Spotify URL, and derive a universal all-services link (song.link).
