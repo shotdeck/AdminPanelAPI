@@ -130,7 +130,11 @@ namespace AdminPanelAPI.Services
                 // Tracks the web-search agent judges are NOT in the film, or that
                 // were released after the film, are likely fingerprint false
                 // positives; flag them for review.
+                // The soundtrack cross-check can't corroborate every real
+                // needle-drop/score cue, so when the agent confirms a track is
+                // in the film and its match is solid, promote it to confirmed.
                 var flagForReview = new Dictionary<long, string>();
+                var confirmFromAi = new Dictionary<long, string>();
                 foreach (var track in tracks)
                 {
                     if (cancellationToken.IsCancellationRequested) break;
@@ -140,8 +144,18 @@ namespace AdminPanelAPI.Services
                             track.SongId, movieId, false, cancellationToken);
                         if (aiWarning == null && !string.IsNullOrWhiteSpace(details?.AiDescriptionError))
                             aiWarning = details!.AiDescriptionError;
-                        if (details != null && TrackDetailsService.ShouldFlagForReview(details))
+                        if (details == null) continue;
+                        if (TrackDetailsService.ShouldFlagForReview(details))
+                        {
                             flagForReview[track.SongId] = "review";
+                        }
+                        else if (TrackDetailsService.AiConfirmsInFilm(details) &&
+                                 string.Equals(track.Confidence, "unverified", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var maxScore = track.Occurrences.Max(o => o.Score ?? 0);
+                            if (maxScore >= TrackDetailsService.ConfirmScoreThreshold)
+                                confirmFromAi[track.SongId] = "confirmed";
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -157,6 +171,14 @@ namespace AdminPanelAPI.Services
                         "Flagging {Count} track(s) as review for movie {MovieId} (agent: not in film).",
                         flagForReview.Count, movieId);
                     await _repo.SetSongConfidenceAsync(movieId, flagForReview, cancellationToken);
+                }
+
+                if (confirmFromAi.Count > 0)
+                {
+                    _logger.LogInformation(
+                        "Confirming {Count} track(s) for movie {MovieId} (agent: in film + solid match).",
+                        confirmFromAi.Count, movieId);
+                    await _repo.SetSongConfidenceAsync(movieId, confirmFromAi, cancellationToken);
                 }
             }
             catch (Exception ex)

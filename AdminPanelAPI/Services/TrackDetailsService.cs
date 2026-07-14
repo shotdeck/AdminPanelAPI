@@ -601,6 +601,21 @@ namespace AdminPanelAPI.Services
             return details.ReleasedAfterMovie;
         }
 
+        /// <summary>
+        /// Minimum fingerprint match score for a track to be auto-confirmed on
+        /// an AI "in_film" verdict. High enough that only solid matches promote;
+        /// weaker matches stay unverified even when the AI vouches for the song.
+        /// </summary>
+        public const double ConfirmScoreThreshold = 80;
+
+        /// <summary>
+        /// Whether the AI verdict says the track is in the film, making it
+        /// eligible to be promoted from unverified to confirmed (subject to a
+        /// solid match score checked by the caller).
+        /// </summary>
+        public static bool AiConfirmsInFilm(TrackDetails details) =>
+            string.Equals(details.AiInFilm, "in_film", StringComparison.OrdinalIgnoreCase);
+
         // Pulls the "VERDICT: ..." tag the agent appends to say whether the
         // track actually appears in the film. Returns null if absent.
         private static string? ExtractInFilmVerdict(string? text)
