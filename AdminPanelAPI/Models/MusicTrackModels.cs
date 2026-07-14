@@ -156,6 +156,7 @@ namespace AdminPanelAPI.Models
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();
         public List<MusicCredit> Producers { get; set; } = new();
+        public List<MusicCredit> Publishers { get; set; } = new();
         public string? Album { get; set; }
         public string? ReleaseDate { get; set; }
         public string? Label { get; set; }
