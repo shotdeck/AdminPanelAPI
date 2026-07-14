@@ -104,6 +104,23 @@ namespace AdminPanelAPI.Models
     {
         public string? Title { get; set; }
         public string? Artist { get; set; }
+        /// <summary>
+        /// Optional movie context. When supplied and the edit changes the
+        /// title/artist, the track's streaming links + artwork are re-resolved
+        /// for that movie so they match the corrected song.
+        /// </summary>
+        public int? MovieId { get; set; }
+    }
+
+    /// <summary>Outcome of editing a track's title/artist.</summary>
+    public enum SongTrackUpdate
+    {
+        /// <summary>The song row doesn't exist.</summary>
+        NotFound,
+        /// <summary>Found, but the title and artist were already as requested.</summary>
+        Unchanged,
+        /// <summary>Found and the title and/or artist changed.</summary>
+        Changed
     }
 
     /// <summary>

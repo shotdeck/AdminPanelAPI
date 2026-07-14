@@ -189,6 +189,20 @@ namespace AdminPanelAPI.Services
                 _logger.LogWarning(ex, "Track-details pre-warm failed for movie {MovieId}.", movieId);
             }
 
+            // The description pass can auto-correct cover/tribute artists, which
+            // clears those tracks' now-wrong streaming links + artwork. Re-run
+            // the backfill so the corrected songs get matching art/links. Cheap:
+            // force=false only searches the just-cleared (null-link) tracks.
+            try
+            {
+                await _repo.UpdateProgressAsync(jobId, "Refreshing links for corrected tracks", 98, cancellationToken);
+                await _streamingLinkService.BackfillAsync(movieId, false, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Post-correction streaming-link refill failed for movie {MovieId}.", movieId);
+            }
+
             await _repo.MarkCompletedAsync(
                 jobId,
                 result.MatchedSegments.Count,

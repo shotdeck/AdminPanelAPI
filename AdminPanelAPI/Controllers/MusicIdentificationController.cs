@@ -392,15 +392,43 @@ namespace AdminPanelAPI.Controllers
             if (string.IsNullOrEmpty(title))
                 return BadRequest(new { error = "title is required." });
 
-            var updated = await _jobRepository.UpdateSongTrackAsync(
+            var result = await _jobRepository.UpdateSongTrackAsync(
                 songId, title, request?.Artist, cancellationToken);
-            if (!updated)
+            if (result == SongTrackUpdate.NotFound)
                 return NotFound();
 
             var artist = string.IsNullOrWhiteSpace(request?.Artist)
                 ? null
                 : request!.Artist!.Trim();
-            return Ok(new { songId, title, artist });
+
+            // A real change makes the cached description, artwork and streaming
+            // links (resolved for the previous song) stale. UpdateSongTrackAsync
+            // already cleared the links/artwork and song-level details cache;
+            // drop the (non-locked) AI descriptions so they regenerate, and
+            // re-resolve links/artwork for this movie so the corrected song
+            // shows matching art. Re-resolution only touches the just-cleared
+            // (null-link) track, so it's cheap.
+            if (result == SongTrackUpdate.Changed)
+            {
+                await _jobRepository.DeleteUnlockedAiDescriptionsForSongAsync(songId, cancellationToken);
+                if (request?.MovieId is int movieId)
+                {
+                    try
+                    {
+                        await _streamingLinkService.BackfillAsync(movieId, force: false, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Links/artwork will be refilled on the next backfill run;
+                        // don't fail the edit if Spotify/Odesli is unavailable.
+                        _logger.LogWarning(ex,
+                            "Post-edit streaming-link refresh failed for song {SongId} in movie {MovieId}.",
+                            songId, movieId);
+                    }
+                }
+            }
+
+            return Ok(new { songId, title, artist, changed = result == SongTrackUpdate.Changed });
         }
 
         /// <summary>
