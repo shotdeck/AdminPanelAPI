@@ -53,19 +53,20 @@ namespace AdminPanelAPI.Services
 
             var baseUrl = _musicApiBaseUrl.TrimEnd('/');
 
-            // A healthy full-movie scan finishes in ~10-12 min. Modal occasionally
+            // A typical full-movie scan finishes in ~10-12 min. Modal occasionally
             // stalls at the detect step (an intermittent hang we've observed on
             // larger files); rather than blocking the single-threaded queue on one
-            // hung call for the better part of an hour, cap each attempt and
-            // re-spawn a fresh Modal call. Re-spawning reliably clears the stall.
+            // hung call, cap each attempt and re-spawn a fresh Modal call, which
+            // reliably clears the stall.
             //
-            // The cap must still clear a genuinely-long run: heavily-scored films
-            // (e.g. True Lies) have lots of music the fingerprint providers can't
-            // match, so recognition steps finely through thousands of seconds and
-            // legitimately runs well past an hour. Too short a cap cancels that
-            // real work and re-spawns forever (the movie never completes), so the
-            // cap is generous enough to let such a scan finish in one attempt.
-            var perAttemptTimeout = TimeSpan.FromMinutes(150);
+            // The cap must still clear the slowest legitimate scans: heavily-scored
+            // films (e.g. True Lies ~20 min) have lots of music the fingerprint
+            // providers can't match, so recognition steps finely through every
+            // region with paced provider calls. The previous 18-min cap sat right
+            // on that runtime and cancelled the real work just before it finished,
+            // so the movie re-spawned forever and never completed. 60 min gives
+            // ample headroom for such scans while still bounding a genuine hang.
+            var perAttemptTimeout = TimeSpan.FromMinutes(60);
             const int maxAttempts = 2;
 
             MusicApiResponse? result = null;
