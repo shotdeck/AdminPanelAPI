@@ -104,15 +104,18 @@ namespace AdminPanelAPI.Services
                 ", which may be wrong. " +
                 "Identify the music STRICTLY from what you actually hear in this clip. " +
                 "The film name is context only — do NOT assume it is one of that film's famous or " +
-                "signature songs, and do NOT let the film's reputation influence your guess. If the " +
-                "audio is faint, buried under dialogue, or you cannot actually recognise it, say so: " +
-                "return a null title and \"low\" confidence rather than guessing a well-known track. " +
-                "Only give a title you can genuinely hear. " +
+                "signature songs, and never invent a specific well-known track title just to fit the film. " +
+                "Separate two judgements: (a) the exact TITLE — only give one you can genuinely recognise " +
+                "by ear, otherwise null; (b) whether it is an instrumental film-score cue and, if so, the " +
+                "likely COMPOSER and musical style — you MAY name the composer/style when you can hear it " +
+                "is orchestral score even if you cannot name the exact cue, since composer/style is more " +
+                "reliable than the exact title. If the music is too faint or buried under dialogue to tell " +
+                "anything, return nulls and \"low\" confidence rather than guessing. " +
                 "Reply ONLY with a JSON object with these keys: " +
                 "\"title\" (track/cue title you actually recognise, or null if unsure), " +
                 "\"artist\" (performer or composer, or null if unsure), " +
                 "\"is_score_cue\" (true if it's an instrumental film-score cue, false if a commercial/pop song), " +
-                "\"confidence\" (\"low\", \"medium\" or \"high\"; use \"low\" whenever you are guessing), " +
+                "\"confidence\" (\"low\", \"medium\" or \"high\"; use \"low\" whenever you are guessing a title), " +
                 "\"explanation\" (one or two sentences; state honestly if you cannot identify it). " +
                 "Prefer the composer/artist you are confident about even when unsure of the exact title.";
 
