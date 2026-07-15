@@ -69,6 +69,7 @@ namespace AdminPanelAPI.Services
                 details.Title = song.Title;
                 details.Artist = song.Artist;
                 details.SpotifyUrl = song.SpotifyUrl;
+                details.ArtworkUrl = song.ArtworkUrl;
             }
             else
             {
@@ -77,12 +78,20 @@ namespace AdminPanelAPI.Services
                     SongId = songId,
                     Title = song.Title,
                     Artist = song.Artist,
-                    SpotifyUrl = song.SpotifyUrl
+                    SpotifyUrl = song.SpotifyUrl,
+                    ArtworkUrl = song.ArtworkUrl
                 };
 
                 await EnrichFromMusicBrainzAsync(details, song, cancellationToken);
                 await EnrichFromWikipediaAsync(details, song, cancellationToken);
                 await EnrichFromSpotifyAsync(details, song, cancellationToken);
+
+                // When the exact recording heard in the film isn't in the
+                // providers (a film-specific arrangement/cover, e.g. a Hollywood
+                // Symphony Orchestra rendition for Austin Powers), fall back to
+                // the underlying composition/original recording so writers,
+                // artwork and a Spotify link still resolve — clearly marked.
+                await EnrichCompositionFallbackAsync(details, song, cancellationToken);
 
                 await _repository.UpsertTrackDetailsAsync(details, cancellationToken);
             }
@@ -430,6 +439,169 @@ namespace AdminPanelAPI.Services
             {
                 _logger.LogDebug(ex, "Spotify enrichment failed for song {SongId}", details.SongId);
             }
+        }
+
+        // ---- Composition-level fallback --------------------------------------
+
+        /// <summary>
+        /// When the exact recording heard in the film isn't catalogued by the
+        /// providers — a film-specific arrangement or cover (e.g. a Hollywood
+        /// Symphony Orchestra rendition made for a movie) — fill the gaps from
+        /// the underlying COMPOSITION: writers/composers from its MusicBrainz
+        /// work, and artwork + a Spotify link + preview from the composition's
+        /// best-known recording (matched by title alone). Only fills what didn't
+        /// already resolve at the recording level, and marks the details as
+        /// composition-level so the UI can label the info as being about the
+        /// composition, not the exact film cue.
+        /// </summary>
+        private async Task EnrichCompositionFallbackAsync(TrackDetails details, MovieSongRow song, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(song.Title)) return;
+
+            var needCredits = details.Writers.Count == 0 && details.Composers.Count == 0;
+            var needArtwork = string.IsNullOrWhiteSpace(details.ArtworkUrl);
+            var needSpotify = string.IsNullOrWhiteSpace(details.SpotifyUrl);
+            if (!needCredits && !needArtwork && !needSpotify) return;
+
+            var filled = false;
+
+            // 1. Composition credits from the MusicBrainz work (matched by title).
+            if (needCredits)
+            {
+                try
+                {
+                    foreach (var workId in await ResolveWorkCandidatesByTitleAsync(song.Title!, cancellationToken))
+                    {
+                        await EnrichFromWorkAsync(details, workId, cancellationToken);
+                        if (details.Writers.Count > 0 || details.Composers.Count > 0)
+                        {
+                            filled = true;
+                            if (string.IsNullOrWhiteSpace(details.MusicbrainzUrl))
+                                details.MusicbrainzUrl = "https://musicbrainz.org/work/" + workId;
+                            break;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Composition work lookup failed for song {SongId}", details.SongId);
+                }
+            }
+
+            // 2. Artwork + Spotify link + preview from the composition's
+            //    best-known recording (matched by title alone).
+            if (needArtwork || needSpotify)
+            {
+                try
+                {
+                    var (spotifyUrl, artworkUrl, previewUrl) =
+                        await SearchCompositionRecordingAsync(song.Title!, cancellationToken);
+
+                    var newSpotify = needSpotify && !string.IsNullOrWhiteSpace(spotifyUrl) ? spotifyUrl : null;
+                    var newArtwork = needArtwork && !string.IsNullOrWhiteSpace(artworkUrl) ? artworkUrl : null;
+
+                    if (newSpotify != null) { details.SpotifyUrl = newSpotify; filled = true; }
+                    if (newArtwork != null) { details.ArtworkUrl = newArtwork; filled = true; }
+                    if (!string.IsNullOrWhiteSpace(previewUrl) && string.IsNullOrWhiteSpace(details.PreviewUrl))
+                        details.PreviewUrl = previewUrl;
+
+                    // Persist onto the song row so the track thumbnail and future
+                    // loads show the composition link/artwork.
+                    if (newSpotify != null || newArtwork != null)
+                        await _repository.SetSongLinksAsync(
+                            new Dictionary<long, (string? spotifyUrl, string? streamingUrl, string? artworkUrl)>
+                            {
+                                [details.SongId] = (newSpotify, null, newArtwork)
+                            },
+                            cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Composition recording lookup failed for song {SongId}", details.SongId);
+                }
+            }
+
+            if (filled) details.CompositionFallback = true;
+        }
+
+        // Up to 5 MusicBrainz work ids whose title matches the song title, so
+        // the caller can walk them until one carries writer/composer relations.
+        // Requires a real title (>= 2 tokens) so a generic one-word cue name
+        // doesn't pull an unrelated work.
+        private async Task<List<string>> ResolveWorkCandidatesByTitleAsync(string title, CancellationToken cancellationToken)
+        {
+            var titleTokens = Tokenize(title);
+            if (titleTokens.Count < 2) return new List<string>();
+
+            var json = await GetStringAsync(
+                $"https://musicbrainz.org/ws/2/work?query={Uri.EscapeDataString("work:\"" + title + "\"")}&fmt=json&limit=10",
+                cancellationToken);
+            if (json == null) return new List<string>();
+
+            var ids = new List<string>();
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("works", out var works) && works.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var w in works.EnumerateArray())
+                {
+                    var wt = w.TryGetProperty("title", out var t) ? t.GetString() : null;
+                    if (!titleTokens.IsSubsetOf(Tokenize(wt))) continue;
+                    if (w.TryGetProperty("id", out var id) && id.GetString() is { } wid)
+                        ids.Add(wid);
+                    if (ids.Count >= 5) break;
+                }
+            }
+            return ids;
+        }
+
+        // Search Spotify by title alone for the composition's best-known
+        // recording and return its Spotify URL, cover art and 30s preview. The
+        // candidate title must contain all of the song's title tokens (>= 2), so
+        // an unrelated single-word match isn't attached.
+        private async Task<(string? spotifyUrl, string? artworkUrl, string? previewUrl)> SearchCompositionRecordingAsync(
+            string title, CancellationToken cancellationToken)
+        {
+            var titleTokens = Tokenize(title);
+            if (titleTokens.Count < 2) return (null, null, null);
+
+            var clientId = _configuration["Spotify:ClientId"] ?? _configuration["SPOTIFY_CLIENT_ID"];
+            var clientSecret = _configuration["Spotify:ClientSecret"] ?? _configuration["SPOTIFY_CLIENT_SECRET"];
+            if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret)) return (null, null, null);
+
+            var token = await GetSpotifyTokenAsync(clientId, clientSecret, cancellationToken);
+            if (token == null) return (null, null, null);
+
+            using var req = new HttpRequestMessage(HttpMethod.Get,
+                "https://api.spotify.com/v1/search?type=track&limit=5&q=" + Uri.EscapeDataString(title));
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            using var resp = await _http.SendAsync(req, cancellationToken);
+            if (!resp.IsSuccessStatusCode) return (null, null, null);
+
+            var body = await resp.Content.ReadAsStringAsync(cancellationToken);
+            using var doc = JsonDocument.Parse(body);
+            if (!doc.RootElement.TryGetProperty("tracks", out var tracks) ||
+                !tracks.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
+                return (null, null, null);
+
+            foreach (var item in items.EnumerateArray())
+            {
+                var candTitle = item.TryGetProperty("name", out var n) ? n.GetString() : null;
+                if (!titleTokens.IsSubsetOf(Tokenize(candTitle))) continue;
+
+                var spotifyUrl = item.TryGetProperty("external_urls", out var ext) &&
+                                 ext.TryGetProperty("spotify", out var sp) ? sp.GetString() : null;
+                var previewUrl = item.TryGetProperty("preview_url", out var pv) && pv.ValueKind == JsonValueKind.String
+                    ? pv.GetString() : null;
+                string? artworkUrl = null;
+                if (item.TryGetProperty("album", out var album) &&
+                    album.TryGetProperty("images", out var imgs) && imgs.ValueKind == JsonValueKind.Array &&
+                    imgs.GetArrayLength() > 0 && imgs[0].TryGetProperty("url", out var iu))
+                    artworkUrl = iu.GetString();
+
+                return (spotifyUrl, artworkUrl, previewUrl);
+            }
+
+            return (null, null, null);
         }
 
         // ---- OpenAI (film-specific description) ------------------------------
