@@ -15,6 +15,10 @@ namespace AdminPanelAPI.Services
         // Audio-input chat model that can "listen" to the clip.
         private const string AudioModel = "gpt-audio";
 
+        // Web-search reasoning model used to turn the audio model's
+        // composer/style read into a specific soundtrack cue title.
+        private const string WebSearchModel = "gpt-4o";
+
         public AudioIdentifyService(
             IHttpClientFactory httpClientFactory,
             IConfiguration configuration,
@@ -54,9 +58,10 @@ namespace AdminPanelAPI.Services
                 return new AudioIdentifySuggestion { Error = "Couldn't extract the clip audio." };
             }
 
+            AudioIdentifySuggestion suggestion;
             try
             {
-                return await AskAudioModelAsync(
+                suggestion = await AskAudioModelAsync(
                     apiKey, audioB64, currentTitle, currentArtist,
                     movieTitle, movieYear, cancellationToken);
             }
@@ -65,6 +70,29 @@ namespace AdminPanelAPI.Services
                 _logger.LogWarning(ex, "Audio identification call failed.");
                 return new AudioIdentifySuggestion { Error = "The audio model call failed." };
             }
+
+            // Second step: the audio model reliably hears the composer/style but
+            // not the exact cue title. When it heard something usable (a
+            // performer/composer or an instrumental score cue), use a web-search
+            // reasoning pass over the film's soundtrack/score to propose the
+            // specific title — the way ChatGPT gets it. Advisory only; failures
+            // leave the audio suggestion untouched.
+            if (suggestion.Error == null &&
+                (!string.IsNullOrWhiteSpace(suggestion.Artist) || suggestion.IsScoreCue))
+            {
+                try
+                {
+                    await RefineTitleWithWebSearchAsync(
+                        apiKey, suggestion, currentTitle, currentArtist,
+                        movieTitle, movieYear, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Web-search title refinement failed.");
+                }
+            }
+
+            return suggestion;
         }
 
         private async Task<string> ExtractClipAsync(
@@ -170,6 +198,104 @@ namespace AdminPanelAPI.Services
                 .GetString() ?? "";
 
             return ParseSuggestion(content);
+        }
+
+        // Turns the audio model's composer/style read into a specific soundtrack
+        // cue title via a web-search reasoning pass (OpenAI Responses API), then
+        // merges any found title/artist into the suggestion. Best-effort: if the
+        // model can't find a real match it leaves the title alone.
+        private async Task RefineTitleWithWebSearchAsync(
+            string apiKey,
+            AudioIdentifySuggestion suggestion,
+            string currentTitle,
+            string? currentArtist,
+            string movieTitle,
+            int? movieYear,
+            CancellationToken cancellationToken)
+        {
+            var yearText = movieYear.HasValue ? $" ({movieYear})" : "";
+            var heard = new StringBuilder();
+            if (!string.IsNullOrWhiteSpace(suggestion.Artist))
+                heard.Append($"Performer/composer heard: {suggestion.Artist}. ");
+            heard.Append(suggestion.IsScoreCue
+                ? "It is an instrumental film-score cue. "
+                : "It is a commercial/pop song, not a score cue. ");
+            if (!string.IsNullOrWhiteSpace(suggestion.Explanation))
+                heard.Append($"Audio notes: {suggestion.Explanation} ");
+
+            var prompt =
+                $"A short music clip from the film \"{movieTitle}\"{yearText} was identified by ear. {heard}" +
+                $"A fingerprint service (often wrong) had labelled it \"{currentTitle}\"" +
+                (string.IsNullOrWhiteSpace(currentArtist) ? "" : $" by \"{currentArtist}\"") + ". " +
+                "Using web search of this film's official soundtrack and score track listing, determine the " +
+                "single most likely EXACT cue/track title that matches what was heard. Only name a title that " +
+                "genuinely appears on this film's soundtrack or score — do NOT invent one to fit. If you cannot " +
+                "find a specific real match, return a null title. " +
+                "Reply ONLY with a JSON object with keys: " +
+                "\"title\" (exact cue/track title, or null), " +
+                "\"artist\" (performer or composer, or null), " +
+                "\"confidence\" (\"low\", \"medium\" or \"high\"), " +
+                "\"explanation\" (one sentence).";
+
+            var payload = new
+            {
+                model = WebSearchModel,
+                tools = new[] { new { type = "web_search_preview" } },
+                input = prompt
+            };
+
+            var client = _httpClientFactory.CreateClient();
+            client.Timeout = TimeSpan.FromSeconds(120);
+            using var req = new HttpRequestMessage(
+                HttpMethod.Post, "https://api.openai.com/v1/responses");
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            req.Content = new StringContent(
+                JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+
+            using var resp = await client.SendAsync(req, cancellationToken);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _logger.LogDebug("Web-search title call returned {Status}.", resp.StatusCode);
+                return;
+            }
+
+            var body = await resp.Content.ReadAsStringAsync(cancellationToken);
+            var text = ExtractResponsesText(body);
+            if (string.IsNullOrWhiteSpace(text)) return;
+
+            var refined = ParseSuggestion(text);
+            if (string.IsNullOrWhiteSpace(refined.Title)) return;
+
+            suggestion.Title = refined.Title;
+            if (!string.IsNullOrWhiteSpace(refined.Artist))
+                suggestion.Artist = refined.Artist;
+            if (!string.IsNullOrWhiteSpace(refined.Confidence))
+                suggestion.Confidence = refined.Confidence;
+            if (!string.IsNullOrWhiteSpace(refined.Explanation))
+                suggestion.Explanation = refined.Explanation;
+        }
+
+        // Concatenates the "output_text" parts of an OpenAI Responses API result.
+        private static string ExtractResponsesText(string body)
+        {
+            var text = new StringBuilder();
+            using var doc = JsonDocument.Parse(body);
+            if (!doc.RootElement.TryGetProperty("output", out var output)
+                || output.ValueKind != JsonValueKind.Array)
+                return "";
+            foreach (var item in output.EnumerateArray())
+            {
+                if (!item.TryGetProperty("content", out var content)
+                    || content.ValueKind != JsonValueKind.Array)
+                    continue;
+                foreach (var c in content.EnumerateArray())
+                {
+                    if (c.TryGetProperty("type", out var ct) && ct.GetString() == "output_text"
+                        && c.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.String)
+                        text.Append(tx.GetString());
+                }
+            }
+            return text.ToString();
         }
 
         private static AudioIdentifySuggestion ParseSuggestion(string content)
