@@ -58,7 +58,14 @@ namespace AdminPanelAPI.Services
             // larger files); rather than blocking the single-threaded queue on one
             // hung call for the better part of an hour, cap each attempt and
             // re-spawn a fresh Modal call. Re-spawning reliably clears the stall.
-            var perAttemptTimeout = TimeSpan.FromMinutes(18);
+            //
+            // The cap must still clear a genuinely-long run: heavily-scored films
+            // (e.g. True Lies) have lots of music the fingerprint providers can't
+            // match, so recognition steps finely through thousands of seconds and
+            // legitimately runs well past an hour. Too short a cap cancels that
+            // real work and re-spawns forever (the movie never completes), so the
+            // cap is generous enough to let such a scan finish in one attempt.
+            var perAttemptTimeout = TimeSpan.FromMinutes(150);
             const int maxAttempts = 2;
 
             MusicApiResponse? result = null;
