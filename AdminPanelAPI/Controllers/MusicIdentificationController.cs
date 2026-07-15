@@ -17,6 +17,7 @@ namespace AdminPanelAPI.Controllers
         private readonly ISoundtrackReconciliationService _reconciliationService;
         private readonly IStreamingLinkService _streamingLinkService;
         private readonly ITrackDetailsService _trackDetailsService;
+        private readonly IAudioIdentifyService _audioIdentifyService;
         private readonly IConfiguration _configuration;
         private readonly ILogger<MusicIdentificationController> _logger;
         private readonly string _connectionString;
@@ -34,6 +35,7 @@ namespace AdminPanelAPI.Controllers
             ISoundtrackReconciliationService reconciliationService,
             IStreamingLinkService streamingLinkService,
             ITrackDetailsService trackDetailsService,
+            IAudioIdentifyService audioIdentifyService,
             IConfiguration configuration,
             ILogger<MusicIdentificationController> logger)
         {
@@ -42,6 +44,7 @@ namespace AdminPanelAPI.Controllers
             _reconciliationService = reconciliationService;
             _streamingLinkService = streamingLinkService;
             _trackDetailsService = trackDetailsService;
+            _audioIdentifyService = audioIdentifyService;
             _configuration = configuration;
             _logger = logger;
             _connectionString = configuration.GetConnectionString("Default")
@@ -331,6 +334,79 @@ namespace AdminPanelAPI.Controllers
             if (details == null)
                 return NotFound();
             return Ok(details);
+        }
+
+        /// <summary>
+        /// Audio-listening identification for a weak/false fingerprint match:
+        /// extracts the clip's real audio and asks an audio LLM what the music
+        /// is. Advisory only — returns a suggestion; the caller confirms before
+        /// applying it via the track-edit endpoint. Writes nothing.
+        /// </summary>
+        [HttpPost("song/{songId:long}/audio-identify")]
+        public async Task<IActionResult> AudioIdentify(
+            long songId,
+            [FromQuery] int movieId,
+            CancellationToken cancellationToken)
+        {
+            if (movieId <= 0)
+                return BadRequest("movieId is required.");
+
+            var r2Key = await GetR2KeyFromDialogueJobAsync(movieId, cancellationToken)
+                ?? await GetR2KeyForMovieAsync(movieId, cancellationToken)
+                ?? await ResolveR2KeyForMovieAsync(movieId, cancellationToken);
+            if (string.IsNullOrWhiteSpace(r2Key))
+                return NotFound(new { error = $"No source video found for movie {movieId}." });
+
+            var occ = await GetSongOccurrenceAsync(movieId, songId, cancellationToken);
+            if (occ == null)
+                return NotFound(new { error = $"No occurrence found for song {songId} in movie {movieId}." });
+
+            var suggestion = await _audioIdentifyService.IdentifyAsync(
+                r2Key,
+                occ.Value.Start,
+                occ.Value.End,
+                occ.Value.Title ?? "",
+                occ.Value.Artist,
+                occ.Value.MovieTitle ?? "",
+                occ.Value.MovieYear,
+                cancellationToken);
+
+            return Ok(suggestion);
+        }
+
+        private async Task<(double Start, double End, string? Title, string? Artist, string? MovieTitle, int? MovieYear)?>
+            GetSongOccurrenceAsync(int movieId, long songId, CancellationToken cancellationToken)
+        {
+            const string sql = @"
+SELECT s.start_time, s.end_time, so.title, ar.name AS artist,
+       m.title AS movie_title, m.year AS movie_year
+FROM frl.frl_join_movies_music_segments s
+JOIN frl.frl_music_songs so ON s.song_id = so.id
+LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
+LEFT JOIN frl.frl_movies m ON m.idnum = s.movieid
+WHERE s.movieid = @movieid AND s.song_id = @song_id
+ORDER BY (s.end_time - s.start_time) DESC
+LIMIT 1;";
+
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken);
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("movieid", movieId);
+            cmd.Parameters.AddWithValue("song_id", songId);
+
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+                return null;
+
+            return (
+                reader.GetDouble(0),
+                reader.GetDouble(1),
+                reader.IsDBNull(2) ? null : reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.IsDBNull(4) ? null : reader.GetString(4),
+                reader.IsDBNull(5) ? (int?)null : reader.GetInt32(5)
+            );
         }
 
         /// <summary>
