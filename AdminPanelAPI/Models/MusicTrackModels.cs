@@ -194,6 +194,21 @@ namespace AdminPanelAPI.Models
         public string? PreviewUrl { get; set; }
         public string? SpotifyUrl { get; set; }
         public string? MusicbrainzUrl { get; set; }
+        /// <summary>
+        /// Album cover art. Normally sourced onto the song row; also filled by
+        /// the composition fallback so the panel can show art for a film-specific
+        /// arrangement that isn't itself in streaming catalogues.
+        /// </summary>
+        public string? ArtworkUrl { get; set; }
+        /// <summary>
+        /// True when the credits/release/links shown were resolved from the
+        /// underlying composition (or its original recording) rather than the
+        /// exact recording heard in the film. Set when the film uses a
+        /// film-specific arrangement/cover that providers don't list, so the UI
+        /// can label the metadata as being about the composition, not the film
+        /// cue. Persisted (migration 023).
+        /// </summary>
+        public bool CompositionFallback { get; set; }
     }
 
     /// <summary>

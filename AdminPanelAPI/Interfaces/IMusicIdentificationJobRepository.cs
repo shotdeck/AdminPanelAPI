@@ -1138,9 +1138,26 @@ WHERE so.id = @id;";
 
     public async Task<TrackDetails?> GetTrackDetailsAsync(long songId, CancellationToken cancellationToken)
     {
-        const string sql = @"
+        // The `composition_fallback` column is added by migration 023. If the
+        // code is deployed before the migration runs, selecting it throws
+        // undefined_column (42703); fall back to reading without it so cached
+        // details still show (just never marked as composition-level).
+        try
+        {
+            return await ReadTrackDetailsAsync(songId, withComposition: true, cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+        {
+            return await ReadTrackDetailsAsync(songId, withComposition: false, cancellationToken);
+        }
+    }
+
+    private async Task<TrackDetails?> ReadTrackDetailsAsync(long songId, bool withComposition, CancellationToken cancellationToken)
+    {
+        var sql = @"
 SELECT description, description_source, wikipedia_url, writers, composers, producers,
-       album, release_date, label, preview_url, musicbrainz_url
+       album, release_date, label, preview_url, musicbrainz_url"
+            + (withComposition ? ", composition_fallback" : "") + @"
 FROM frl.frl_music_track_details
 WHERE song_id = @id;";
 
@@ -1170,19 +1187,38 @@ WHERE song_id = @id;";
             ReleaseDate = reader.IsDBNull(7) ? null : reader.GetString(7),
             Label = reader.IsDBNull(8) ? null : reader.GetString(8),
             PreviewUrl = reader.IsDBNull(9) ? null : reader.GetString(9),
-            MusicbrainzUrl = reader.IsDBNull(10) ? null : reader.GetString(10)
+            MusicbrainzUrl = reader.IsDBNull(10) ? null : reader.GetString(10),
+            CompositionFallback = withComposition && !reader.IsDBNull(11) && reader.GetBoolean(11)
         };
     }
 
     public async Task UpsertTrackDetailsAsync(TrackDetails details, CancellationToken cancellationToken)
     {
-        const string sql = @"
+        // The `composition_fallback` column is added by migration 023. Persist it
+        // when present; if the migration hasn't run yet, retry without it so the
+        // rest of the details still cache (undefined_column = 42703).
+        try
+        {
+            await WriteTrackDetailsAsync(details, withComposition: true, cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+        {
+            await WriteTrackDetailsAsync(details, withComposition: false, cancellationToken);
+        }
+    }
+
+    private async Task WriteTrackDetailsAsync(TrackDetails details, bool withComposition, CancellationToken cancellationToken)
+    {
+        var cols = withComposition ? ", composition_fallback" : "";
+        var vals = withComposition ? ", @composition_fallback" : "";
+        var upd = withComposition ? "\n    composition_fallback = EXCLUDED.composition_fallback," : "";
+        var sql = @"
 INSERT INTO frl.frl_music_track_details
     (song_id, description, description_source, wikipedia_url, writers, composers,
-     producers, album, release_date, label, preview_url, musicbrainz_url, fetched_at)
+     producers, album, release_date, label, preview_url, musicbrainz_url" + cols + @", fetched_at)
 VALUES
     (@song_id, @description, @description_source, @wikipedia_url, @writers, @composers,
-     @producers, @album, @release_date, @label, @preview_url, @musicbrainz_url, now())
+     @producers, @album, @release_date, @label, @preview_url, @musicbrainz_url" + vals + @", now())
 ON CONFLICT (song_id) DO UPDATE SET
     description        = EXCLUDED.description,
     description_source = EXCLUDED.description_source,
@@ -1194,7 +1230,7 @@ ON CONFLICT (song_id) DO UPDATE SET
     release_date       = EXCLUDED.release_date,
     label              = EXCLUDED.label,
     preview_url        = EXCLUDED.preview_url,
-    musicbrainz_url    = EXCLUDED.musicbrainz_url,
+    musicbrainz_url    = EXCLUDED.musicbrainz_url," + upd + @"
     fetched_at         = now();";
 
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -1212,6 +1248,8 @@ ON CONFLICT (song_id) DO UPDATE SET
         cmd.Parameters.AddWithValue("label", (object?)details.Label ?? DBNull.Value);
         cmd.Parameters.AddWithValue("preview_url", (object?)details.PreviewUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("musicbrainz_url", (object?)details.MusicbrainzUrl ?? DBNull.Value);
+        if (withComposition)
+            cmd.Parameters.AddWithValue("composition_fallback", details.CompositionFallback);
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 

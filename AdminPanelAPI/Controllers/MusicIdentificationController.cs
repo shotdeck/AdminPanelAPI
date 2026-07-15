@@ -18,6 +18,7 @@ namespace AdminPanelAPI.Controllers
         private readonly IStreamingLinkService _streamingLinkService;
         private readonly ITrackDetailsService _trackDetailsService;
         private readonly IAudioIdentifyService _audioIdentifyService;
+        private readonly IServiceScopeFactory _scopeFactory;
         private readonly IConfiguration _configuration;
         private readonly ILogger<MusicIdentificationController> _logger;
         private readonly string _connectionString;
@@ -36,6 +37,7 @@ namespace AdminPanelAPI.Controllers
             IStreamingLinkService streamingLinkService,
             ITrackDetailsService trackDetailsService,
             IAudioIdentifyService audioIdentifyService,
+            IServiceScopeFactory scopeFactory,
             IConfiguration configuration,
             ILogger<MusicIdentificationController> logger)
         {
@@ -45,6 +47,7 @@ namespace AdminPanelAPI.Controllers
             _streamingLinkService = streamingLinkService;
             _trackDetailsService = trackDetailsService;
             _audioIdentifyService = audioIdentifyService;
+            _scopeFactory = scopeFactory;
             _configuration = configuration;
             _logger = logger;
             _connectionString = configuration.GetConnectionString("Default")
@@ -482,29 +485,47 @@ LIMIT 1;";
             // already cleared the links/artwork and song-level details cache;
             // drop the (non-locked) AI descriptions so they regenerate, and
             // re-resolve links/artwork for this movie so the corrected song
-            // shows matching art. Re-resolution only touches the just-cleared
-            // (null-link) track, so it's cheap.
+            // shows matching art.
             if (result == SongTrackUpdate.Changed)
             {
                 await _jobRepository.DeleteUnlockedAiDescriptionsForSongAsync(songId, cancellationToken);
                 if (request?.MovieId is int movieId)
                 {
-                    try
-                    {
-                        await _streamingLinkService.BackfillAsync(movieId, force: false, cancellationToken);
-                    }
-                    catch (Exception ex)
-                    {
-                        // Links/artwork will be refilled on the next backfill run;
-                        // don't fail the edit if Spotify/Odesli is unavailable.
-                        _logger.LogWarning(ex,
-                            "Post-edit streaming-link refresh failed for song {SongId} in movie {MovieId}.",
-                            songId, movieId);
-                    }
+                    // Run the streaming-link refresh in the background: it calls
+                    // Spotify/Odesli which can take many seconds (Odesli alone is
+                    // budgeted up to ~2 min), and blocking the response is what
+                    // made applying an AI suggestion feel slow. The client
+                    // re-loads details after saving and picks up the artwork/links
+                    // once they land; results are idempotently persisted.
+                    RunStreamingBackfillInBackground(movieId, songId);
                 }
             }
 
             return Ok(new { songId, title, artist, changed = result == SongTrackUpdate.Changed });
+        }
+
+        // Fire-and-forget the post-edit streaming-link refresh on its own DI
+        // scope (the request scope is disposed once the response returns) with a
+        // non-request cancellation token, so the edit responds immediately.
+        private void RunStreamingBackfillInBackground(int movieId, long songId)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var scope = _scopeFactory.CreateScope();
+                    var linkService = scope.ServiceProvider.GetRequiredService<IStreamingLinkService>();
+                    await linkService.BackfillAsync(movieId, force: false, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    // Links/artwork will be refilled on the next backfill run;
+                    // don't let a background failure crash the process.
+                    _logger.LogWarning(ex,
+                        "Background streaming-link refresh failed for song {SongId} in movie {MovieId}.",
+                        songId, movieId);
+                }
+            });
         }
 
         /// <summary>
