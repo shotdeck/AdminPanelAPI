@@ -176,6 +176,14 @@ namespace AdminPanelAPI.Models
         /// than the version actually in the film. Transient.
         /// </summary>
         public string? AiCanonicalArtist { get; set; }
+        /// <summary>
+        /// The canonical (official catalogue) title of the recording per the
+        /// web-search agent. Used to auto-correct a nickname/alternate title the
+        /// fingerprint produced (e.g. "The Hey Song – Football Theme" ->
+        /// "Rock and Roll (Part 2)") so MusicBrainz/Spotify enrichment — writers,
+        /// credits, release, artwork, links — can resolve it. Transient.
+        /// </summary>
+        public string? AiCanonicalTitle { get; set; }
         public string? WikipediaUrl { get; set; }
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();
