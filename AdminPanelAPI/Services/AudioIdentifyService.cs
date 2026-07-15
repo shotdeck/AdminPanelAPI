@@ -101,13 +101,19 @@ namespace AdminPanelAPI.Services
                 $"from the film \"{movieTitle}\"{yearText} (it may have dialogue or sound effects over it). " +
                 $"A fingerprint service labelled it \"{currentTitle}\"" +
                 (string.IsNullOrWhiteSpace(currentArtist) ? "" : $" by \"{currentArtist}\"") +
-                ", which may be wrong. Listen and identify the music actually playing. " +
+                ", which may be wrong. " +
+                "Identify the music STRICTLY from what you actually hear in this clip. " +
+                "The film name is context only — do NOT assume it is one of that film's famous or " +
+                "signature songs, and do NOT let the film's reputation influence your guess. If the " +
+                "audio is faint, buried under dialogue, or you cannot actually recognise it, say so: " +
+                "return a null title and \"low\" confidence rather than guessing a well-known track. " +
+                "Only give a title you can genuinely hear. " +
                 "Reply ONLY with a JSON object with these keys: " +
-                "\"title\" (best-guess track/cue title, or null if unsure), " +
+                "\"title\" (track/cue title you actually recognise, or null if unsure), " +
                 "\"artist\" (performer or composer, or null if unsure), " +
                 "\"is_score_cue\" (true if it's an instrumental film-score cue, false if a commercial/pop song), " +
-                "\"confidence\" (\"low\", \"medium\" or \"high\"), " +
-                "\"explanation\" (one or two sentences). " +
+                "\"confidence\" (\"low\", \"medium\" or \"high\"; use \"low\" whenever you are guessing), " +
+                "\"explanation\" (one or two sentences; state honestly if you cannot identify it). " +
                 "Prefer the composer/artist you are confident about even when unsure of the exact title.";
 
             var payload = new
