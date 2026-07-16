@@ -100,6 +100,34 @@ LIMIT @limit;";
             return Ok(new QueueResponse { Images = items, Count = items.Count });
         }
 
+        // ── GET /api/admin/camera-movements/media-types ────────────────
+        // Distinct media types available to fetch, from frl_movies.media_type.
+        // Trailers are excluded (never fetched). The frontend uses these exact
+        // values for the fetch filter so there's no format/casing mismatch.
+        [HttpGet("media-types")]
+        [ProducesResponseType(typeof(MediaTypesResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<MediaTypesResponse>> GetMediaTypes(CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+
+            const string sql = @"
+SELECT DISTINCT media_type
+FROM frl.frl_movies
+WHERE media_type IS NOT NULL
+  AND btrim(media_type) <> ''
+  AND lower(media_type) <> 'trailer'
+ORDER BY media_type;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var types = new List<string>();
+            while (await reader.ReadAsync(ct))
+                types.Add(reader.GetString(0));
+
+            return Ok(new MediaTypesResponse { MediaTypes = types });
+        }
+
         // ── POST /api/admin/camera-movements/analyze ───────────────────
         // Batch-analyze images: calls VideoMAE API for each, stores results.
         [HttpPost("analyze")]
@@ -107,6 +135,7 @@ LIMIT @limit;";
         public async Task<ActionResult<AnalyzeBatchResponse>> AnalyzeBatch(
             [FromQuery] int limit = 100,
             [FromQuery] Guid? jobId = null,
+            [FromQuery] string? mediaType = null,
             CancellationToken ct = default)
         {
             if (limit < 1) limit = 1;
@@ -122,7 +151,7 @@ LIMIT @limit;";
             //    fetches (from other sessions) grab disjoint sets. Claims tie to
             //    a job id; a random one is used when no job is supplied.
             var claimJobId = jobId ?? Guid.NewGuid();
-            var images = await ClaimImagesAsync(claimJobId, limit, ct);
+            var images = await ClaimImagesAsync(claimJobId, limit, mediaType, ct);
 
             if (images.Count == 0)
                 return Ok(new AnalyzeBatchResponse { Processed = 0, Failed = 0, Message = "No images in queue." });
@@ -684,7 +713,8 @@ SELECT cm.imageid,
        sb.end_time,
        sb.fps,
        sb.target_frame,
-       m.title AS movie_title
+       m.title AS movie_title,
+       m.media_type AS media_type
 FROM frl.frl_join_image_camera_movements cm
 INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
 INNER JOIN frl.frl_image_scene_boundaries sb
@@ -724,6 +754,8 @@ LIMIT @limit OFFSET @offset;";
                         ? null : reader.GetInt32(reader.GetOrdinal("target_frame")),
                     MovieTitle = reader.IsDBNull(reader.GetOrdinal("movie_title"))
                         ? "" : reader.GetString(reader.GetOrdinal("movie_title")),
+                    MediaType = reader.IsDBNull(reader.GetOrdinal("media_type"))
+                        ? "" : reader.GetString(reader.GetOrdinal("media_type")),
                 });
             }
             await reader.CloseAsync();
@@ -803,6 +835,7 @@ WHERE imageid IN ({idParams});";
                         ImageId = row.ImageId,
                         MovieId = row.MovieId,
                         MovieTitle = row.MovieTitle,
+                        MediaType = row.MediaType,
                         Url = url,
                         StartTime = row.StartTime,
                         EndTime = row.EndTime,
@@ -911,7 +944,8 @@ SELECT cm.imageid,
        sb.end_time,
        sb.fps,
        sb.target_frame,
-       m.title AS movie_title
+       m.title AS movie_title,
+       m.media_type AS media_type
 FROM frl.frl_join_image_camera_movements cm
 INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
 INNER JOIN frl.frl_image_scene_boundaries sb
@@ -957,6 +991,8 @@ LIMIT @limit OFFSET @offset;";
                         ? null : reader.GetInt32(reader.GetOrdinal("target_frame")),
                     MovieTitle = reader.IsDBNull(reader.GetOrdinal("movie_title"))
                         ? "" : reader.GetString(reader.GetOrdinal("movie_title")),
+                    MediaType = reader.IsDBNull(reader.GetOrdinal("media_type"))
+                        ? "" : reader.GetString(reader.GetOrdinal("media_type")),
                 });
             }
             await reader.CloseAsync();
@@ -1035,6 +1071,7 @@ WHERE imageid IN ({idParams});";
                         ImageId = row.ImageId,
                         MovieId = row.MovieId,
                         MovieTitle = row.MovieTitle,
+                        MediaType = row.MediaType,
                         Url = url,
                         StartTime = row.StartTime,
                         EndTime = row.EndTime,
@@ -1428,14 +1465,27 @@ CREATE INDEX IF NOT EXISTS idx_cmc_claimed_at ON frl.frl_camera_movement_claims 
         // SKIP LOCKED plus a claims table means two concurrent fetches never
         // grab the same images.
         private async Task<List<AnalyzeItem>> ClaimImagesAsync(
-            Guid jobId, int limit, CancellationToken ct)
+            Guid jobId, int limit, string? mediaType, CancellationToken ct)
         {
+            // Media-type filter. A specific type selects only that type; "all"
+            // (or null/empty) selects every type except trailers, which are
+            // never fetched. Values come straight from frl_movies.media_type
+            // (see the media-types endpoint), so match them case-insensitively.
+            var isAll = string.IsNullOrWhiteSpace(mediaType)
+                || string.Equals(mediaType, "all", StringComparison.OrdinalIgnoreCase);
+
+            var mediaJoin = "LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid";
+            var mediaClause = isAll
+                ? " AND (m.media_type IS NULL OR lower(m.media_type) <> 'trailer')"
+                : " AND lower(m.media_type) = lower(@mediaType)";
+
             var sql = $@"
 WITH candidates AS (
     SELECT i.idnum, i.movieid, i.randid, sb.start_time, sb.end_time
     FROM frl.frl_images i
     INNER JOIN frl.frl_image_scene_boundaries sb
         ON sb.movieid = i.movieid AND sb.filename = i.randid
+    {mediaJoin}
     WHERE i.status = 'live'
       AND NOT EXISTS (
           SELECT 1 FROM frl.frl_join_image_camera_movements cm
@@ -1444,6 +1494,7 @@ WITH candidates AS (
           SELECT 1 FROM frl.frl_camera_movement_claims c
           WHERE c.imageid = i.idnum
             AND c.claimed_at > now() - INTERVAL '{ClaimTtlMinutes} minutes')
+      {mediaClause}
     ORDER BY i.weighted_score DESC
     LIMIT @limit
     FOR UPDATE OF i SKIP LOCKED
@@ -1461,6 +1512,8 @@ WHERE idnum IN (SELECT imageid FROM claimed);";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@limit", limit);
             cmd.Parameters.AddWithValue("@jobId", jobId);
+            if (!isAll)
+                cmd.Parameters.AddWithValue("@mediaType", mediaType!);
 
             var images = new List<AnalyzeItem>();
             await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -1732,6 +1785,11 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string Message { get; set; } = "";
         }
 
+        public sealed class MediaTypesResponse
+        {
+            public List<string> MediaTypes { get; set; } = new();
+        }
+
         public sealed class VerifyPasswordRequest
         {
             public string? Password { get; set; }
@@ -1805,6 +1863,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public double? Fps { get; set; }
             public int? TargetFrame { get; set; }
             public string MovieTitle { get; set; } = "";
+            public string MediaType { get; set; } = "";
         }
 
         public sealed class ImageMovementInfo
@@ -1819,6 +1878,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public int ImageId { get; set; }
             public int MovieId { get; set; }
             public string MovieTitle { get; set; } = "";
+            public string MediaType { get; set; } = "";
             public string Url { get; set; } = "";
             public double? StartTime { get; set; }
             public double? EndTime { get; set; }
