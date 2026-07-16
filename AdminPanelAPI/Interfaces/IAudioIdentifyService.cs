@@ -16,6 +16,6 @@ public interface IAudioIdentifyService
         string? currentArtist,
         string movieTitle,
         int? movieYear,
-        IReadOnlyList<string> soundtrackCues,
+        IReadOnlyList<SoundtrackCue> soundtrackCues,
         CancellationToken cancellationToken);
 }
