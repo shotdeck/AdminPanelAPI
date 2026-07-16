@@ -310,6 +310,59 @@ namespace AdminPanelAPI.Services
         /// stale album); searched=false on a transient failure (rate limit /
         /// exception) so the caller leaves any existing album untouched.
         /// </returns>
+        public async Task<IReadOnlyList<string>> GetSoundtrackCueTitlesAsync(
+            int movieId, CancellationToken cancellationToken)
+        {
+            var soundtrack = await _repository.GetMovieSoundtrackAsync(movieId, cancellationToken);
+            var albumUrl = soundtrack?.SpotifyUrl;
+            if (string.IsNullOrWhiteSpace(albumUrl))
+                return Array.Empty<string>();
+
+            var m = Regex.Match(albumUrl, @"album[/:]([A-Za-z0-9]+)");
+            if (!m.Success)
+                return Array.Empty<string>();
+            var albumId = m.Groups[1].Value;
+
+            var clientId = _configuration["Spotify:ClientId"] ?? _configuration["SPOTIFY_CLIENT_ID"];
+            var clientSecret = _configuration["Spotify:ClientSecret"] ?? _configuration["SPOTIFY_CLIENT_SECRET"];
+            if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
+                return Array.Empty<string>();
+
+            var token = await GetTokenAsync(clientId, clientSecret, cancellationToken);
+            if (token == null)
+                return Array.Empty<string>();
+
+            var titles = new List<string>();
+            var url = $"https://api.spotify.com/v1/albums/{albumId}/tracks?limit=50";
+            try
+            {
+                while (!string.IsNullOrEmpty(url))
+                {
+                    var json = await GetWithRetryAsync(url, token, cancellationToken);
+                    if (json == null) break;
+
+                    using var doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("items", out var items)
+                        && items.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var item in items.EnumerateArray())
+                            if (item.TryGetProperty("name", out var n) && n.GetString() is { } name
+                                && !string.IsNullOrWhiteSpace(name))
+                                titles.Add(name);
+                    }
+
+                    url = doc.RootElement.TryGetProperty("next", out var next)
+                        && next.ValueKind == JsonValueKind.String ? next.GetString() : null;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Spotify album tracks fetch threw for movie {MovieId}", movieId);
+            }
+
+            return titles;
+        }
+
         private async Task<(bool searched, string? name, string? spotifyUrl, string? artworkUrl)> SearchSoundtrackAlbumAsync(
             string movieTitle, string token, CancellationToken cancellationToken)
         {
