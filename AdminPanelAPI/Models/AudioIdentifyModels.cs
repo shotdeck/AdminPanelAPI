@@ -11,6 +11,12 @@ namespace AdminPanelAPI.Models
     {
         public string? Title { get; set; }
         public string? Artist { get; set; }
+        /// <summary>
+        /// True when the title came from the web-search reasoning pass (a
+        /// best-guess "possible cue") rather than being recognised by ear, so the
+        /// UI can flag it as unverified.
+        /// </summary>
+        public bool TitleUnverified { get; set; }
         public bool IsScoreCue { get; set; }
         public string? Confidence { get; set; }
         public string? Explanation { get; set; }

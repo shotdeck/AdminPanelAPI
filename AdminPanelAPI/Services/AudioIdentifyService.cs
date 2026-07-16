@@ -227,22 +227,19 @@ namespace AdminPanelAPI.Services
                 $"A short music clip from the film \"{movieTitle}\"{yearText} was identified by ear. {heard}" +
                 $"A fingerprint service (often wrong) had labelled it \"{currentTitle}\"" +
                 (string.IsNullOrWhiteSpace(currentArtist) ? "" : $" by \"{currentArtist}\"") + ". " +
-                "Using web search of this film's official soundtrack and score track listing, decide whether the " +
-                "SPECIFIC musical details described above (composer, instrumentation, melody, style) uniquely " +
-                "match ONE particular cue/track. " +
-                "CRITICAL: do NOT pick a title just because it is this film's famous, signature or most " +
-                "prominent song, and do NOT pick a title merely because it appears on the soundtrack — the clip " +
-                "is a weak/uncertain match and is usually NOT the film's well-known cue. " +
-                "Only name a title when the described details clearly single it out over every other track on " +
-                "the soundtrack. If several cues could fit, if the only reason to choose one is its popularity " +
-                "in the film, or if you are inferring rather than matching, return a null title. " +
-                "When you do name a title, use \"low\" confidence (or \"medium\" only if the details are very " +
-                "distinctive) — never \"high\", since this is a reasoned guess, not an aural recognition. " +
-                "Do NOT justify a title by how prominent or famous it is in the film. " +
+                "Using web search of this film's official soundtrack and score track listing, propose your " +
+                "single BEST-GUESS cue/track title from that film that is consistent with the specific musical " +
+                "details described above (composer, instrumentation, melody, style). This is an advisory guess " +
+                "a human will verify — offer a title even when you are not certain, but only return null if " +
+                "nothing on the soundtrack is plausibly consistent with what was heard. " +
+                "IMPORTANT: do NOT pick a title just because it is this film's famous, signature or most " +
+                "prominent song — choose the cue that best fits the described style/scene, not the best-known " +
+                "one, and do not justify your choice by how prominent or famous it is in the film. " +
+                "This is a reasoned guess, not an aural recognition, so always report \"low\" confidence. " +
                 "Reply ONLY with a JSON object with keys: " +
-                "\"title\" (exact cue/track title, or null), " +
+                "\"title\" (best-guess cue/track title, or null if nothing plausibly fits), " +
                 "\"artist\" (performer or composer, or null), " +
-                "\"confidence\" (\"low\" or \"medium\"), " +
+                "\"confidence\" (always \"low\"), " +
                 "\"explanation\" (one sentence).";
 
             var payload = new
@@ -274,40 +271,16 @@ namespace AdminPanelAPI.Services
             var refined = ParseSuggestion(text);
             if (string.IsNullOrWhiteSpace(refined.Title)) return;
 
+            // The web-searched title is a best-guess "possible cue", not an aural
+            // recognition — flag it unverified so the UI shows it as such, and
+            // leave the overall confidence reflecting the composer/style read from
+            // the audio (a title guess must never raise it).
             suggestion.Title = refined.Title;
+            suggestion.TitleUnverified = true;
             if (!string.IsNullOrWhiteSpace(refined.Artist))
                 suggestion.Artist = refined.Artist;
-            // A web-searched title is a reasoned guess, not an aural match, so it
-            // must never raise the confidence the audio model reported — cap it at
-            // "medium" and take the lower of the two.
-            suggestion.Confidence = LowerConfidence(
-                CapConfidence(refined.Confidence, "medium"), suggestion.Confidence);
             if (!string.IsNullOrWhiteSpace(refined.Explanation))
                 suggestion.Explanation = refined.Explanation;
-        }
-
-        private static readonly string[] ConfidenceRank = { "low", "medium", "high" };
-
-        private static int ConfidenceIndex(string? c)
-        {
-            if (string.IsNullOrWhiteSpace(c)) return 0;
-            var idx = Array.IndexOf(ConfidenceRank, c.Trim().ToLowerInvariant());
-            return idx < 0 ? 0 : idx;
-        }
-
-        // Returns whichever confidence level is lower, ignoring blanks.
-        private static string? LowerConfidence(string? a, string? b)
-        {
-            if (string.IsNullOrWhiteSpace(a)) return b;
-            if (string.IsNullOrWhiteSpace(b)) return a;
-            return ConfidenceIndex(a) <= ConfidenceIndex(b) ? a : b;
-        }
-
-        // Clamps a confidence level so it never exceeds the given ceiling.
-        private static string? CapConfidence(string? c, string ceiling)
-        {
-            if (string.IsNullOrWhiteSpace(c)) return c;
-            return ConfidenceIndex(c) > ConfidenceIndex(ceiling) ? ceiling : c;
         }
 
         // Concatenates the "output_text" parts of an OpenAI Responses API result.
