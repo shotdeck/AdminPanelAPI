@@ -112,6 +112,27 @@ namespace AdminPanelAPI.Services
                     _logger.LogDebug(ex, "Web-search title refinement failed.");
                 }
             }
+            // When the model DID recognise a commercial song by ear, it can be a
+            // confident mishearing (e.g. a retro-pastiche riff matched to a famous
+            // 60s hit). Cross-check it against what actually plays in the film via
+            // web search — the way ChatGPT gets it right — and surface a ranked
+            // shortlist to confirm. Score cues are handled above; needle-drops go
+            // here. Best-effort: on failure the recognised title is left intact.
+            else if (suggestion.Error == null &&
+                     !suggestion.IsScoreCue &&
+                     !string.IsNullOrWhiteSpace(suggestion.Title))
+            {
+                try
+                {
+                    await VerifyCommercialSongWithWebSearchAsync(
+                        apiKey, suggestion, currentTitle, currentArtist,
+                        movieTitle, movieYear, soundtrackCues, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Web-search song verification failed.");
+                }
+            }
 
             return suggestion;
         }
@@ -341,6 +362,84 @@ namespace AdminPanelAPI.Services
             BuildCandidatesFromSoundtrack(suggestion, soundtrackCues, ranked);
         }
 
+        // Cross-checks a commercial song the audio model recognised by ear against
+        // what actually plays in the film (via web search), considering both the
+        // heard title and the fingerprint's label as hypotheses. Produces a ranked
+        // shortlist (best-supported first) so a human confirms. If web search
+        // turns up nothing usable, the original recognised title is left intact.
+        private async Task VerifyCommercialSongWithWebSearchAsync(
+            string apiKey,
+            AudioIdentifySuggestion suggestion,
+            string currentTitle,
+            string? currentArtist,
+            string movieTitle,
+            int? movieYear,
+            IReadOnlyList<SoundtrackCue> soundtrackCues,
+            CancellationToken cancellationToken)
+        {
+            var yearText = movieYear.HasValue ? $" ({movieYear})" : "";
+            var heardTitle = suggestion.Title!.Trim();
+            var heardArtist = suggestion.Artist;
+
+            var prompt =
+                $"A short music clip from the film \"{movieTitle}\"{yearText} was analysed. " +
+                $"By ear it was identified as the song \"{heardTitle}\"" +
+                (string.IsNullOrWhiteSpace(heardArtist) ? "" : $" by \"{heardArtist}\"") + ". " +
+                $"Separately, an audio-fingerprint service (sometimes wrong) labelled it \"{currentTitle}\"" +
+                (string.IsNullOrWhiteSpace(currentArtist) ? "" : $" by \"{currentArtist}\"") + ". " +
+                "The by-ear guess can be a confident mistake — e.g. a retro-pastiche or sound-alike track " +
+                "mistaken for a more famous song from that era. " +
+                "Using web search, determine which commercial song ACTUALLY plays in this film (check the " +
+                "film's soundtrack listing, song/needle-drop credits, and scene references). Treat BOTH the " +
+                "by-ear guess and the fingerprint label as hypotheses to verify, and include any other song " +
+                "the sources indicate actually appears in the film. " +
+                "Return a RANKED SHORTLIST of up to 5 candidate songs, ordered by how well documented it is " +
+                "that the song appears in THIS film (best-supported first) — NOT by fame. " +
+                "This is an advisory shortlist a human will listen to and confirm, so report \"low\" confidence. " +
+                "Reply ONLY with a JSON object with keys: " +
+                "\"candidates\" (an array, best first, of objects with \"title\" and \"artist\" (performer or null)), " +
+                "\"confidence\" (always \"low\"), " +
+                "\"explanation\" (one sentence citing why the top candidate is the one that appears in the film).";
+
+            var payload = new
+            {
+                model = WebSearchModel,
+                tools = new[] { new { type = "web_search_preview" } },
+                input = prompt
+            };
+
+            var client = _httpClientFactory.CreateClient();
+            client.Timeout = TimeSpan.FromSeconds(120);
+            using var req = new HttpRequestMessage(
+                HttpMethod.Post, "https://api.openai.com/v1/responses");
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            req.Content = new StringContent(
+                JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+
+            using var resp = await client.SendAsync(req, cancellationToken);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _logger.LogDebug("Web-search song verification returned {Status}.", resp.StatusCode);
+                return;
+            }
+
+            var body = await resp.Content.ReadAsStringAsync(cancellationToken);
+            var text = ExtractResponsesText(body);
+
+            var (ranked, explanation) = ParseRankedCandidates(text);
+            if (ranked.Count == 0)
+                return; // Nothing usable — keep the recognised title as-is.
+
+            if (!string.IsNullOrWhiteSpace(explanation))
+                suggestion.Explanation = explanation;
+            suggestion.Confidence = "low";
+
+            // Don't top up with the score-album cues here: this is a commercial
+            // needle-drop, so the shortlist should be only the web-verified songs.
+            BuildCandidatesFromSoundtrack(
+                suggestion, soundtrackCues, ranked, topUpFromSoundtrack: false);
+        }
+
         // Populates suggestion.Candidates with a ranked shortlist of real cues,
         // each carrying Spotify + YouTube links so a human can listen and pick.
         // Prefers the model's ranking when available; otherwise falls back to the
@@ -350,7 +449,8 @@ namespace AdminPanelAPI.Services
         private static void BuildCandidatesFromSoundtrack(
             AudioIdentifySuggestion suggestion,
             IReadOnlyList<SoundtrackCue> soundtrackCues,
-            IReadOnlyList<(string Title, string? Artist)>? ranked)
+            IReadOnlyList<(string Title, string? Artist)>? ranked,
+            bool topUpFromSoundtrack = true)
         {
             const int MaxCandidates = 5;
             var byNorm = new Dictionary<string, SoundtrackCue>();
@@ -373,7 +473,11 @@ namespace AdminPanelAPI.Services
                 {
                     Title = title.Trim(),
                     Artist = finalArtist,
-                    SpotifyUrl = match?.SpotifyUrl,
+                    // Prefer the official soundtrack track link; otherwise a Spotify
+                    // search so needle-drops (not on the album) still get a link.
+                    SpotifyUrl = !string.IsNullOrWhiteSpace(match?.SpotifyUrl)
+                        ? match!.SpotifyUrl
+                        : SpotifySearchUrl(title, finalArtist),
                     YouTubeUrl = YouTubeSearchUrl(title, finalArtist)
                 });
             }
@@ -390,10 +494,13 @@ namespace AdminPanelAPI.Services
 
             // Fall back to (or top up with) the soundtrack listing so there is
             // always something to pick from with real listen links.
-            foreach (var c in soundtrackCues)
+            if (topUpFromSoundtrack)
             {
-                if (candidates.Count >= MaxCandidates) break;
-                Add(c.Title, c.Artist, c);
+                foreach (var c in soundtrackCues)
+                {
+                    if (candidates.Count >= MaxCandidates) break;
+                    Add(c.Title, c.Artist, c);
+                }
             }
 
             if (candidates.Count == 0) return;
@@ -412,6 +519,13 @@ namespace AdminPanelAPI.Services
             var query = string.Join(" ", new[] { artist, title }
                 .Where(s => !string.IsNullOrWhiteSpace(s))).Trim();
             return "https://www.youtube.com/results?search_query=" + Uri.EscapeDataString(query);
+        }
+
+        private static string SpotifySearchUrl(string? title, string? artist)
+        {
+            var query = string.Join(" ", new[] { artist, title }
+                .Where(s => !string.IsNullOrWhiteSpace(s))).Trim();
+            return "https://open.spotify.com/search/" + Uri.EscapeDataString(query);
         }
 
         private static string NormalizeTitle(string? s)
