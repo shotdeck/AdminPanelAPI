@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using AdminPanelAPI.Models;
 
 namespace AdminPanelAPI.Services
@@ -348,9 +349,16 @@ namespace AdminPanelAPI.Services
                 return suggestion;
             }
 
-            try
+            var json = content.Substring(startIdx, endIdx - startIdx + 1);
+            var doc = TryParseLenient(json);
+            if (doc == null)
             {
-                using var doc = JsonDocument.Parse(content.Substring(startIdx, endIdx - startIdx + 1));
+                suggestion.Explanation = content.Trim();
+                return suggestion;
+            }
+
+            using (doc)
+            {
                 var root = doc.RootElement;
                 suggestion.Title = ReadString(root, "title");
                 suggestion.Artist = ReadString(root, "artist");
@@ -363,12 +371,37 @@ namespace AdminPanelAPI.Services
                             && bool.TryParse(sc.GetString(), out var b) && b);
                 }
             }
-            catch (JsonException)
-            {
-                suggestion.Explanation = content.Trim();
-            }
 
             return suggestion;
+        }
+
+        // Parse the model's JSON, tolerating a common malformation: emitting a
+        // bare (unquoted) enum value, e.g. `"confidence": medium`. Quotes those
+        // and retries so a stray formatting slip doesn't discard an otherwise
+        // usable suggestion. Returns null only when it's still unparseable.
+        private static JsonDocument? TryParseLenient(string json)
+        {
+            var options = new JsonDocumentOptions { AllowTrailingCommas = true };
+            try
+            {
+                return JsonDocument.Parse(json, options);
+            }
+            catch (JsonException)
+            {
+                var repaired = Regex.Replace(
+                    json,
+                    "(\"(?:confidence|title|artist)\"\\s*:\\s*)(low|medium|high)\\b",
+                    "$1\"$2\"",
+                    RegexOptions.IgnoreCase);
+                try
+                {
+                    return JsonDocument.Parse(repaired, options);
+                }
+                catch (JsonException)
+                {
+                    return null;
+                }
+            }
         }
 
         private static string? ReadString(JsonElement root, string name)
