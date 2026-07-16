@@ -1276,6 +1276,10 @@ ON CONFLICT (imageid, movement) DO UPDATE SET status = 'ok', updated_at = now();
                 await LogQcActionAsync(
                     request.ImageId, "reassigned", request.OldMovement,
                     request.NewMovement, confidence, ct);
+
+                // The reassigned tag is confirmed ('ok'), so queue its
+                // sub-variants for review just like a QC-confirmed parent.
+                await PromoteToSubMovementsAsync(request.ImageId, request.NewMovement, ct);
             }
 
             return Ok(new ReassignResponse { Updated = rows > 0 });
@@ -1357,6 +1361,10 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
                 await LogQcActionAsync(
                     request.ImageId, "added", null, request.Movement,
                     null, ct);
+
+                // A manually added tag is confirmed ('ok'), so queue its
+                // sub-variants for review just like a QC-confirmed parent.
+                await PromoteToSubMovementsAsync(request.ImageId, request.Movement, ct);
             }
 
             return Ok(new AddTagResponse { Added = rows > 0 });
