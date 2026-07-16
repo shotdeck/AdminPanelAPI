@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Mvc;
 using Npgsql;
 using System.Collections.Concurrent;
 using System.Data;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -264,6 +265,31 @@ LIMIT @limit;";
                 Total = images.Count,
                 Message = $"Analyzed {processed} images, {failed} failed."
             });
+        }
+
+        // ── POST /api/admin/camera-movements/verify-password ───────────
+        // Simple shared-password gate for the QC dashboard. Compares the
+        // submitted value against the CAMERAMOVEMENTPASSWORD app setting
+        // (set in Azure). Not per-user auth — a single access password.
+        [HttpPost("verify-password")]
+        [ProducesResponseType(typeof(VerifyPasswordResponse), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+        public ActionResult<VerifyPasswordResponse> VerifyPassword([FromBody] VerifyPasswordRequest req)
+        {
+            var expected = _configuration["CAMERAMOVEMENTPASSWORD"];
+            if (string.IsNullOrEmpty(expected))
+                return StatusCode(StatusCodes.Status503ServiceUnavailable,
+                    new VerifyPasswordResponse { Ok = false, Error = "Password not configured." });
+
+            var supplied = req?.Password ?? "";
+            var ok = CryptographicOperations.FixedTimeEquals(
+                Encoding.UTF8.GetBytes(supplied),
+                Encoding.UTF8.GetBytes(expected));
+
+            if (!ok)
+                return Unauthorized(new VerifyPasswordResponse { Ok = false, Error = "Incorrect password." });
+
+            return Ok(new VerifyPasswordResponse { Ok = true });
         }
 
         // ── POST /api/admin/camera-movements/analyze/jobs/start ────────
@@ -1704,6 +1730,17 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public int Failed { get; set; }
             public int Total { get; set; }
             public string Message { get; set; } = "";
+        }
+
+        public sealed class VerifyPasswordRequest
+        {
+            public string? Password { get; set; }
+        }
+
+        public sealed class VerifyPasswordResponse
+        {
+            public bool Ok { get; set; }
+            public string? Error { get; set; }
         }
 
         public sealed class JobStartRequest
