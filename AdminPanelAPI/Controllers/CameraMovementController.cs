@@ -105,6 +105,7 @@ LIMIT @limit;";
         [ProducesResponseType(typeof(AnalyzeBatchResponse), StatusCodes.Status200OK)]
         public async Task<ActionResult<AnalyzeBatchResponse>> AnalyzeBatch(
             [FromQuery] int limit = 100,
+            [FromQuery] Guid? jobId = null,
             CancellationToken ct = default)
         {
             if (limit < 1) limit = 1;
@@ -114,44 +115,13 @@ LIMIT @limit;";
                 ?? "https://semanticsearch--camera-motion-api-fastapi-app.modal.run";
 
             await EnsureOpenAsync(ct);
+            await EnsureJobTablesAsync(ct);
 
-            // 1. Get images that need analysis
-            const string queueSql = @"
-SELECT i.idnum,
-       i.movieid,
-       i.randid,
-       sb.start_time,
-       sb.end_time
-FROM frl.frl_images i
-INNER JOIN frl.frl_image_scene_boundaries sb
-    ON sb.movieid = i.movieid AND sb.filename = i.randid
-WHERE i.status = 'live'
-  AND NOT EXISTS (
-      SELECT 1 FROM frl.frl_join_image_camera_movements cm
-      WHERE cm.imageid = i.idnum
-  )
-ORDER BY i.weighted_score DESC
-LIMIT @limit;";
-
-            await using var queueCmd = new NpgsqlCommand(queueSql, _connection);
-            queueCmd.Parameters.AddWithValue("@limit", limit);
-            await using var queueReader = await queueCmd.ExecuteReaderAsync(ct);
-
-            var images = new List<AnalyzeItem>();
-            while (await queueReader.ReadAsync(ct))
-            {
-                images.Add(new AnalyzeItem
-                {
-                    ImageId = queueReader.GetInt32(queueReader.GetOrdinal("idnum")),
-                    MovieId = queueReader.GetInt32(queueReader.GetOrdinal("movieid")),
-                    RandId = queueReader.GetString(queueReader.GetOrdinal("randid")),
-                    StartTime = queueReader.IsDBNull(queueReader.GetOrdinal("start_time"))
-                        ? null : queueReader.GetDouble(queueReader.GetOrdinal("start_time")),
-                    EndTime = queueReader.IsDBNull(queueReader.GetOrdinal("end_time"))
-                        ? null : queueReader.GetDouble(queueReader.GetOrdinal("end_time")),
-                });
-            }
-            await queueReader.CloseAsync();
+            // 1. Atomically claim the next N unanalyzed images so simultaneous
+            //    fetches (from other sessions) grab disjoint sets. Claims tie to
+            //    a job id; a random one is used when no job is supplied.
+            var claimJobId = jobId ?? Guid.NewGuid();
+            var images = await ClaimImagesAsync(claimJobId, limit, ct);
 
             if (images.Count == 0)
                 return Ok(new AnalyzeBatchResponse { Processed = 0, Failed = 0, Message = "No images in queue." });
@@ -279,6 +249,14 @@ LIMIT @limit;";
                 processed++;
             }
 
+            // Release the claims we took (analyzed rows are excluded by the
+            // queue anyway; failed ones become eligible for a later retry).
+            await ReleaseClaimsAsync(images.Select(i => i.ImageId).ToList(), ct);
+
+            // Record progress on the job so other sessions see it live.
+            if (jobId.HasValue)
+                await UpdateJobProgressAsync(jobId.Value, processed, failed, ct);
+
             return Ok(new AnalyzeBatchResponse
             {
                 Processed = processed,
@@ -286,6 +264,119 @@ LIMIT @limit;";
                 Total = images.Count,
                 Message = $"Analyzed {processed} images, {failed} failed."
             });
+        }
+
+        // ── POST /api/admin/camera-movements/analyze/jobs/start ────────
+        // Register a fetch run so every session can see it's in progress.
+        [HttpPost("analyze/jobs/start")]
+        [ProducesResponseType(typeof(JobStartResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<JobStartResponse>> StartJob(
+            [FromBody] JobStartRequest req,
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureJobTablesAsync(ct);
+
+            var jobId = Guid.NewGuid();
+            var startedBy = string.IsNullOrWhiteSpace(req?.StartedBy)
+                ? "Anonymous"
+                : req!.StartedBy!.Trim();
+            if (startedBy.Length > 120) startedBy = startedBy[..120];
+            var requested = req?.Requested ?? 0;
+            if (requested < 0) requested = 0;
+
+            const string sql = @"
+INSERT INTO frl.frl_camera_movement_jobs (job_id, started_by, requested, status)
+VALUES (@jobId, @startedBy, @requested, 'running');";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@jobId", jobId);
+            cmd.Parameters.AddWithValue("@startedBy", startedBy);
+            cmd.Parameters.AddWithValue("@requested", requested);
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            return Ok(new JobStartResponse { JobId = jobId });
+        }
+
+        // ── POST /api/admin/camera-movements/analyze/jobs/finish ───────
+        // Mark a fetch run finished (done/error) and release its claims.
+        [HttpPost("analyze/jobs/finish")]
+        public async Task<IActionResult> FinishJob(
+            [FromBody] JobFinishRequest req,
+            CancellationToken ct = default)
+        {
+            if (req == null || req.JobId == Guid.Empty)
+                return BadRequest(new { error = "jobId is required." });
+
+            var status = req.Status == "error" ? "error" : "done";
+
+            await EnsureOpenAsync(ct);
+            await EnsureJobTablesAsync(ct);
+
+            const string sql = @"
+UPDATE frl.frl_camera_movement_jobs
+SET status = @status, updated_at = now()
+WHERE job_id = @jobId;
+DELETE FROM frl.frl_camera_movement_claims WHERE job_id = @jobId;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@jobId", req.JobId);
+            cmd.Parameters.AddWithValue("@status", status);
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            return Ok(new { ok = true });
+        }
+
+        // ── GET /api/admin/camera-movements/analyze/jobs/active ────────
+        // List fetch runs currently in progress (across all sessions).
+        [HttpGet("analyze/jobs/active")]
+        [ProducesResponseType(typeof(ActiveJobsResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ActiveJobsResponse>> ActiveJobs(
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureJobTablesAsync(ct);
+
+            // Expire runs that stopped reporting progress (crashed/closed tab),
+            // then drop their claims so those images can be picked up again.
+            const string maintenanceSql = @"
+UPDATE frl.frl_camera_movement_jobs
+SET status = 'stale'
+WHERE status = 'running' AND updated_at < now() - INTERVAL '5 minutes';
+
+DELETE FROM frl.frl_camera_movement_claims c
+USING frl.frl_camera_movement_jobs j
+WHERE c.job_id = j.job_id AND j.status <> 'running';";
+
+            await using (var maintCmd = new NpgsqlCommand(maintenanceSql, _connection))
+                await maintCmd.ExecuteNonQueryAsync(ct);
+
+            const string sql = @"
+SELECT job_id, started_by, requested, processed, failed, status, started_at, updated_at
+FROM frl.frl_camera_movement_jobs
+WHERE status = 'running'
+ORDER BY started_at;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var jobs = new List<ActiveJob>();
+            while (await reader.ReadAsync(ct))
+            {
+                jobs.Add(new ActiveJob
+                {
+                    JobId = reader.GetGuid(0),
+                    StartedBy = reader.IsDBNull(1) ? "Anonymous" : reader.GetString(1),
+                    Requested = reader.GetInt32(2),
+                    Processed = reader.GetInt32(3),
+                    Failed = reader.GetInt32(4),
+                    Status = reader.GetString(5),
+                    StartedAt = reader.GetDateTime(6),
+                    UpdatedAt = reader.GetDateTime(7),
+                });
+            }
+
+            return Ok(new ActiveJobsResponse { Jobs = jobs });
         }
 
         // ── POST /api/admin/camera-movements/analyze-movie ─────────────
@@ -1278,6 +1369,118 @@ ORDER BY created_at DESC;";
                 await _connection.OpenAsync(ct);
         }
 
+        // How long a claim is honoured before it's treated as abandoned (a
+        // crashed/closed session), so the image can be picked up again.
+        private const int ClaimTtlMinutes = 15;
+
+        private async Task EnsureJobTablesAsync(CancellationToken ct)
+        {
+            const string sql = @"
+CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_jobs (
+    job_id      UUID PRIMARY KEY,
+    started_by  VARCHAR(120),
+    status      VARCHAR(20)  NOT NULL DEFAULT 'running',
+    requested   INTEGER      NOT NULL DEFAULT 0,
+    processed   INTEGER      NOT NULL DEFAULT 0,
+    failed      INTEGER      NOT NULL DEFAULT 0,
+    started_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cmj_status ON frl.frl_camera_movement_jobs (status);
+CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_claims (
+    imageid     INTEGER      PRIMARY KEY,
+    job_id      UUID         NOT NULL,
+    claimed_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cmc_job_id     ON frl.frl_camera_movement_claims (job_id);
+CREATE INDEX IF NOT EXISTS idx_cmc_claimed_at ON frl.frl_camera_movement_claims (claimed_at);";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        // Atomically select and claim the next N unanalyzed images. FOR UPDATE
+        // SKIP LOCKED plus a claims table means two concurrent fetches never
+        // grab the same images.
+        private async Task<List<AnalyzeItem>> ClaimImagesAsync(
+            Guid jobId, int limit, CancellationToken ct)
+        {
+            var sql = $@"
+WITH candidates AS (
+    SELECT i.idnum, i.movieid, i.randid, sb.start_time, sb.end_time
+    FROM frl.frl_images i
+    INNER JOIN frl.frl_image_scene_boundaries sb
+        ON sb.movieid = i.movieid AND sb.filename = i.randid
+    WHERE i.status = 'live'
+      AND NOT EXISTS (
+          SELECT 1 FROM frl.frl_join_image_camera_movements cm
+          WHERE cm.imageid = i.idnum)
+      AND NOT EXISTS (
+          SELECT 1 FROM frl.frl_camera_movement_claims c
+          WHERE c.imageid = i.idnum
+            AND c.claimed_at > now() - INTERVAL '{ClaimTtlMinutes} minutes')
+    ORDER BY i.weighted_score DESC
+    LIMIT @limit
+    FOR UPDATE OF i SKIP LOCKED
+),
+claimed AS (
+    INSERT INTO frl.frl_camera_movement_claims (imageid, job_id, claimed_at)
+    SELECT idnum, @jobId, now() FROM candidates
+    ON CONFLICT (imageid) DO UPDATE SET job_id = EXCLUDED.job_id, claimed_at = now()
+    RETURNING imageid
+)
+SELECT idnum, movieid, randid, start_time, end_time
+FROM candidates
+WHERE idnum IN (SELECT imageid FROM claimed);";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@limit", limit);
+            cmd.Parameters.AddWithValue("@jobId", jobId);
+
+            var images = new List<AnalyzeItem>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                images.Add(new AnalyzeItem
+                {
+                    ImageId = reader.GetInt32(0),
+                    MovieId = reader.GetInt32(1),
+                    RandId = reader.GetString(2),
+                    StartTime = reader.IsDBNull(3) ? null : reader.GetDouble(3),
+                    EndTime = reader.IsDBNull(4) ? null : reader.GetDouble(4),
+                });
+            }
+            return images;
+        }
+
+        private async Task ReleaseClaimsAsync(List<int> imageIds, CancellationToken ct)
+        {
+            if (imageIds.Count == 0) return;
+
+            const string sql = @"
+DELETE FROM frl.frl_camera_movement_claims WHERE imageid = ANY(@ids);";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@ids", imageIds.ToArray());
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        private async Task UpdateJobProgressAsync(
+            Guid jobId, int processed, int failed, CancellationToken ct)
+        {
+            const string sql = @"
+UPDATE frl.frl_camera_movement_jobs
+SET processed = processed + @processed,
+    failed    = failed + @failed,
+    updated_at = now()
+WHERE job_id = @jobId;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@jobId", jobId);
+            cmd.Parameters.AddWithValue("@processed", processed);
+            cmd.Parameters.AddWithValue("@failed", failed);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
         private async Task InsertMovementAsync(
             int imageId, string movement, double confidence, CancellationToken ct)
         {
@@ -1501,6 +1704,40 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public int Failed { get; set; }
             public int Total { get; set; }
             public string Message { get; set; } = "";
+        }
+
+        public sealed class JobStartRequest
+        {
+            public string? StartedBy { get; set; }
+            public int Requested { get; set; }
+        }
+
+        public sealed class JobStartResponse
+        {
+            public Guid JobId { get; set; }
+        }
+
+        public sealed class JobFinishRequest
+        {
+            public Guid JobId { get; set; }
+            public string Status { get; set; } = "done";
+        }
+
+        public sealed class ActiveJob
+        {
+            public Guid JobId { get; set; }
+            public string StartedBy { get; set; } = "";
+            public int Requested { get; set; }
+            public int Processed { get; set; }
+            public int Failed { get; set; }
+            public string Status { get; set; } = "";
+            public DateTime StartedAt { get; set; }
+            public DateTime UpdatedAt { get; set; }
+        }
+
+        public sealed class ActiveJobsResponse
+        {
+            public List<ActiveJob> Jobs { get; set; } = new();
         }
 
         public sealed class TagSummary
