@@ -366,10 +366,10 @@ namespace AdminPanelAPI.Controllers
 
             // Ground the audio ID with the film's known soundtrack cues (a hint,
             // not a whitelist) so the model can name the right real cue; best-effort.
-            IReadOnlyList<string> soundtrackCues = Array.Empty<string>();
+            IReadOnlyList<SoundtrackCue> soundtrackCues = Array.Empty<SoundtrackCue>();
             try
             {
-                soundtrackCues = await _streamingLinkService.GetSoundtrackCueTitlesAsync(movieId, cancellationToken);
+                soundtrackCues = await _streamingLinkService.GetSoundtrackCuesAsync(movieId, cancellationToken);
             }
             catch (Exception ex)
             {

@@ -22,5 +22,38 @@ namespace AdminPanelAPI.Models
         public string? Explanation { get; set; }
         public string? Raw { get; set; }
         public string? Error { get; set; }
+
+        /// <summary>
+        /// Ranked shortlist of the most likely soundtrack cues (best first) when
+        /// the exact title can't be pinned by ear. Each carries listen links so a
+        /// human can play the candidates and pick the right one. Empty when there
+        /// is no soundtrack to draw from.
+        /// </summary>
+        public IReadOnlyList<AudioCueCandidate> Candidates { get; set; }
+            = System.Array.Empty<AudioCueCandidate>();
+    }
+
+    /// <summary>
+    /// One candidate cue in the audio-ID shortlist, with links so the user can
+    /// listen and decide which one actually plays in the scene.
+    /// </summary>
+    public class AudioCueCandidate
+    {
+        public string Title { get; set; } = "";
+        public string? Artist { get; set; }
+        public string? SpotifyUrl { get; set; }
+        public string? YouTubeUrl { get; set; }
+    }
+
+    /// <summary>
+    /// A track/cue from a movie's official soundtrack album, with its Spotify
+    /// track link when available. Used both as a grounding hint for audio ID and
+    /// to build the "pick a cue" shortlist with listen links.
+    /// </summary>
+    public class SoundtrackCue
+    {
+        public string Title { get; set; } = "";
+        public string? Artist { get; set; }
+        public string? SpotifyUrl { get; set; }
     }
 }

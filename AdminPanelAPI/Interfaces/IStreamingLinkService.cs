@@ -12,9 +12,11 @@ public interface IStreamingLinkService
     Task<StreamingLinkResult> BackfillAsync(int movieId, bool force, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Returns the track/cue titles of the movie's official soundtrack album
-    /// (from the stored Spotify album), for use as a grounding hint. Empty when
-    /// no soundtrack album is known or Spotify is unavailable.
+    /// Returns the track/cue listing of the movie's official soundtrack album
+    /// (from the stored Spotify album) — title, artist and Spotify track link —
+    /// for use both as a grounding hint and to build a shortlist of candidate
+    /// cues with listen links. Empty when no soundtrack album is known or
+    /// Spotify is unavailable.
     /// </summary>
-    Task<IReadOnlyList<string>> GetSoundtrackCueTitlesAsync(int movieId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<SoundtrackCue>> GetSoundtrackCuesAsync(int movieId, CancellationToken cancellationToken);
 }

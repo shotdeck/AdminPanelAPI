@@ -41,7 +41,7 @@ namespace AdminPanelAPI.Services
             string? currentArtist,
             string movieTitle,
             int? movieYear,
-            IReadOnlyList<string> soundtrackCues,
+            IReadOnlyList<SoundtrackCue> soundtrackCues,
             CancellationToken cancellationToken)
         {
             var apiKey = _configuration["OpenAI:ApiKey"]
@@ -127,7 +127,7 @@ namespace AdminPanelAPI.Services
             string? currentArtist,
             string movieTitle,
             int? movieYear,
-            IReadOnlyList<string> soundtrackCues,
+            IReadOnlyList<SoundtrackCue> soundtrackCues,
             CancellationToken cancellationToken)
         {
             var yearText = movieYear.HasValue ? $" ({movieYear})" : "";
@@ -138,7 +138,7 @@ namespace AdminPanelAPI.Services
             var cuesHint = "";
             if (soundtrackCues.Count > 0)
             {
-                var list = string.Join("; ", soundtrackCues.Take(60));
+                var list = string.Join("; ", soundtrackCues.Select(c => c.Title).Take(60));
                 cuesHint =
                     "For reference, this film's official soundtrack/score track listing is: " +
                     $"[{list}]. Treat this ONLY as a hint: if what you hear clearly matches one of " +
@@ -234,7 +234,7 @@ namespace AdminPanelAPI.Services
             string? currentArtist,
             string movieTitle,
             int? movieYear,
-            IReadOnlyList<string> soundtrackCues,
+            IReadOnlyList<SoundtrackCue> soundtrackCues,
             CancellationToken cancellationToken)
         {
             var yearText = movieYear.HasValue ? $" ({movieYear})" : "";
@@ -249,29 +249,27 @@ namespace AdminPanelAPI.Services
 
             var cuesHint = soundtrackCues.Count > 0
                 ? "This film's official soundtrack/score track listing is: " +
-                  $"[{string.Join("; ", soundtrackCues.Take(60))}]. Prefer a title from this list when one " +
-                  "is consistent with what was heard, but the list is not exhaustive — you may propose a cue " +
-                  "not listed if it fits better. "
+                  $"[{string.Join("; ", soundtrackCues.Select(c => c.Title).Take(60))}]. Prefer titles from this " +
+                  "list when consistent with what was heard, but the list is not exhaustive — you may include a " +
+                  "cue not listed if it fits better. "
                 : "";
             var prompt =
                 $"A short music clip from the film \"{movieTitle}\"{yearText} was identified by ear. {heard}" +
                 $"A fingerprint service (often wrong) had labelled it \"{currentTitle}\"" +
                 (string.IsNullOrWhiteSpace(currentArtist) ? "" : $" by \"{currentArtist}\"") + ". " +
                 cuesHint +
-                "Using web search of this film's official soundtrack and score track listing, propose your " +
-                "single BEST-GUESS cue/track title from that film that is consistent with the specific musical " +
-                "details described above (composer, instrumentation, melody, style). This is an advisory guess " +
-                "a human will verify — offer a title even when you are not certain, but only return null if " +
-                "nothing on the soundtrack is plausibly consistent with what was heard. " +
-                "IMPORTANT: do NOT pick a title just because it is this film's famous, signature or most " +
-                "prominent song — choose the cue that best fits the described style/scene, not the best-known " +
-                "one, and do not justify your choice by how prominent or famous it is in the film. " +
-                "This is a reasoned guess, not an aural recognition, so always report \"low\" confidence. " +
+                "Using web search of this film's official soundtrack and score track listing, return a RANKED " +
+                "SHORTLIST of up to 5 candidate cue/track titles from that film that are most consistent with " +
+                "the specific musical details described above (composer, instrumentation, melody, style), best " +
+                "guess first. This is an advisory shortlist a human will listen to and confirm. " +
+                "IMPORTANT: do NOT rank a title higher just because it is this film's famous, signature or most " +
+                "prominent song — order by how well each fits the described style/scene, not by fame. " +
+                "Return an empty list only if nothing on the soundtrack is plausibly consistent with what was heard. " +
+                "This is reasoned guessing, not aural recognition, so always report \"low\" confidence. " +
                 "Reply ONLY with a JSON object with keys: " +
-                "\"title\" (best-guess cue/track title, or null if nothing plausibly fits), " +
-                "\"artist\" (performer or composer, or null), " +
+                "\"candidates\" (an array, best first, of objects with \"title\" and \"artist\" (performer/composer or null)), " +
                 "\"confidence\" (always \"low\"), " +
-                "\"explanation\" (one sentence).";
+                "\"explanation\" (one sentence on how to tell the top candidates apart).";
 
             var payload = new
             {
@@ -292,26 +290,173 @@ namespace AdminPanelAPI.Services
             if (!resp.IsSuccessStatusCode)
             {
                 _logger.LogDebug("Web-search title call returned {Status}.", resp.StatusCode);
+                BuildCandidatesFromSoundtrack(suggestion, soundtrackCues, null);
                 return;
             }
 
             var body = await resp.Content.ReadAsStringAsync(cancellationToken);
             var text = ExtractResponsesText(body);
-            if (string.IsNullOrWhiteSpace(text)) return;
 
-            var refined = ParseSuggestion(text);
-            if (string.IsNullOrWhiteSpace(refined.Title)) return;
+            var (ranked, explanation) = ParseRankedCandidates(text);
+            if (!string.IsNullOrWhiteSpace(explanation))
+                suggestion.Explanation = explanation;
 
-            // The web-searched title is a best-guess "possible cue", not an aural
-            // recognition — flag it unverified so the UI shows it as such, and
-            // leave the overall confidence reflecting the composer/style read from
-            // the audio (a title guess must never raise it).
-            suggestion.Title = refined.Title;
+            BuildCandidatesFromSoundtrack(suggestion, soundtrackCues, ranked);
+        }
+
+        // Populates suggestion.Candidates with a ranked shortlist of real cues,
+        // each carrying Spotify + YouTube links so a human can listen and pick.
+        // Prefers the model's ranking when available; otherwise falls back to the
+        // soundtrack listing order so the user still gets a pick-list with links.
+        // The top candidate is also mirrored onto Title (flagged unverified) for
+        // backward compatibility with the single-title UI.
+        private static void BuildCandidatesFromSoundtrack(
+            AudioIdentifySuggestion suggestion,
+            IReadOnlyList<SoundtrackCue> soundtrackCues,
+            IReadOnlyList<(string Title, string? Artist)>? ranked)
+        {
+            const int MaxCandidates = 5;
+            var byNorm = new Dictionary<string, SoundtrackCue>();
+            foreach (var c in soundtrackCues)
+            {
+                var key = NormalizeTitle(c.Title);
+                if (!string.IsNullOrEmpty(key) && !byNorm.ContainsKey(key))
+                    byNorm[key] = c;
+            }
+
+            var candidates = new List<AudioCueCandidate>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            void Add(string title, string? artist, SoundtrackCue? match)
+            {
+                if (string.IsNullOrWhiteSpace(title)) return;
+                if (!seen.Add(NormalizeTitle(title))) return;
+                var finalArtist = !string.IsNullOrWhiteSpace(artist) ? artist : match?.Artist;
+                candidates.Add(new AudioCueCandidate
+                {
+                    Title = title.Trim(),
+                    Artist = finalArtist,
+                    SpotifyUrl = match?.SpotifyUrl,
+                    YouTubeUrl = YouTubeSearchUrl(title, finalArtist)
+                });
+            }
+
+            if (ranked != null)
+            {
+                foreach (var r in ranked)
+                {
+                    if (candidates.Count >= MaxCandidates) break;
+                    byNorm.TryGetValue(NormalizeTitle(r.Title), out var match);
+                    Add(r.Title, r.Artist, match);
+                }
+            }
+
+            // Fall back to (or top up with) the soundtrack listing so there is
+            // always something to pick from with real listen links.
+            foreach (var c in soundtrackCues)
+            {
+                if (candidates.Count >= MaxCandidates) break;
+                Add(c.Title, c.Artist, c);
+            }
+
+            if (candidates.Count == 0) return;
+
+            suggestion.Candidates = candidates;
+            // Mirror the top pick onto the legacy single-title fields, clearly
+            // unverified — the shortlist is the source of truth.
+            suggestion.Title = candidates[0].Title;
             suggestion.TitleUnverified = true;
-            if (!string.IsNullOrWhiteSpace(refined.Artist))
-                suggestion.Artist = refined.Artist;
-            if (!string.IsNullOrWhiteSpace(refined.Explanation))
-                suggestion.Explanation = refined.Explanation;
+            if (!string.IsNullOrWhiteSpace(candidates[0].Artist))
+                suggestion.Artist = candidates[0].Artist;
+        }
+
+        private static string YouTubeSearchUrl(string? title, string? artist)
+        {
+            var query = string.Join(" ", new[] { artist, title }
+                .Where(s => !string.IsNullOrWhiteSpace(s))).Trim();
+            return "https://www.youtube.com/results?search_query=" + Uri.EscapeDataString(query);
+        }
+
+        private static string NormalizeTitle(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            var lower = s.Trim().ToLowerInvariant();
+            // Drop parenthetical qualifiers (e.g. "(From ...)") and punctuation so
+            // the model's title and the album track name line up.
+            lower = Regex.Replace(lower, @"\([^)]*\)", " ");
+            lower = Regex.Replace(lower, @"[^a-z0-9]+", " ");
+            return Regex.Replace(lower, @"\s+", " ").Trim();
+        }
+
+        // Parses the ranked-candidates JSON: {"candidates":[{"title","artist"}],
+        // "explanation"}. Tolerant of the model returning a bare {"title"} object
+        // or a plain array. Returns an ordered list (best first) and explanation.
+        private static (IReadOnlyList<(string Title, string? Artist)> Ranked, string? Explanation)
+            ParseRankedCandidates(string content)
+        {
+            var ranked = new List<(string, string?)>();
+            if (string.IsNullOrWhiteSpace(content))
+                return (ranked, null);
+
+            var startObj = content.IndexOf('{');
+            var startArr = content.IndexOf('[');
+            var start = startObj < 0 ? startArr
+                : startArr < 0 ? startObj
+                : Math.Min(startObj, startArr);
+            if (start < 0) return (ranked, null);
+            var endObj = content.LastIndexOf('}');
+            var endArr = content.LastIndexOf(']');
+            var end = Math.Max(endObj, endArr);
+            if (end <= start) return (ranked, null);
+
+            var json = content.Substring(start, end - start + 1);
+            var doc = TryParseLenient(json);
+            if (doc == null) return (ranked, null);
+
+            string? explanation = null;
+            using (doc)
+            {
+                var root = doc.RootElement;
+                JsonElement arr;
+                if (root.ValueKind == JsonValueKind.Array)
+                {
+                    arr = root;
+                }
+                else if (root.ValueKind == JsonValueKind.Object)
+                {
+                    explanation = ReadString(root, "explanation");
+                    if (!root.TryGetProperty("candidates", out arr)
+                        || arr.ValueKind != JsonValueKind.Array)
+                    {
+                        // Single-object fallback: {"title","artist"}.
+                        var t = ReadString(root, "title");
+                        if (!string.IsNullOrWhiteSpace(t))
+                            ranked.Add((t!, ReadString(root, "artist")));
+                        return (ranked, explanation);
+                    }
+                }
+                else
+                {
+                    return (ranked, null);
+                }
+
+                foreach (var el in arr.EnumerateArray())
+                {
+                    if (el.ValueKind == JsonValueKind.String)
+                    {
+                        var s = el.GetString();
+                        if (!string.IsNullOrWhiteSpace(s)) ranked.Add((s!, null));
+                    }
+                    else if (el.ValueKind == JsonValueKind.Object)
+                    {
+                        var t = ReadString(el, "title");
+                        if (!string.IsNullOrWhiteSpace(t))
+                            ranked.Add((t!, ReadString(el, "artist")));
+                    }
+                }
+            }
+
+            return (ranked, explanation);
         }
 
         // Concatenates the "output_text" parts of an OpenAI Responses API result.
