@@ -110,13 +110,15 @@ LIMIT @limit;";
         {
             await EnsureOpenAsync(ct);
 
+            // Cast to text: media_type may be a Postgres enum, and btrim/lower
+            // are not defined for enum types.
             const string sql = @"
-SELECT DISTINCT media_type
+SELECT DISTINCT media_type::text AS media_type
 FROM frl.frl_movies
 WHERE media_type IS NOT NULL
-  AND btrim(media_type) <> ''
-  AND lower(media_type) <> 'trailer'
-ORDER BY media_type;";
+  AND btrim(media_type::text) <> ''
+  AND lower(media_type::text) <> 'trailer'
+ORDER BY media_type::text;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -1476,8 +1478,8 @@ CREATE INDEX IF NOT EXISTS idx_cmc_claimed_at ON frl.frl_camera_movement_claims 
 
             var mediaJoin = "LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid";
             var mediaClause = isAll
-                ? " AND (m.media_type IS NULL OR lower(m.media_type) <> 'trailer')"
-                : " AND lower(m.media_type) = lower(@mediaType)";
+                ? " AND (m.media_type IS NULL OR lower(m.media_type::text) <> 'trailer')"
+                : " AND lower(m.media_type::text) = lower(@mediaType)";
 
             var sql = $@"
 WITH candidates AS (
