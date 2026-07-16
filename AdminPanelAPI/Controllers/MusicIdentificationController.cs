@@ -364,6 +364,18 @@ namespace AdminPanelAPI.Controllers
             if (occ == null)
                 return NotFound(new { error = $"No occurrence found for song {songId} in movie {movieId}." });
 
+            // Ground the audio ID with the film's known soundtrack cues (a hint,
+            // not a whitelist) so the model can name the right real cue; best-effort.
+            IReadOnlyList<string> soundtrackCues = Array.Empty<string>();
+            try
+            {
+                soundtrackCues = await _streamingLinkService.GetSoundtrackCueTitlesAsync(movieId, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Fetching soundtrack cues for movie {MovieId} failed.", movieId);
+            }
+
             var suggestion = await _audioIdentifyService.IdentifyAsync(
                 r2Key,
                 occ.Value.Start,
@@ -372,6 +384,7 @@ namespace AdminPanelAPI.Controllers
                 occ.Value.Artist,
                 occ.Value.MovieTitle ?? "",
                 occ.Value.MovieYear,
+                soundtrackCues,
                 cancellationToken);
 
             return Ok(suggestion);

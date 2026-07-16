@@ -40,6 +40,7 @@ namespace AdminPanelAPI.Services
             string? currentArtist,
             string movieTitle,
             int? movieYear,
+            IReadOnlyList<string> soundtrackCues,
             CancellationToken cancellationToken)
         {
             var apiKey = _configuration["OpenAI:ApiKey"]
@@ -63,7 +64,7 @@ namespace AdminPanelAPI.Services
             {
                 suggestion = await AskAudioModelAsync(
                     apiKey, audioB64, currentTitle, currentArtist,
-                    movieTitle, movieYear, cancellationToken);
+                    movieTitle, movieYear, soundtrackCues, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -72,19 +73,23 @@ namespace AdminPanelAPI.Services
             }
 
             // Second step: the audio model reliably hears the composer/style but
-            // not the exact cue title. When it heard something usable (a
-            // performer/composer or an instrumental score cue), use a web-search
-            // reasoning pass over the film's soundtrack/score to propose the
-            // specific title — the way ChatGPT gets it. Advisory only; failures
-            // leave the audio suggestion untouched.
+            // not always the exact cue title. When it already recognised a title
+            // (often now that it's given the film's tracklist as a hint), keep it
+            // as a genuine aural recognition. Otherwise, when it heard something
+            // usable (a performer/composer or an instrumental score cue), use a
+            // web-search reasoning pass over the film's soundtrack/score to
+            // propose a best-guess title — the way ChatGPT gets it — flagged
+            // unverified. Advisory only; failures leave the audio suggestion
+            // untouched.
             if (suggestion.Error == null &&
+                string.IsNullOrWhiteSpace(suggestion.Title) &&
                 (!string.IsNullOrWhiteSpace(suggestion.Artist) || suggestion.IsScoreCue))
             {
                 try
                 {
                     await RefineTitleWithWebSearchAsync(
                         apiKey, suggestion, currentTitle, currentArtist,
-                        movieTitle, movieYear, cancellationToken);
+                        movieTitle, movieYear, soundtrackCues, cancellationToken);
                 }
                 catch (Exception ex)
                 {
@@ -121,9 +126,25 @@ namespace AdminPanelAPI.Services
             string? currentArtist,
             string movieTitle,
             int? movieYear,
+            IReadOnlyList<string> soundtrackCues,
             CancellationToken cancellationToken)
         {
             var yearText = movieYear.HasValue ? $" ({movieYear})" : "";
+            // The film's known soundtrack/score cues, offered as a HINT (not a
+            // whitelist): if the clip clearly matches one, naming it lets the model
+            // pick the right real cue; unlisted needle-drops must still identify
+            // freely.
+            var cuesHint = "";
+            if (soundtrackCues.Count > 0)
+            {
+                var list = string.Join("; ", soundtrackCues.Take(60));
+                cuesHint =
+                    "For reference, this film's official soundtrack/score track listing is: " +
+                    $"[{list}]. Treat this ONLY as a hint: if what you hear clearly matches one of " +
+                    "these cues, name that exact title; but this list is NOT exhaustive — if the clip " +
+                    "is a needle-drop or any track not on the list, identify it normally, and never pick " +
+                    "a listed title just because it is on the list or is the film's famous cue. ";
+            }
             var prompt =
                 "You are an expert at identifying music by ear. This is a short audio clip taken " +
                 $"from the film \"{movieTitle}\"{yearText} (it may have dialogue or sound effects over it). " +
@@ -133,6 +154,7 @@ namespace AdminPanelAPI.Services
                 "Identify the music STRICTLY from what you actually hear in this clip. " +
                 "The film name is context only — do NOT assume it is one of that film's famous or " +
                 "signature songs, and never invent a specific well-known track title just to fit the film. " +
+                cuesHint +
                 "Separate two judgements: (a) the exact TITLE — only give one you can genuinely recognise " +
                 "by ear, otherwise null; (b) whether it is an instrumental film-score cue and, if so, the " +
                 "likely COMPOSER and musical style — you MAY name the composer/style when you can hear it " +
@@ -211,6 +233,7 @@ namespace AdminPanelAPI.Services
             string? currentArtist,
             string movieTitle,
             int? movieYear,
+            IReadOnlyList<string> soundtrackCues,
             CancellationToken cancellationToken)
         {
             var yearText = movieYear.HasValue ? $" ({movieYear})" : "";
@@ -223,10 +246,17 @@ namespace AdminPanelAPI.Services
             if (!string.IsNullOrWhiteSpace(suggestion.Explanation))
                 heard.Append($"Audio notes: {suggestion.Explanation} ");
 
+            var cuesHint = soundtrackCues.Count > 0
+                ? "This film's official soundtrack/score track listing is: " +
+                  $"[{string.Join("; ", soundtrackCues.Take(60))}]. Prefer a title from this list when one " +
+                  "is consistent with what was heard, but the list is not exhaustive — you may propose a cue " +
+                  "not listed if it fits better. "
+                : "";
             var prompt =
                 $"A short music clip from the film \"{movieTitle}\"{yearText} was identified by ear. {heard}" +
                 $"A fingerprint service (often wrong) had labelled it \"{currentTitle}\"" +
                 (string.IsNullOrWhiteSpace(currentArtist) ? "" : $" by \"{currentArtist}\"") + ". " +
+                cuesHint +
                 "Using web search of this film's official soundtrack and score track listing, propose your " +
                 "single BEST-GUESS cue/track title from that film that is consistent with the specific musical " +
                 "details described above (composer, instrumentation, melody, style). This is an advisory guess " +
