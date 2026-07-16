@@ -5,6 +5,7 @@ using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
+using System.Text.Json;
 
 namespace AdminPanelAPI.Controllers
 {
@@ -349,10 +350,20 @@ namespace AdminPanelAPI.Controllers
         public async Task<IActionResult> AudioIdentify(
             long songId,
             [FromQuery] int movieId,
+            [FromQuery] bool refresh,
             CancellationToken cancellationToken)
         {
             if (movieId <= 0)
                 return BadRequest("movieId is required.");
+
+            // Return the last successful result instantly unless a fresh listen
+            // is explicitly requested.
+            if (!refresh)
+            {
+                var cached = await GetCachedAudioIdentifyAsync(movieId, songId, cancellationToken);
+                if (cached != null)
+                    return Ok(cached);
+            }
 
             var r2Key = await GetR2KeyFromDialogueJobAsync(movieId, cancellationToken)
                 ?? await GetR2KeyForMovieAsync(movieId, cancellationToken)
@@ -387,7 +398,75 @@ namespace AdminPanelAPI.Controllers
                 soundtrackCues,
                 cancellationToken);
 
+            // Persist a usable result so a second press returns instantly. Don't
+            // cache errors or empty no-ops (a re-listen may do better).
+            if (IsCacheableSuggestion(suggestion))
+                await SaveCachedAudioIdentifyAsync(movieId, songId, suggestion, cancellationToken);
+
             return Ok(suggestion);
+        }
+
+        private static bool IsCacheableSuggestion(AudioIdentifySuggestion s)
+        {
+            if (s.Error != null)
+                return false;
+            return !string.IsNullOrWhiteSpace(s.Title)
+                || !string.IsNullOrWhiteSpace(s.Artist)
+                || s.IsScoreCue
+                || s.Candidates.Count > 0;
+        }
+
+        private async Task<AudioIdentifySuggestion?> GetCachedAudioIdentifyAsync(
+            int movieId, long songId, CancellationToken cancellationToken)
+        {
+            const string sql = @"
+SELECT suggestion FROM frl.frl_music_audio_identify_cache
+WHERE movieid = @movieid AND song_id = @song_id;";
+            try
+            {
+                await using var conn = new NpgsqlConnection(_connectionString);
+                await conn.OpenAsync(cancellationToken);
+                await using var cmd = new NpgsqlCommand(sql, conn);
+                cmd.Parameters.AddWithValue("movieid", movieId);
+                cmd.Parameters.AddWithValue("song_id", songId);
+                var json = await cmd.ExecuteScalarAsync(cancellationToken) as string;
+                if (string.IsNullOrWhiteSpace(json))
+                    return null;
+                return JsonSerializer.Deserialize<AudioIdentifySuggestion>(json);
+            }
+            catch (Exception ex)
+            {
+                // Cache is a best-effort optimisation (e.g. table may not exist
+                // until migration 025 runs); never fail the request over it.
+                _logger.LogDebug(ex, "Reading audio-identify cache failed.");
+                return null;
+            }
+        }
+
+        private async Task SaveCachedAudioIdentifyAsync(
+            int movieId, long songId, AudioIdentifySuggestion suggestion,
+            CancellationToken cancellationToken)
+        {
+            const string sql = @"
+INSERT INTO frl.frl_music_audio_identify_cache (movieid, song_id, suggestion, created_at)
+VALUES (@movieid, @song_id, @suggestion::jsonb, now())
+ON CONFLICT (movieid, song_id)
+DO UPDATE SET suggestion = EXCLUDED.suggestion, created_at = now();";
+            try
+            {
+                var json = JsonSerializer.Serialize(suggestion);
+                await using var conn = new NpgsqlConnection(_connectionString);
+                await conn.OpenAsync(cancellationToken);
+                await using var cmd = new NpgsqlCommand(sql, conn);
+                cmd.Parameters.AddWithValue("movieid", movieId);
+                cmd.Parameters.AddWithValue("song_id", songId);
+                cmd.Parameters.AddWithValue("suggestion", json);
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Writing audio-identify cache failed.");
+            }
         }
 
         private async Task<(double Start, double End, string? Title, string? Artist, string? MovieTitle, int? MovieYear)?>
