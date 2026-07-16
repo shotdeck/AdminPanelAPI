@@ -60,17 +60,32 @@ namespace AdminPanelAPI.Services
                 return new AudioIdentifySuggestion { Error = "Couldn't extract the clip audio." };
             }
 
-            AudioIdentifySuggestion suggestion;
-            try
+            // The audio model intermittently returns a no-op ("please provide the
+            // audio" / "I can't listen to audio right now") as if it never received
+            // the clip, yielding an empty suggestion. Retry a couple of times so a
+            // transient miss doesn't surface as "unsure" to the user.
+            AudioIdentifySuggestion suggestion = new AudioIdentifySuggestion();
+            const int MaxAudioAttempts = 3;
+            for (var attempt = 1; attempt <= MaxAudioAttempts; attempt++)
             {
-                suggestion = await AskAudioModelAsync(
-                    apiKey, audioB64, currentTitle, currentArtist,
-                    movieTitle, movieYear, soundtrackCues, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Audio identification call failed.");
-                return new AudioIdentifySuggestion { Error = "The audio model call failed." };
+                try
+                {
+                    suggestion = await AskAudioModelAsync(
+                        apiKey, audioB64, currentTitle, currentArtist,
+                        movieTitle, movieYear, soundtrackCues, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Audio identification call failed (attempt {Attempt}).", attempt);
+                    if (attempt == MaxAudioAttempts)
+                        return new AudioIdentifySuggestion { Error = "The audio model call failed." };
+                    continue;
+                }
+
+                if (!LooksLikeAudioNoOp(suggestion))
+                    break;
+
+                _logger.LogDebug("Audio model produced a no-op on attempt {Attempt}; retrying.", attempt);
             }
 
             // Second step: the audio model reliably hears the composer/style but
@@ -99,6 +114,28 @@ namespace AdminPanelAPI.Services
             }
 
             return suggestion;
+        }
+
+        // True when the audio model returned nothing usable AND its text reads
+        // like it never received the audio (a transient failure worth retrying),
+        // rather than a genuine "the music is too faint to identify" result.
+        private static bool LooksLikeAudioNoOp(AudioIdentifySuggestion s)
+        {
+            if (s.Error != null) return false;
+            var hasSignal = !string.IsNullOrWhiteSpace(s.Title)
+                || !string.IsNullOrWhiteSpace(s.Artist)
+                || s.IsScoreCue;
+            if (hasSignal) return false;
+
+            var text = (s.Explanation ?? s.Raw ?? "").ToLowerInvariant();
+            if (string.IsNullOrWhiteSpace(text)) return true;
+            string[] noOpMarkers =
+            {
+                "provide the audio", "share the audio", "can't listen",
+                "cannot listen", "can't analyze audio", "cannot analyze audio",
+                "unable to listen", "no audio", "ready to help", "please provide"
+            };
+            return noOpMarkers.Any(m => text.Contains(m));
         }
 
         private async Task<string> ExtractClipAsync(
