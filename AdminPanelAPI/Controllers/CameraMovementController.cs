@@ -677,6 +677,7 @@ ORDER BY total DESC;";
             [FromQuery] string? status = null,
             [FromQuery] int page = 1,
             [FromQuery] int pageSize = 50,
+            [FromQuery] string? sort = null,
             CancellationToken ct = default)
         {
             if (page < 1) page = 1;
@@ -684,6 +685,9 @@ ORDER BY total DESC;";
             if (pageSize > 200) pageSize = 200;
 
             await EnsureOpenAsync(ct);
+            await EnsureTimestampColumnsAsync(ct);
+
+            var orderBy = ResolveClipSort(sort);
 
             var whereClauses = new List<string> { "cm.movement = @movement" };
             if (!string.IsNullOrWhiteSpace(status))
@@ -723,7 +727,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid
 LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
 WHERE {whereStr}
-ORDER BY cm.confidence DESC
+ORDER BY {orderBy}
 LIMIT @limit OFFSET @offset;";
 
             await using var cmd = new NpgsqlCommand(dataSql, _connection);
@@ -881,6 +885,9 @@ WHERE imageid IN ({idParams});";
             int pageSize = request.PageSize < 1 ? 20 : request.PageSize > 200 ? 200 : request.PageSize;
 
             await EnsureOpenAsync(ct);
+            await EnsureTimestampColumnsAsync(ct);
+
+            var orderBy = ResolveClipSort(request.Sort);
 
             // Build parameterised include list
             var includeParams = new List<string>();
@@ -955,7 +962,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
 LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
 WHERE cm.movement = @firstMovement
   AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}
-ORDER BY cm.confidence DESC
+ORDER BY {orderBy}
 LIMIT @limit OFFSET @offset;";
 
             await using var cmd = new NpgsqlCommand(dataSql, _connection);
@@ -1692,6 +1699,44 @@ WHERE imageid IN ({idParams});";
             return result;
         }
 
+        // Sort keys for the clip listing endpoints. Values are trusted, fixed
+        // ORDER BY fragments (never user input) to avoid SQL injection.
+        private static readonly Dictionary<string, string> ClipSortOrders = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["edited_desc"] = "cm.updated_at DESC NULLS LAST, cm.imageid DESC",
+            ["edited_asc"] = "cm.updated_at ASC NULLS LAST, cm.imageid ASC",
+            ["tagged_desc"] = "cm.created_at DESC NULLS LAST, cm.imageid DESC",
+            ["tagged_asc"] = "cm.created_at ASC NULLS LAST, cm.imageid ASC",
+            ["confidence_desc"] = "cm.confidence DESC",
+            ["confidence_asc"] = "cm.confidence ASC",
+        };
+
+        private static string ResolveClipSort(string? sort)
+        {
+            if (!string.IsNullOrWhiteSpace(sort) && ClipSortOrders.TryGetValue(sort, out var order))
+                return order;
+            return ClipSortOrders["confidence_desc"];
+        }
+
+        private static bool _timestampColumnsReady;
+
+        // Ensure created_at/updated_at exist on the join table so the sort
+        // options work. Adds nullable columns (metadata-only, instant even on
+        // large tables) with a default for future inserts; existing rows keep
+        // NULL and sort last. Idempotent.
+        private async Task EnsureTimestampColumnsAsync(CancellationToken ct)
+        {
+            if (_timestampColumnsReady) return;
+            const string sql = @"
+ALTER TABLE frl.frl_join_image_camera_movements ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+ALTER TABLE frl.frl_join_image_camera_movements ALTER COLUMN created_at SET DEFAULT now();
+ALTER TABLE frl.frl_join_image_camera_movements ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+ALTER TABLE frl.frl_join_image_camera_movements ALTER COLUMN updated_at SET DEFAULT now();";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await cmd.ExecuteNonQueryAsync(ct);
+            _timestampColumnsReady = true;
+        }
+
         private async Task EnsureSegmentsTableAsync(CancellationToken ct)
         {
             const string sql = @"
@@ -1974,6 +2019,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string? Status { get; set; }
             public int Page { get; set; } = 1;
             public int PageSize { get; set; } = 50;
+            public string? Sort { get; set; }
         }
 
         // VideoMAE API response DTOs
