@@ -668,6 +668,24 @@ ORDER BY total DESC;";
             return Ok(new TagSummaryResponse { Tags = tags });
         }
 
+        // ── GET /api/admin/camera-movements/analyzed-count ─────────────
+        // Total distinct images that have been through camera-movement analysis.
+        [HttpGet("analyzed-count")]
+        [ProducesResponseType(typeof(AnalyzedCountResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<AnalyzedCountResponse>> GetAnalyzedCount(CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+
+            const string sql = @"
+SELECT COUNT(DISTINCT imageid)
+FROM frl.frl_join_image_camera_movements;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            var count = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
+
+            return Ok(new AnalyzedCountResponse { AnalyzedImages = count });
+        }
+
         // ── GET /api/admin/camera-movements/tags/{movement}/clips ──────
         // Returns clips tagged with a specific movement, with R2 URLs.
         [HttpGet("tags/{movement}/clips")]
@@ -678,6 +696,8 @@ ORDER BY total DESC;";
             [FromQuery] int page = 1,
             [FromQuery] int pageSize = 50,
             [FromQuery] string? sort = null,
+            [FromQuery] double? minLen = null,
+            [FromQuery] double? maxLen = null,
             CancellationToken ct = default)
         {
             if (page < 1) page = 1;
@@ -688,26 +708,38 @@ ORDER BY total DESC;";
             await EnsureTimestampColumnsAsync(ct);
 
             var orderBy = ResolveClipSort(sort);
+            var cutActive = CutLengthActive(minLen, maxLen);
 
             var whereClauses = new List<string> { "cm.movement = @movement" };
             if (!string.IsNullOrWhiteSpace(status))
                 whereClauses.Add("cm.status = @status");
+            if (cutActive)
+                whereClauses.AddRange(CutLengthWhere(minLen, maxLen));
 
             var whereStr = string.Join(" AND ", whereClauses);
             var offset = (page - 1) * pageSize;
 
+            // The cut-length filter needs the scene-boundary join + lateral;
+            // the count query normally only touches cm, so add them when active.
+            var countJoins = cutActive ? $@"
+INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
+INNER JOIN frl.frl_image_scene_boundaries sb
+    ON sb.movieid = i.movieid AND sb.filename = i.randid{CutLengthLateralSql}" : "";
+
             var countSql = $@"
 SELECT COUNT(*)
-FROM frl.frl_join_image_camera_movements cm
+FROM frl.frl_join_image_camera_movements cm{countJoins}
 WHERE {whereStr};";
 
             await using var countCmd = new NpgsqlCommand(countSql, _connection);
             countCmd.Parameters.AddWithValue("@movement", movement);
             if (!string.IsNullOrWhiteSpace(status))
                 countCmd.Parameters.AddWithValue("@status", status);
+            AddCutLengthParams(countCmd, minLen, maxLen);
 
             var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
 
+            var dataLateral = cutActive ? CutLengthLateralSql : "";
             var dataSql = $@"
 SELECT cm.imageid,
        cm.movement,
@@ -724,7 +756,7 @@ SELECT cm.imageid,
 FROM frl.frl_join_image_camera_movements cm
 INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
 INNER JOIN frl.frl_image_scene_boundaries sb
-    ON sb.movieid = i.movieid AND sb.filename = i.randid
+    ON sb.movieid = i.movieid AND sb.filename = i.randid{dataLateral}
 LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
 WHERE {whereStr}
 ORDER BY {orderBy}
@@ -734,6 +766,7 @@ LIMIT @limit OFFSET @offset;";
             cmd.Parameters.AddWithValue("@movement", movement);
             if (!string.IsNullOrWhiteSpace(status))
                 cmd.Parameters.AddWithValue("@status", status);
+            AddCutLengthParams(cmd, minLen, maxLen);
             cmd.Parameters.AddWithValue("@limit", pageSize);
             cmd.Parameters.AddWithValue("@offset", offset);
 
@@ -888,6 +921,10 @@ WHERE imageid IN ({idParams});";
             await EnsureTimestampColumnsAsync(ct);
 
             var orderBy = ResolveClipSort(request.Sort);
+            var cutActive = CutLengthActive(request.MinLen, request.MaxLen);
+            var cutWhere = cutActive
+                ? " AND " + string.Join(" AND ", CutLengthWhere(request.MinLen, request.MaxLen))
+                : "";
 
             // Build parameterised include list
             var includeParams = new List<string>();
@@ -922,12 +959,19 @@ HAVING COUNT(DISTINCT movement) = @includeCount";
 
             var offset = (page - 1) * pageSize;
 
+            // The cut-length filter needs the scene-boundary join + lateral;
+            // the count query normally only touches cm, so add them when active.
+            var countJoins = cutActive ? $@"
+INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
+INNER JOIN frl.frl_image_scene_boundaries sb
+    ON sb.movieid = i.movieid AND sb.filename = i.randid{CutLengthLateralSql}" : "";
+
             // Count query
             var countSql = $@"
 SELECT COUNT(*)
-FROM frl.frl_join_image_camera_movements cm
+FROM frl.frl_join_image_camera_movements cm{countJoins}
 WHERE cm.movement = @firstMovement
-  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause};";
+  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere};";
 
             await using var countCmd = new NpgsqlCommand(countSql, _connection);
             countCmd.Parameters.AddWithValue("@firstMovement", include[0]);
@@ -938,10 +982,12 @@ WHERE cm.movement = @firstMovement
                 countCmd.Parameters.AddWithValue($"@exc{i}", exclude[i]);
             if (!string.IsNullOrWhiteSpace(request.Status))
                 countCmd.Parameters.AddWithValue("@status", request.Status);
+            AddCutLengthParams(countCmd, request.MinLen, request.MaxLen);
 
             var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
 
             // Data query
+            var dataLateral = cutActive ? CutLengthLateralSql : "";
             var dataSql = $@"
 SELECT cm.imageid,
        cm.movement,
@@ -958,10 +1004,10 @@ SELECT cm.imageid,
 FROM frl.frl_join_image_camera_movements cm
 INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
 INNER JOIN frl.frl_image_scene_boundaries sb
-    ON sb.movieid = i.movieid AND sb.filename = i.randid
+    ON sb.movieid = i.movieid AND sb.filename = i.randid{dataLateral}
 LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
 WHERE cm.movement = @firstMovement
-  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}
+  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere}
 ORDER BY {orderBy}
 LIMIT @limit OFFSET @offset;";
 
@@ -974,6 +1020,7 @@ LIMIT @limit OFFSET @offset;";
                 cmd.Parameters.AddWithValue($"@exc{i}", exclude[i]);
             if (!string.IsNullOrWhiteSpace(request.Status))
                 cmd.Parameters.AddWithValue("@status", request.Status);
+            AddCutLengthParams(cmd, request.MinLen, request.MaxLen);
             cmd.Parameters.AddWithValue("@limit", pageSize);
             cmd.Parameters.AddWithValue("@offset", offset);
 
@@ -1718,6 +1765,44 @@ WHERE imageid IN ({idParams});";
             return ClipSortOrders["confidence_desc"];
         }
 
+        // Shot-length filter. Each image sits inside one cut; its true cut
+        // length is derived from the scene-boundary cut_times array (the QC clip
+        // itself is padded, so its start/end can't be used). The lateral finds
+        // the cut boundaries surrounding the image's frame time and returns the
+        // cut's duration. Depends on the sb alias being in scope.
+        private const double CutLengthMax = 9.0;
+
+        private const string CutLengthLateralSql = @"
+LEFT JOIN LATERAL (
+    SELECT
+        COALESCE((SELECT MIN(e.v::double precision)
+                  FROM jsonb_array_elements_text(sb.cut_times::jsonb) e(v)
+                  WHERE e.v::double precision > (sb.target_frame::double precision / NULLIF(sb.fps, 0))),
+                 sb.duration)
+      - COALESCE((SELECT MAX(e.v::double precision)
+                  FROM jsonb_array_elements_text(sb.cut_times::jsonb) e(v)
+                  WHERE e.v::double precision <= (sb.target_frame::double precision / NULLIF(sb.fps, 0))),
+                 0.0) AS cut_length
+) cl ON TRUE";
+
+        private static bool CutLengthActive(double? minLen, double? maxLen)
+            => (minLen.HasValue && minLen.Value > 0)
+               || (maxLen.HasValue && maxLen.Value < CutLengthMax);
+
+        private static List<string> CutLengthWhere(double? minLen, double? maxLen)
+        {
+            var clauses = new List<string>();
+            if (minLen.HasValue && minLen.Value > 0) clauses.Add("cl.cut_length >= @minLen");
+            if (maxLen.HasValue && maxLen.Value < CutLengthMax) clauses.Add("cl.cut_length <= @maxLen");
+            return clauses;
+        }
+
+        private static void AddCutLengthParams(NpgsqlCommand cmd, double? minLen, double? maxLen)
+        {
+            if (minLen.HasValue && minLen.Value > 0) cmd.Parameters.AddWithValue("@minLen", minLen.Value);
+            if (maxLen.HasValue && maxLen.Value < CutLengthMax) cmd.Parameters.AddWithValue("@maxLen", maxLen.Value);
+        }
+
         private static bool _timestampColumnsReady;
 
         // Ensure created_at/updated_at exist on the join table so the sort
@@ -1905,6 +1990,11 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public List<TagSummary> Tags { get; set; } = new();
         }
 
+        public sealed class AnalyzedCountResponse
+        {
+            public int AnalyzedImages { get; set; }
+        }
+
         private sealed class TagClipRow
         {
             public int ImageId { get; set; }
@@ -2020,6 +2110,8 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public int Page { get; set; } = 1;
             public int PageSize { get; set; } = 50;
             public string? Sort { get; set; }
+            public double? MinLen { get; set; }
+            public double? MaxLen { get; set; }
         }
 
         // VideoMAE API response DTOs
