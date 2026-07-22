@@ -750,13 +750,18 @@ LIMIT @limit;";
         [ProducesResponseType(typeof(TagSummaryResponse), StatusCodes.Status200OK)]
         public async Task<ActionResult<TagSummaryResponse>> GetTags(
             [FromQuery] string? owner = null,
+            [FromQuery] int? movieId = null,
             CancellationToken ct = default)
         {
             await EnsureOpenAsync(ct);
             await EnsureUsersTablesAsync(ct);
 
             var ownerActive = OwnerActive(owner);
-            var ownerFilter = ownerActive ? $"WHERE {OwnerWhereSql}" : "";
+            var movieActive = MovieActive(movieId);
+            var filters = new List<string>();
+            if (ownerActive) filters.Add(OwnerWhereSql);
+            if (movieActive) filters.Add(MovieWhereSql);
+            var ownerFilter = filters.Count > 0 ? "WHERE " + string.Join(" AND ", filters) : "";
 
             var sql = $@"
 SELECT cm.movement,
@@ -772,6 +777,7 @@ ORDER BY total DESC;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             if (ownerActive) cmd.Parameters.AddWithValue("@owner", owner!.Trim());
+            if (movieActive) cmd.Parameters.AddWithValue("@movieId", movieId!.Value);
             await using var reader = await cmd.ExecuteReaderAsync(ct);
 
             var tags = new List<TagSummary>();
@@ -807,6 +813,45 @@ FROM frl.frl_join_image_camera_movements;";
             var count = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
 
             return Ok(new AnalyzedCountResponse { AnalyzedImages = count });
+        }
+
+        // ── GET /api/admin/camera-movements/movies ─────────────────────
+        // Distinct movies that have at least one analyzed image, for the
+        // movie-title search/filter. Optional owner narrows to that reviewer.
+        [HttpGet("movies")]
+        [ProducesResponseType(typeof(List<QcMovie>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<List<QcMovie>>> GetAnalyzedMovies(
+            [FromQuery] string? owner = null,
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+
+            var ownerActive = OwnerActive(owner);
+            var ownerFilter = ownerActive ? $" AND {OwnerWhereSql}" : "";
+
+            var sql = $@"
+SELECT DISTINCT i.movieid, COALESCE(m.title, '') AS title, m.year AS year
+FROM frl.frl_join_image_camera_movements cm
+INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
+LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
+WHERE TRUE{ownerFilter}
+ORDER BY title;";
+
+            var movies = new List<QcMovie>();
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            if (ownerActive) cmd.Parameters.AddWithValue("@owner", owner!.Trim());
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                movies.Add(new QcMovie
+                {
+                    MovieId = reader.GetInt32(0),
+                    Title = reader.IsDBNull(1) ? "" : reader.GetString(1),
+                    Year = reader.IsDBNull(2) ? null : reader.GetInt32(2)
+                });
+            }
+            return Ok(movies);
         }
 
         // ── GET /api/admin/camera-movements/users ──────────────────────
@@ -1075,6 +1120,7 @@ WHERE id = @id;";
             [FromQuery] double? minLen = null,
             [FromQuery] double? maxLen = null,
             [FromQuery] string? owner = null,
+            [FromQuery] int? movieId = null,
             CancellationToken ct = default)
         {
             if (page < 1) page = 1;
@@ -1088,6 +1134,7 @@ WHERE id = @id;";
             var orderBy = ResolveClipSort(sort);
             var cutActive = CutLengthActive(minLen, maxLen);
             var ownerActive = OwnerActive(owner);
+            var movieActive = MovieActive(movieId);
 
             var whereClauses = new List<string> { "cm.movement = @movement" };
             if (!string.IsNullOrWhiteSpace(status))
@@ -1096,6 +1143,8 @@ WHERE id = @id;";
                 whereClauses.AddRange(CutLengthWhere(minLen, maxLen));
             if (ownerActive)
                 whereClauses.Add(OwnerWhereSql);
+            if (movieActive)
+                whereClauses.Add(MovieWhereSql);
 
             var whereStr = string.Join(" AND ", whereClauses);
             var offset = (page - 1) * pageSize;
@@ -1118,6 +1167,7 @@ WHERE {whereStr};";
                 countCmd.Parameters.AddWithValue("@status", status);
             AddCutLengthParams(countCmd, minLen, maxLen);
             if (ownerActive) countCmd.Parameters.AddWithValue("@owner", owner!.Trim());
+            if (movieActive) countCmd.Parameters.AddWithValue("@movieId", movieId!.Value);
 
             var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
 
@@ -1150,6 +1200,7 @@ LIMIT @limit OFFSET @offset;";
                 cmd.Parameters.AddWithValue("@status", status);
             AddCutLengthParams(cmd, minLen, maxLen);
             if (ownerActive) cmd.Parameters.AddWithValue("@owner", owner!.Trim());
+            if (movieActive) cmd.Parameters.AddWithValue("@movieId", movieId!.Value);
             cmd.Parameters.AddWithValue("@limit", pageSize);
             cmd.Parameters.AddWithValue("@offset", offset);
 
@@ -1311,6 +1362,8 @@ WHERE imageid IN ({idParams});";
                 : "";
             var ownerActive = OwnerActive(request.Owner);
             var ownerWhere = ownerActive ? " AND " + OwnerWhereSql : "";
+            var movieActive = MovieActive(request.MovieId);
+            var movieWhere = movieActive ? " AND " + MovieWhereSql : "";
 
             // Build parameterised include list
             var includeParams = new List<string>();
@@ -1357,7 +1410,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
 SELECT COUNT(*)
 FROM frl.frl_join_image_camera_movements cm{countJoins}
 WHERE cm.movement = @firstMovement
-  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere}{ownerWhere};";
+  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere}{ownerWhere}{movieWhere};";
 
             await using var countCmd = new NpgsqlCommand(countSql, _connection);
             countCmd.Parameters.AddWithValue("@firstMovement", include[0]);
@@ -1370,6 +1423,7 @@ WHERE cm.movement = @firstMovement
                 countCmd.Parameters.AddWithValue("@status", request.Status);
             AddCutLengthParams(countCmd, request.MinLen, request.MaxLen);
             if (ownerActive) countCmd.Parameters.AddWithValue("@owner", request.Owner!.Trim());
+            if (movieActive) countCmd.Parameters.AddWithValue("@movieId", request.MovieId!.Value);
 
             var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
 
@@ -1394,7 +1448,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid{dataLateral}
 LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
 WHERE cm.movement = @firstMovement
-  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere}{ownerWhere}
+  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere}{ownerWhere}{movieWhere}
 ORDER BY {orderBy}
 LIMIT @limit OFFSET @offset;";
 
@@ -1409,6 +1463,7 @@ LIMIT @limit OFFSET @offset;";
                 cmd.Parameters.AddWithValue("@status", request.Status);
             AddCutLengthParams(cmd, request.MinLen, request.MaxLen);
             if (ownerActive) cmd.Parameters.AddWithValue("@owner", request.Owner!.Trim());
+            if (movieActive) cmd.Parameters.AddWithValue("@movieId", request.MovieId!.Value);
             cmd.Parameters.AddWithValue("@limit", pageSize);
             cmd.Parameters.AddWithValue("@offset", offset);
 
@@ -2249,6 +2304,13 @@ LEFT JOIN LATERAL (
         private static bool OwnerActive(string? owner)
             => !string.IsNullOrWhiteSpace(owner) && !owner.Trim().Equals("all", StringComparison.OrdinalIgnoreCase);
 
+        // Movie filter: restrict to images belonging to one movie. Uses an
+        // EXISTS on frl_images so it works whether or not i is already joined.
+        private const string MovieWhereSql =
+            "EXISTS (SELECT 1 FROM frl.frl_images im WHERE im.idnum = cm.imageid AND im.movieid = @movieId)";
+
+        private static bool MovieActive(int? movieId) => movieId.HasValue && movieId.Value > 0;
+
         private static bool _timestampColumnsReady;
 
         // Ensure created_at/updated_at exist on the join table so the sort
@@ -2573,6 +2635,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public double? MinLen { get; set; }
             public double? MaxLen { get; set; }
             public string? Owner { get; set; }
+            public int? MovieId { get; set; }
         }
 
         public sealed class QcUser
@@ -2581,6 +2644,13 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string Name { get; set; } = "";
             public bool IsAdmin { get; set; }
             public bool HasPassword { get; set; }
+        }
+
+        public sealed class QcMovie
+        {
+            public int MovieId { get; set; }
+            public string Title { get; set; } = "";
+            public int? Year { get; set; }
         }
 
         public sealed class QcUserStats
