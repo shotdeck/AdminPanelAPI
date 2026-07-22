@@ -831,7 +831,7 @@ FROM frl.frl_join_image_camera_movements;";
             var ownerFilter = ownerActive ? $" AND {OwnerWhereSql}" : "";
 
             var sql = $@"
-SELECT DISTINCT i.movieid, COALESCE(m.title, '') AS title
+SELECT DISTINCT i.movieid, COALESCE(m.title, '') AS title, m.year AS year
 FROM frl.frl_join_image_camera_movements cm
 INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
 LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
@@ -847,7 +847,8 @@ ORDER BY title;";
                 movies.Add(new QcMovie
                 {
                     MovieId = reader.GetInt32(0),
-                    Title = reader.IsDBNull(1) ? "" : reader.GetString(1)
+                    Title = reader.IsDBNull(1) ? "" : reader.GetString(1),
+                    Year = reader.IsDBNull(2) ? null : reader.GetInt32(2)
                 });
             }
             return Ok(movies);
@@ -2649,6 +2650,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
         {
             public int MovieId { get; set; }
             public string Title { get; set; } = "";
+            public int? Year { get; set; }
         }
 
         public sealed class QcUserStats
