@@ -954,6 +954,12 @@ ORDER BY is_admin DESC, lower(name);";
             var addedRange = DateRangeSql("cm.created_at", fromDt, toExclusive);
             var doneRange = DateRangeSql("cm.updated_at", fromDt, toExclusive);
 
+            // "Completed" = images whose tags are all actioned; the range is
+            // applied to when the image was last actioned (MAX updated_at).
+            var completedHaving = new System.Text.StringBuilder();
+            if (fromDt.HasValue) completedHaving.Append(" AND MAX(cm.updated_at) >= @from");
+            if (toExclusive.HasValue) completedHaving.Append(" AND MAX(cm.updated_at) < @to");
+
             var sql = $@"
 SELECT u.name,
   (SELECT COUNT(*) FROM frl.frl_camera_movement_image_owner o
@@ -961,9 +967,26 @@ SELECT u.name,
   (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name){addedRange}) AS tags_added,
+<<<<<<< Updated upstream
+  (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
+||||||| constructed merge base
+  (SELECT COUNT(DISTINCT cm.imageid) FROM frl.frl_join_image_camera_movements cm
+=======
+  (SELECT COUNT(*) FROM (
+     SELECT cm.imageid
+     FROM frl.frl_join_image_camera_movements cm
+     JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
+     WHERE lower(o.owner) = lower(u.name)
+     GROUP BY cm.imageid
+     HAVING COUNT(*) FILTER (WHERE cm.status NOT IN ('ok','bad')) = 0{completedHaving}
+   ) done_imgs) AS completed,
   (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
-     WHERE lower(o.owner) = lower(u.name) AND cm.status = 'ok'{doneRange}) AS completed
+     WHERE lower(o.owner) = lower(u.name) AND cm.status = 'ok'{doneRange}) AS confirmed_tags,
+  (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
+>>>>>>> Stashed changes
+     JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
+     WHERE lower(o.owner) = lower(u.name) AND cm.status IN ('ok','bad'){doneRange}) AS reviewed_tags
 FROM frl.frl_camera_movement_users u
 ORDER BY u.is_admin DESC, lower(u.name);";
 
@@ -979,7 +1002,9 @@ ORDER BY u.is_admin DESC, lower(u.name);";
                     Name = reader.GetString(0),
                     Pulled = Convert.ToInt32(reader.GetInt64(1)),
                     TagsAdded = Convert.ToInt32(reader.GetInt64(2)),
-                    Completed = Convert.ToInt32(reader.GetInt64(3))
+                    Completed = Convert.ToInt32(reader.GetInt64(3)),
+                    ConfirmedTags = Convert.ToInt32(reader.GetInt64(4)),
+                    ReviewedTags = Convert.ToInt32(reader.GetInt64(5))
                 });
             }
             return Ok(stats);
@@ -2701,7 +2726,11 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string Name { get; set; } = "";
             public int Pulled { get; set; }
             public int TagsAdded { get; set; }
+            // Images where every tag is actioned (confirmed or incorrect).
             public int Completed { get; set; }
+            // AI accuracy: confirmed tags out of reviewed (confirmed + incorrect).
+            public int ConfirmedTags { get; set; }
+            public int ReviewedTags { get; set; }
         }
 
         public sealed class UserWriteRequest
