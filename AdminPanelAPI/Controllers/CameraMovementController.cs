@@ -954,11 +954,9 @@ ORDER BY is_admin DESC, lower(name);";
             var addedRange = DateRangeSql("cm.created_at", fromDt, toExclusive);
             var doneRange = DateRangeSql("cm.updated_at", fromDt, toExclusive);
 
-            // "Completed" = images whose tags are all actioned; the range is
-            // applied to when the image was last actioned (MAX updated_at).
-            var completedHaving = new System.Text.StringBuilder();
-            if (fromDt.HasValue) completedHaving.Append(" AND MAX(cm.updated_at) >= @from");
-            if (toExclusive.HasValue) completedHaving.Append(" AND MAX(cm.updated_at) < @to");
+            // "Completed" = images whose tags are all actioned (confirmed or
+            // incorrect); the range is applied to when a tag was last actioned.
+            var completedRange = DateRangeSql("e.updated_at", fromDt, toExclusive);
 
             var sql = $@"
 SELECT u.name,
@@ -967,24 +965,16 @@ SELECT u.name,
   (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name){addedRange}) AS tags_added,
-<<<<<<< Updated upstream
-  (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
-||||||| constructed merge base
-  (SELECT COUNT(DISTINCT cm.imageid) FROM frl.frl_join_image_camera_movements cm
-=======
-  (SELECT COUNT(*) FROM (
-     SELECT cm.imageid
-     FROM frl.frl_join_image_camera_movements cm
-     JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
+  (SELECT COUNT(*) FROM frl.frl_camera_movement_image_owner o
      WHERE lower(o.owner) = lower(u.name)
-     GROUP BY cm.imageid
-     HAVING COUNT(*) FILTER (WHERE cm.status NOT IN ('ok','bad')) = 0{completedHaving}
-   ) done_imgs) AS completed,
+       AND EXISTS (SELECT 1 FROM frl.frl_join_image_camera_movements e
+                   WHERE e.imageid = o.imageid{completedRange})
+       AND NOT EXISTS (SELECT 1 FROM frl.frl_join_image_camera_movements n
+                   WHERE n.imageid = o.imageid AND n.status NOT IN ('ok','bad'))) AS completed,
   (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name) AND cm.status = 'ok'{doneRange}) AS confirmed_tags,
   (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
->>>>>>> Stashed changes
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name) AND cm.status IN ('ok','bad'){doneRange}) AS reviewed_tags
 FROM frl.frl_camera_movement_users u
