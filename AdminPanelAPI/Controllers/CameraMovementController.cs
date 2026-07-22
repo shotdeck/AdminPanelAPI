@@ -138,6 +138,7 @@ ORDER BY media_type::text;";
             [FromQuery] int limit = 100,
             [FromQuery] Guid? jobId = null,
             [FromQuery] string? mediaType = null,
+            [FromQuery] string? owner = null,
             CancellationToken ct = default)
         {
             if (limit < 1) limit = 1;
@@ -148,6 +149,7 @@ ORDER BY media_type::text;";
 
             await EnsureOpenAsync(ct);
             await EnsureJobTablesAsync(ct);
+            await EnsureUsersTablesAsync(ct);
 
             // 1. Atomically claim the next N unanalyzed images so simultaneous
             //    fetches (from other sessions) grab disjoint sets. Claims tie to
@@ -266,6 +268,7 @@ ORDER BY media_type::text;";
                     await InsertMovementAsync(r.ImageId, "hold", 0, ct);
                     await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
                     await MaybeTagNoMovementAsync(r.ImageId, ct);
+                    await AssignImageOwnerAsync(r.ImageId, owner, ct);
                     processed++;
                     continue;
                 }
@@ -278,6 +281,7 @@ ORDER BY media_type::text;";
 
                 await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
                 await MaybeTagNoMovementAsync(r.ImageId, ct);
+                await AssignImageOwnerAsync(r.ImageId, owner, ct);
                 processed++;
             }
 
@@ -633,22 +637,30 @@ LIMIT @limit;";
         // Returns all distinct tags with counts by status.
         [HttpGet("tags")]
         [ProducesResponseType(typeof(TagSummaryResponse), StatusCodes.Status200OK)]
-        public async Task<ActionResult<TagSummaryResponse>> GetTags(CancellationToken ct = default)
+        public async Task<ActionResult<TagSummaryResponse>> GetTags(
+            [FromQuery] string? owner = null,
+            CancellationToken ct = default)
         {
             await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
 
-            const string sql = @"
-SELECT movement,
+            var ownerActive = OwnerActive(owner);
+            var ownerFilter = ownerActive ? $"WHERE {OwnerWhereSql}" : "";
+
+            var sql = $@"
+SELECT cm.movement,
        COUNT(*) AS total,
-       COUNT(*) FILTER (WHERE status = 'ok') AS confirmed,
-       COUNT(*) FILTER (WHERE status = 'bad') AS rejected,
-       COUNT(*) FILTER (WHERE status = 'not_checked') AS remaining,
-       COUNT(*) FILTER (WHERE status = 'flagged') AS flagged
-FROM frl.frl_join_image_camera_movements
-GROUP BY movement
+       COUNT(*) FILTER (WHERE cm.status = 'ok') AS confirmed,
+       COUNT(*) FILTER (WHERE cm.status = 'bad') AS rejected,
+       COUNT(*) FILTER (WHERE cm.status = 'not_checked') AS remaining,
+       COUNT(*) FILTER (WHERE cm.status = 'flagged') AS flagged
+FROM frl.frl_join_image_camera_movements cm
+{ownerFilter}
+GROUP BY cm.movement
 ORDER BY total DESC;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
+            if (ownerActive) cmd.Parameters.AddWithValue("@owner", owner!.Trim());
             await using var reader = await cmd.ExecuteReaderAsync(ct);
 
             var tags = new List<TagSummary>();
@@ -686,6 +698,134 @@ FROM frl.frl_join_image_camera_movements;";
             return Ok(new AnalyzedCountResponse { AnalyzedImages = count });
         }
 
+        // ── GET /api/admin/camera-movements/users ──────────────────────
+        // The reviewer roster picked from at login.
+        [HttpGet("users")]
+        [ProducesResponseType(typeof(List<QcUser>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<List<QcUser>>> GetUsers(CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+
+            const string sql = @"
+SELECT id, name, is_admin
+FROM frl.frl_camera_movement_users
+ORDER BY is_admin DESC, lower(name);";
+
+            var users = new List<QcUser>();
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                users.Add(new QcUser
+                {
+                    Id = reader.GetInt32(0),
+                    Name = reader.GetString(1),
+                    IsAdmin = reader.GetBoolean(2)
+                });
+            }
+            return Ok(users);
+        }
+
+        // ── POST /api/admin/camera-movements/users ─────────────────────
+        // Add a reviewer. Admin-only (actingUser must be an admin).
+        [HttpPost("users")]
+        [ProducesResponseType(typeof(QcUser), StatusCodes.Status200OK)]
+        public async Task<ActionResult<QcUser>> AddUser([FromBody] UserWriteRequest request, CancellationToken ct = default)
+        {
+            var name = (request.Name ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(name))
+                return BadRequest(new { error = "Name is required." });
+
+            await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            if (!await IsAdminAsync(request.ActingUser, ct))
+                return StatusCode(403, new { error = "Only an admin can manage users." });
+
+            const string sql = @"
+INSERT INTO frl.frl_camera_movement_users (name, is_admin)
+VALUES (@name, @isAdmin)
+ON CONFLICT (name) DO NOTHING
+RETURNING id, name, is_admin;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@name", name);
+            cmd.Parameters.AddWithValue("@isAdmin", request.IsAdmin);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct))
+                return Conflict(new { error = "A user with that name already exists." });
+
+            return Ok(new QcUser
+            {
+                Id = reader.GetInt32(0),
+                Name = reader.GetString(1),
+                IsAdmin = reader.GetBoolean(2)
+            });
+        }
+
+        // ── PUT /api/admin/camera-movements/users/{id} ─────────────────
+        // Rename / change admin flag for a reviewer. Admin-only.
+        [HttpPut("users/{id:int}")]
+        public async Task<IActionResult> UpdateUser(int id, [FromBody] UserWriteRequest request, CancellationToken ct = default)
+        {
+            var name = (request.Name ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(name))
+                return BadRequest(new { error = "Name is required." });
+
+            await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            if (!await IsAdminAsync(request.ActingUser, ct))
+                return StatusCode(403, new { error = "Only an admin can manage users." });
+
+            // Re-point owned images if the name changes, so their work follows.
+            const string sql = @"
+UPDATE frl.frl_camera_movement_image_owner o
+SET owner = @name
+FROM frl.frl_camera_movement_users u
+WHERE u.id = @id AND o.owner = u.name AND u.name <> @name;
+
+UPDATE frl.frl_camera_movement_users
+SET name = @name, is_admin = @isAdmin
+WHERE id = @id;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@id", id);
+            cmd.Parameters.AddWithValue("@name", name);
+            cmd.Parameters.AddWithValue("@isAdmin", request.IsAdmin);
+            var affected = await cmd.ExecuteNonQueryAsync(ct);
+            if (affected == 0) return NotFound(new { error = "User not found." });
+            return NoContent();
+        }
+
+        // ── DELETE /api/admin/camera-movements/users/{id} ──────────────
+        // Remove a reviewer. Admin-only. Their owned images are left assigned
+        // to the (now-removed) name so history isn't lost; they simply won't
+        // appear in the roster.
+        [HttpDelete("users/{id:int}")]
+        public async Task<IActionResult> DeleteUser(int id, [FromQuery] string? actingUser = null, CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            if (!await IsAdminAsync(actingUser, ct))
+                return StatusCode(403, new { error = "Only an admin can manage users." });
+
+            const string sql = "DELETE FROM frl.frl_camera_movement_users WHERE id = @id AND is_admin = false;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@id", id);
+            var affected = await cmd.ExecuteNonQueryAsync(ct);
+            if (affected == 0)
+                return BadRequest(new { error = "User not found, or admins cannot be removed." });
+            return NoContent();
+        }
+
+        private async Task<bool> IsAdminAsync(string? name, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return false;
+            const string sql = "SELECT is_admin FROM frl.frl_camera_movement_users WHERE lower(name) = lower(@name) LIMIT 1;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@name", name.Trim());
+            var result = await cmd.ExecuteScalarAsync(ct);
+            return result is bool b && b;
+        }
+
         // ── GET /api/admin/camera-movements/tags/{movement}/clips ──────
         // Returns clips tagged with a specific movement, with R2 URLs.
         [HttpGet("tags/{movement}/clips")]
@@ -698,6 +838,7 @@ FROM frl.frl_join_image_camera_movements;";
             [FromQuery] string? sort = null,
             [FromQuery] double? minLen = null,
             [FromQuery] double? maxLen = null,
+            [FromQuery] string? owner = null,
             CancellationToken ct = default)
         {
             if (page < 1) page = 1;
@@ -706,15 +847,19 @@ FROM frl.frl_join_image_camera_movements;";
 
             await EnsureOpenAsync(ct);
             await EnsureTimestampColumnsAsync(ct);
+            await EnsureUsersTablesAsync(ct);
 
             var orderBy = ResolveClipSort(sort);
             var cutActive = CutLengthActive(minLen, maxLen);
+            var ownerActive = OwnerActive(owner);
 
             var whereClauses = new List<string> { "cm.movement = @movement" };
             if (!string.IsNullOrWhiteSpace(status))
                 whereClauses.Add("cm.status = @status");
             if (cutActive)
                 whereClauses.AddRange(CutLengthWhere(minLen, maxLen));
+            if (ownerActive)
+                whereClauses.Add(OwnerWhereSql);
 
             var whereStr = string.Join(" AND ", whereClauses);
             var offset = (page - 1) * pageSize;
@@ -736,6 +881,7 @@ WHERE {whereStr};";
             if (!string.IsNullOrWhiteSpace(status))
                 countCmd.Parameters.AddWithValue("@status", status);
             AddCutLengthParams(countCmd, minLen, maxLen);
+            if (ownerActive) countCmd.Parameters.AddWithValue("@owner", owner!.Trim());
 
             var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
 
@@ -767,6 +913,7 @@ LIMIT @limit OFFSET @offset;";
             if (!string.IsNullOrWhiteSpace(status))
                 cmd.Parameters.AddWithValue("@status", status);
             AddCutLengthParams(cmd, minLen, maxLen);
+            if (ownerActive) cmd.Parameters.AddWithValue("@owner", owner!.Trim());
             cmd.Parameters.AddWithValue("@limit", pageSize);
             cmd.Parameters.AddWithValue("@offset", offset);
 
@@ -919,12 +1066,15 @@ WHERE imageid IN ({idParams});";
 
             await EnsureOpenAsync(ct);
             await EnsureTimestampColumnsAsync(ct);
+            await EnsureUsersTablesAsync(ct);
 
             var orderBy = ResolveClipSort(request.Sort);
             var cutActive = CutLengthActive(request.MinLen, request.MaxLen);
             var cutWhere = cutActive
                 ? " AND " + string.Join(" AND ", CutLengthWhere(request.MinLen, request.MaxLen))
                 : "";
+            var ownerActive = OwnerActive(request.Owner);
+            var ownerWhere = ownerActive ? " AND " + OwnerWhereSql : "";
 
             // Build parameterised include list
             var includeParams = new List<string>();
@@ -971,7 +1121,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
 SELECT COUNT(*)
 FROM frl.frl_join_image_camera_movements cm{countJoins}
 WHERE cm.movement = @firstMovement
-  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere};";
+  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere}{ownerWhere};";
 
             await using var countCmd = new NpgsqlCommand(countSql, _connection);
             countCmd.Parameters.AddWithValue("@firstMovement", include[0]);
@@ -983,6 +1133,7 @@ WHERE cm.movement = @firstMovement
             if (!string.IsNullOrWhiteSpace(request.Status))
                 countCmd.Parameters.AddWithValue("@status", request.Status);
             AddCutLengthParams(countCmd, request.MinLen, request.MaxLen);
+            if (ownerActive) countCmd.Parameters.AddWithValue("@owner", request.Owner!.Trim());
 
             var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
 
@@ -1007,7 +1158,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid{dataLateral}
 LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
 WHERE cm.movement = @firstMovement
-  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere}
+  AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere}{ownerWhere}
 ORDER BY {orderBy}
 LIMIT @limit OFFSET @offset;";
 
@@ -1021,6 +1172,7 @@ LIMIT @limit OFFSET @offset;";
             if (!string.IsNullOrWhiteSpace(request.Status))
                 cmd.Parameters.AddWithValue("@status", request.Status);
             AddCutLengthParams(cmd, request.MinLen, request.MaxLen);
+            if (ownerActive) cmd.Parameters.AddWithValue("@owner", request.Owner!.Trim());
             cmd.Parameters.AddWithValue("@limit", pageSize);
             cmd.Parameters.AddWithValue("@offset", offset);
 
@@ -1525,6 +1677,54 @@ CREATE INDEX IF NOT EXISTS idx_cmc_claimed_at ON frl.frl_camera_movement_claims 
             await cmd.ExecuteNonQueryAsync(ct);
         }
 
+        // Multi-user QC: the reviewer roster + per-image ownership. Seeds the
+        // initial team and backfills existing images to MacK once.
+        private async Task EnsureUsersTablesAsync(CancellationToken ct)
+        {
+            const string sql = @"
+CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_users (
+    id          SERIAL       PRIMARY KEY,
+    name        VARCHAR(120) NOT NULL UNIQUE,
+    is_admin    BOOLEAN      NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_image_owner (
+    imageid      INTEGER      PRIMARY KEY,
+    owner        VARCHAR(120) NOT NULL,
+    assigned_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cmio_owner ON frl.frl_camera_movement_image_owner (owner);
+
+INSERT INTO frl.frl_camera_movement_users (name, is_admin)
+SELECT v.name, v.is_admin
+FROM (VALUES ('MacK', true), ('Sam', false), ('Ethan', false), ('Ajai', false), ('Noah', false))
+     AS v(name, is_admin)
+WHERE NOT EXISTS (SELECT 1 FROM frl.frl_camera_movement_users);
+
+INSERT INTO frl.frl_camera_movement_image_owner (imageid, owner)
+SELECT DISTINCT cm.imageid, 'MacK'
+FROM frl.frl_join_image_camera_movements cm
+WHERE NOT EXISTS (SELECT 1 FROM frl.frl_camera_movement_image_owner)
+ON CONFLICT (imageid) DO NOTHING;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        // Stamp an image with the reviewer who fetched it (no-op when no owner
+        // supplied). Ownership is per image and does not change on re-fetch.
+        private async Task AssignImageOwnerAsync(int imageId, string? owner, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(owner)) return;
+            const string sql = @"
+INSERT INTO frl.frl_camera_movement_image_owner (imageid, owner)
+VALUES (@imageid, @owner)
+ON CONFLICT (imageid) DO UPDATE SET owner = EXCLUDED.owner, assigned_at = now();";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@imageid", imageId);
+            cmd.Parameters.AddWithValue("@owner", owner.Trim());
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
         // Atomically select and claim the next N unanalyzed images. FOR UPDATE
         // SKIP LOCKED plus a claims table means two concurrent fetches never
         // grab the same images.
@@ -1802,6 +2002,14 @@ LEFT JOIN LATERAL (
             if (minLen.HasValue && minLen.Value > 0) cmd.Parameters.AddWithValue("@minLen", minLen.Value);
             if (maxLen.HasValue && maxLen.Value < CutLengthMax) cmd.Parameters.AddWithValue("@maxLen", maxLen.Value);
         }
+
+        // Owner filter: null/empty or "all" means no restriction. Otherwise limit
+        // to images owned by that reviewer via the image-owner table.
+        private const string OwnerWhereSql =
+            "EXISTS (SELECT 1 FROM frl.frl_camera_movement_image_owner o WHERE o.imageid = cm.imageid AND lower(o.owner) = lower(@owner))";
+
+        private static bool OwnerActive(string? owner)
+            => !string.IsNullOrWhiteSpace(owner) && !owner.Trim().Equals("all", StringComparison.OrdinalIgnoreCase);
 
         private static bool _timestampColumnsReady;
 
@@ -2112,6 +2320,21 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string? Sort { get; set; }
             public double? MinLen { get; set; }
             public double? MaxLen { get; set; }
+            public string? Owner { get; set; }
+        }
+
+        public sealed class QcUser
+        {
+            public int Id { get; set; }
+            public string Name { get; set; } = "";
+            public bool IsAdmin { get; set; }
+        }
+
+        public sealed class UserWriteRequest
+        {
+            public string? Name { get; set; }
+            public bool IsAdmin { get; set; }
+            public string? ActingUser { get; set; }
         }
 
         // VideoMAE API response DTOs
