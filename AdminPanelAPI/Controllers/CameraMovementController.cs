@@ -327,6 +327,117 @@ ORDER BY media_type::text;";
             return Ok(new VerifyPasswordResponse { Ok = true });
         }
 
+        // ── POST /api/admin/camera-movements/login ─────────────────────
+        // Per-reviewer login: pick a name + enter that reviewer's password.
+        // Admins authenticate against the CAMERAMOVEMENTPASSWORD app setting
+        // (changeable in Azure); everyone else against their PBKDF2 hash that
+        // an admin set. Never stores or returns the plaintext password.
+        [HttpPost("login")]
+        [ProducesResponseType(typeof(LoginResponse), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+        public async Task<ActionResult<LoginResponse>> Login([FromBody] LoginRequest req, CancellationToken ct = default)
+        {
+            var name = (req?.Name ?? "").Trim();
+            var password = req?.Password ?? "";
+            if (string.IsNullOrWhiteSpace(name))
+                return Unauthorized(new LoginResponse { Ok = false, Error = "Select your name." });
+
+            await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+
+            const string sql =
+                "SELECT name, is_admin, password_hash " +
+                "FROM frl.frl_camera_movement_users " +
+                "WHERE lower(name) = lower(@name) LIMIT 1;";
+
+            string? canonicalName = null;
+            var isAdmin = false;
+            string? hash = null;
+            var found = false;
+
+            await using (var cmd = new NpgsqlCommand(sql, _connection))
+            {
+                cmd.Parameters.AddWithValue("@name", name);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                {
+                    found = true;
+                    canonicalName = reader.GetString(0);
+                    isAdmin = reader.GetBoolean(1);
+                    hash = reader.IsDBNull(2) ? null : reader.GetString(2);
+                }
+            }
+
+            if (!found)
+                return Unauthorized(new LoginResponse { Ok = false, Error = "Unknown reviewer." });
+
+            bool ok;
+            if (isAdmin)
+            {
+                var expected = _configuration["CAMERAMOVEMENTPASSWORD"];
+                if (string.IsNullOrEmpty(expected))
+                    return StatusCode(StatusCodes.Status503ServiceUnavailable,
+                        new LoginResponse { Ok = false, Error = "Admin password not configured." });
+                ok = CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(password),
+                    Encoding.UTF8.GetBytes(expected));
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(hash))
+                    return Unauthorized(new LoginResponse
+                    {
+                        Ok = false,
+                        Error = "No password set yet. Ask MacK to set your password."
+                    });
+                ok = VerifyHashedPassword(password, hash);
+            }
+
+            if (!ok)
+                return Unauthorized(new LoginResponse { Ok = false, Error = "Incorrect password." });
+
+            return Ok(new LoginResponse { Ok = true, Name = canonicalName, IsAdmin = isAdmin });
+        }
+
+        // PBKDF2 (SHA-256) password hashing. Format:
+        //   pbkdf2$<iterations>$<saltB64>$<hashB64>
+        private const int Pbkdf2Iterations = 100_000;
+        private const int Pbkdf2SaltBytes = 16;
+        private const int Pbkdf2HashBytes = 32;
+
+        private static string HashPassword(string password)
+        {
+            var salt = RandomNumberGenerator.GetBytes(Pbkdf2SaltBytes);
+            var hash = Rfc2898DeriveBytes.Pbkdf2(
+                Encoding.UTF8.GetBytes(password), salt,
+                Pbkdf2Iterations, HashAlgorithmName.SHA256, Pbkdf2HashBytes);
+            return $"pbkdf2${Pbkdf2Iterations}${Convert.ToBase64String(salt)}${Convert.ToBase64String(hash)}";
+        }
+
+        private static bool VerifyHashedPassword(string password, string? stored)
+        {
+            if (string.IsNullOrEmpty(stored)) return false;
+            var parts = stored.Split('$');
+            if (parts.Length != 4 || parts[0] != "pbkdf2") return false;
+            if (!int.TryParse(parts[1], out var iterations) || iterations < 1) return false;
+
+            byte[] salt, expected;
+            try
+            {
+                salt = Convert.FromBase64String(parts[2]);
+                expected = Convert.FromBase64String(parts[3]);
+            }
+            catch (FormatException)
+            {
+                return false;
+            }
+
+            var actual = Rfc2898DeriveBytes.Pbkdf2(
+                Encoding.UTF8.GetBytes(password), salt,
+                iterations, HashAlgorithmName.SHA256, expected.Length);
+            return CryptographicOperations.FixedTimeEquals(actual, expected);
+        }
+
         // ── POST /api/admin/camera-movements/analyze/jobs/start ────────
         // Register a fetch run so every session can see it's in progress.
         [HttpPost("analyze/jobs/start")]
@@ -708,7 +819,7 @@ FROM frl.frl_join_image_camera_movements;";
             await EnsureUsersTablesAsync(ct);
 
             const string sql = @"
-SELECT id, name, is_admin
+SELECT id, name, is_admin, (password_hash IS NOT NULL) AS has_password
 FROM frl.frl_camera_movement_users
 ORDER BY is_admin DESC, lower(name);";
 
@@ -721,7 +832,8 @@ ORDER BY is_admin DESC, lower(name);";
                 {
                     Id = reader.GetInt32(0),
                     Name = reader.GetString(1),
-                    IsAdmin = reader.GetBoolean(2)
+                    IsAdmin = reader.GetBoolean(2),
+                    HasPassword = reader.GetBoolean(3)
                 });
             }
             return Ok(users);
@@ -809,13 +921,17 @@ ORDER BY u.is_admin DESC, lower(u.name);";
                 return StatusCode(403, new { error = "Only an admin can manage users." });
 
             const string sql = @"
-INSERT INTO frl.frl_camera_movement_users (name, is_admin)
-VALUES (@name, @isAdmin)
+INSERT INTO frl.frl_camera_movement_users (name, is_admin, password_hash)
+VALUES (@name, @isAdmin, @passwordHash)
 ON CONFLICT (name) DO NOTHING
 RETURNING id, name, is_admin;";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@name", name);
             cmd.Parameters.AddWithValue("@isAdmin", request.IsAdmin);
+            cmd.Parameters.AddWithValue("@passwordHash",
+                string.IsNullOrWhiteSpace(request.Password)
+                    ? (object)DBNull.Value
+                    : HashPassword(request.Password));
             await using var reader = await cmd.ExecuteReaderAsync(ct);
             if (!await reader.ReadAsync(ct))
                 return Conflict(new { error = "A user with that name already exists." });
@@ -842,20 +958,27 @@ RETURNING id, name, is_admin;";
             if (!await IsAdminAsync(request.ActingUser, ct))
                 return StatusCode(403, new { error = "Only an admin can manage users." });
 
+            // Update the password only when a new one is supplied; a blank
+            // password leaves the existing hash untouched.
+            var setPassword = !string.IsNullOrWhiteSpace(request.Password);
+            var passwordClause = setPassword ? ", password_hash = @passwordHash" : "";
+
             // Re-point owned images if the name changes, so their work follows.
-            const string sql = @"
+            var sql = $@"
 UPDATE frl.frl_camera_movement_image_owner o
 SET owner = @name
 FROM frl.frl_camera_movement_users u
 WHERE u.id = @id AND o.owner = u.name AND u.name <> @name;
 
 UPDATE frl.frl_camera_movement_users
-SET name = @name, is_admin = @isAdmin
+SET name = @name, is_admin = @isAdmin{passwordClause}
 WHERE id = @id;";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@id", id);
             cmd.Parameters.AddWithValue("@name", name);
             cmd.Parameters.AddWithValue("@isAdmin", request.IsAdmin);
+            if (setPassword)
+                cmd.Parameters.AddWithValue("@passwordHash", HashPassword(request.Password!));
             var affected = await cmd.ExecuteNonQueryAsync(ct);
             if (affected == 0) return NotFound(new { error = "User not found." });
             return NoContent();
@@ -1801,6 +1924,8 @@ CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_users (
     is_admin    BOOLEAN      NOT NULL DEFAULT false,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+ALTER TABLE frl.frl_camera_movement_users
+    ADD COLUMN IF NOT EXISTS password_hash TEXT;
 CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_image_owner (
     imageid      INTEGER      PRIMARY KEY,
     owner        VARCHAR(120) NOT NULL,
@@ -2262,6 +2387,20 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string? Error { get; set; }
         }
 
+        public sealed class LoginRequest
+        {
+            public string? Name { get; set; }
+            public string? Password { get; set; }
+        }
+
+        public sealed class LoginResponse
+        {
+            public bool Ok { get; set; }
+            public string? Name { get; set; }
+            public bool IsAdmin { get; set; }
+            public string? Error { get; set; }
+        }
+
         public sealed class JobStartRequest
         {
             public string? StartedBy { get; set; }
@@ -2441,6 +2580,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public int Id { get; set; }
             public string Name { get; set; } = "";
             public bool IsAdmin { get; set; }
+            public bool HasPassword { get; set; }
         }
 
         public sealed class QcUserStats
@@ -2456,6 +2596,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string? Name { get; set; }
             public bool IsAdmin { get; set; }
             public string? ActingUser { get; set; }
+            public string? Password { get; set; }
         }
 
         // VideoMAE API response DTOs
