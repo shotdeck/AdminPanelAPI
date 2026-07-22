@@ -796,16 +796,53 @@ WHERE id = @id;";
         }
 
         // ── DELETE /api/admin/camera-movements/users/{id} ──────────────
-        // Remove a reviewer. Admin-only. Their owned images are left assigned
-        // to the (now-removed) name so history isn't lost; they simply won't
-        // appear in the roster.
+        // Remove a reviewer. Admin-only. Their owned images are reassigned to
+        // the reviewer named in reassignTo so no work is orphaned.
         [HttpDelete("users/{id:int}")]
-        public async Task<IActionResult> DeleteUser(int id, [FromQuery] string? actingUser = null, CancellationToken ct = default)
+        public async Task<IActionResult> DeleteUser(
+            int id,
+            [FromQuery] string? actingUser = null,
+            [FromQuery] string? reassignTo = null,
+            CancellationToken ct = default)
         {
             await EnsureOpenAsync(ct);
             await EnsureUsersTablesAsync(ct);
             if (!await IsAdminAsync(actingUser, ct))
                 return StatusCode(403, new { error = "Only an admin can manage users." });
+
+            // Resolve the reviewer being removed (and block admin removal).
+            const string findSql = "SELECT name, is_admin FROM frl.frl_camera_movement_users WHERE id = @id LIMIT 1;";
+            string? removedName = null;
+            var isAdmin = false;
+            await using (var findCmd = new NpgsqlCommand(findSql, _connection))
+            {
+                findCmd.Parameters.AddWithValue("@id", id);
+                await using var reader = await findCmd.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                {
+                    removedName = reader.GetString(0);
+                    isAdmin = reader.GetBoolean(1);
+                }
+            }
+            if (removedName == null)
+                return BadRequest(new { error = "User not found." });
+            if (isAdmin)
+                return BadRequest(new { error = "Admins cannot be removed." });
+
+            // Reassign the removed reviewer's owned images to the chosen target.
+            if (!string.IsNullOrWhiteSpace(reassignTo))
+            {
+                if (!await UserExistsAsync(reassignTo, ct))
+                    return BadRequest(new { error = "Reassign target is not a valid reviewer." });
+
+                const string moveSql =
+                    "UPDATE frl.frl_camera_movement_image_owner " +
+                    "SET owner = @to, assigned_at = now() WHERE lower(owner) = lower(@from);";
+                await using var moveCmd = new NpgsqlCommand(moveSql, _connection);
+                moveCmd.Parameters.AddWithValue("@to", reassignTo.Trim());
+                moveCmd.Parameters.AddWithValue("@from", removedName);
+                await moveCmd.ExecuteNonQueryAsync(ct);
+            }
 
             const string sql = "DELETE FROM frl.frl_camera_movement_users WHERE id = @id AND is_admin = false;";
             await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -814,6 +851,16 @@ WHERE id = @id;";
             if (affected == 0)
                 return BadRequest(new { error = "User not found, or admins cannot be removed." });
             return NoContent();
+        }
+
+        private async Task<bool> UserExistsAsync(string? name, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return false;
+            const string sql = "SELECT 1 FROM frl.frl_camera_movement_users WHERE lower(name) = lower(@name) LIMIT 1;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@name", name.Trim());
+            var result = await cmd.ExecuteScalarAsync(ct);
+            return result != null;
         }
 
         private async Task<bool> IsAdminAsync(string? name, CancellationToken ct)
