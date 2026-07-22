@@ -551,6 +551,49 @@ ORDER BY started_at;";
             return Ok(new ActiveJobsResponse { Jobs = jobs });
         }
 
+        // History of fetch runs (any status), newest first. Powers the
+        // notifications panel so an admin can see who pulled how many, when.
+        [HttpGet("analyze/jobs/history")]
+        [ProducesResponseType(typeof(ActiveJobsResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ActiveJobsResponse>> JobHistory(
+            [FromQuery] int limit = 50,
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureJobTablesAsync(ct);
+
+            if (limit < 1) limit = 1;
+            if (limit > 200) limit = 200;
+
+            const string sql = @"
+SELECT job_id, started_by, requested, processed, failed, status, started_at, updated_at
+FROM frl.frl_camera_movement_jobs
+ORDER BY started_at DESC
+LIMIT @limit;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@limit", limit);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var jobs = new List<ActiveJob>();
+            while (await reader.ReadAsync(ct))
+            {
+                jobs.Add(new ActiveJob
+                {
+                    JobId = reader.GetGuid(0),
+                    StartedBy = reader.IsDBNull(1) ? "Anonymous" : reader.GetString(1),
+                    Requested = reader.GetInt32(2),
+                    Processed = reader.GetInt32(3),
+                    Failed = reader.GetInt32(4),
+                    Status = reader.GetString(5),
+                    StartedAt = reader.GetDateTime(6),
+                    UpdatedAt = reader.GetDateTime(7),
+                });
+            }
+
+            return Ok(new ActiveJobsResponse { Jobs = jobs });
+        }
+
         // ── POST /api/admin/camera-movements/analyze-movie ─────────────
         // Batch-analyze images for a specific movie: calls VideoMAE API for each, stores results.
         [HttpPost("analyze-movie")]
