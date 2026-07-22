@@ -637,22 +637,30 @@ LIMIT @limit;";
         // Returns all distinct tags with counts by status.
         [HttpGet("tags")]
         [ProducesResponseType(typeof(TagSummaryResponse), StatusCodes.Status200OK)]
-        public async Task<ActionResult<TagSummaryResponse>> GetTags(CancellationToken ct = default)
+        public async Task<ActionResult<TagSummaryResponse>> GetTags(
+            [FromQuery] string? owner = null,
+            CancellationToken ct = default)
         {
             await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
 
-            const string sql = @"
-SELECT movement,
+            var ownerActive = OwnerActive(owner);
+            var ownerFilter = ownerActive ? $"WHERE {OwnerWhereSql}" : "";
+
+            var sql = $@"
+SELECT cm.movement,
        COUNT(*) AS total,
-       COUNT(*) FILTER (WHERE status = 'ok') AS confirmed,
-       COUNT(*) FILTER (WHERE status = 'bad') AS rejected,
-       COUNT(*) FILTER (WHERE status = 'not_checked') AS remaining,
-       COUNT(*) FILTER (WHERE status = 'flagged') AS flagged
-FROM frl.frl_join_image_camera_movements
-GROUP BY movement
+       COUNT(*) FILTER (WHERE cm.status = 'ok') AS confirmed,
+       COUNT(*) FILTER (WHERE cm.status = 'bad') AS rejected,
+       COUNT(*) FILTER (WHERE cm.status = 'not_checked') AS remaining,
+       COUNT(*) FILTER (WHERE cm.status = 'flagged') AS flagged
+FROM frl.frl_join_image_camera_movements cm
+{ownerFilter}
+GROUP BY cm.movement
 ORDER BY total DESC;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
+            if (ownerActive) cmd.Parameters.AddWithValue("@owner", owner!.Trim());
             await using var reader = await cmd.ExecuteReaderAsync(ct);
 
             var tags = new List<TagSummary>();
