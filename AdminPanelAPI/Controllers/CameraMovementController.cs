@@ -961,7 +961,7 @@ SELECT u.name,
   (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name){addedRange}) AS tags_added,
-  (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
+  (SELECT COUNT(DISTINCT cm.imageid) FROM frl.frl_join_image_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name) AND cm.status = 'ok'{doneRange}) AS completed
 FROM frl.frl_camera_movement_users u
