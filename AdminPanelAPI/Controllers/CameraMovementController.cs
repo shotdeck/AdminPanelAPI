@@ -727,6 +727,72 @@ ORDER BY is_admin DESC, lower(name);";
             return Ok(users);
         }
 
+        // ── GET /api/admin/camera-movements/users/stats ───────────────
+        // Per-reviewer activity for an optional [from, to] date range:
+        //   pulled     = images fetched (owned), assigned in range
+        //   tagsAdded  = movement tags created on their images in range
+        //   completed  = their images confirmed (status = ok) in range
+        // `to` is treated as inclusive (whole day).
+        [HttpGet("users/stats")]
+        [ProducesResponseType(typeof(List<QcUserStats>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<List<QcUserStats>>> GetUserStats(
+            [FromQuery] string? from = null,
+            [FromQuery] string? to = null,
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureTimestampColumnsAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+
+            DateTime? fromDt = null, toExclusive = null;
+            if (!string.IsNullOrWhiteSpace(from) && DateTime.TryParse(from, out var f))
+                fromDt = f.Date;
+            if (!string.IsNullOrWhiteSpace(to) && DateTime.TryParse(to, out var t))
+                toExclusive = t.Date.AddDays(1);
+
+            var ownerRange = DateRangeSql("o.assigned_at", fromDt, toExclusive);
+            var addedRange = DateRangeSql("cm.created_at", fromDt, toExclusive);
+            var doneRange = DateRangeSql("cm.updated_at", fromDt, toExclusive);
+
+            var sql = $@"
+SELECT u.name,
+  (SELECT COUNT(*) FROM frl.frl_camera_movement_image_owner o
+     WHERE lower(o.owner) = lower(u.name){ownerRange}) AS pulled,
+  (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
+     JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
+     WHERE lower(o.owner) = lower(u.name){addedRange}) AS tags_added,
+  (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
+     JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
+     WHERE lower(o.owner) = lower(u.name) AND cm.status = 'ok'{doneRange}) AS completed
+FROM frl.frl_camera_movement_users u
+ORDER BY u.is_admin DESC, lower(u.name);";
+
+            var stats = new List<QcUserStats>();
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            if (fromDt.HasValue) cmd.Parameters.AddWithValue("@from", fromDt.Value);
+            if (toExclusive.HasValue) cmd.Parameters.AddWithValue("@to", toExclusive.Value);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                stats.Add(new QcUserStats
+                {
+                    Name = reader.GetString(0),
+                    Pulled = Convert.ToInt32(reader.GetInt64(1)),
+                    TagsAdded = Convert.ToInt32(reader.GetInt64(2)),
+                    Completed = Convert.ToInt32(reader.GetInt64(3))
+                });
+            }
+            return Ok(stats);
+        }
+
+        private static string DateRangeSql(string column, DateTime? from, DateTime? to)
+        {
+            var sb = new System.Text.StringBuilder();
+            if (from.HasValue) sb.Append($" AND {column} >= @from");
+            if (to.HasValue) sb.Append($" AND {column} < @to");
+            return sb.ToString();
+        }
+
         // ── POST /api/admin/camera-movements/users ─────────────────────
         // Add a reviewer. Admin-only (actingUser must be an admin).
         [HttpPost("users")]
@@ -2375,6 +2441,14 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public int Id { get; set; }
             public string Name { get; set; } = "";
             public bool IsAdmin { get; set; }
+        }
+
+        public sealed class QcUserStats
+        {
+            public string Name { get; set; } = "";
+            public int Pulled { get; set; }
+            public int TagsAdded { get; set; }
+            public int Completed { get; set; }
         }
 
         public sealed class UserWriteRequest
