@@ -1237,6 +1237,7 @@ SELECT cm.imageid,
        cm.status,
        i.movieid,
        i.randid,
+       i.filename AS image_filename,
        sb.start_time,
        sb.end_time,
        sb.fps,
@@ -1275,6 +1276,8 @@ LIMIT @limit OFFSET @offset;";
                     Status = reader.GetString(reader.GetOrdinal("status")),
                     MovieId = reader.GetInt32(reader.GetOrdinal("movieid")),
                     RandId = reader.GetString(reader.GetOrdinal("randid")),
+                    Filename = reader.IsDBNull(reader.GetOrdinal("image_filename"))
+                        ? "" : reader.GetString(reader.GetOrdinal("image_filename")),
                     StartTime = reader.IsDBNull(reader.GetOrdinal("start_time"))
                         ? null : reader.GetDouble(reader.GetOrdinal("start_time")),
                     EndTime = reader.IsDBNull(reader.GetOrdinal("end_time"))
@@ -1367,6 +1370,7 @@ WHERE imageid IN ({idParams});";
                         MovieId = row.MovieId,
                         MovieTitle = row.MovieTitle,
                         MediaType = row.MediaType,
+                        Filename = row.Filename,
                         Url = url,
                         StartTime = row.StartTime,
                         EndTime = row.EndTime,
@@ -1494,6 +1498,7 @@ SELECT cm.imageid,
        cm.status,
        i.movieid,
        i.randid,
+       i.filename AS image_filename,
        sb.start_time,
        sb.end_time,
        sb.fps,
@@ -1538,6 +1543,8 @@ LIMIT @limit OFFSET @offset;";
                     Status = reader.GetString(reader.GetOrdinal("status")),
                     MovieId = reader.GetInt32(reader.GetOrdinal("movieid")),
                     RandId = reader.GetString(reader.GetOrdinal("randid")),
+                    Filename = reader.IsDBNull(reader.GetOrdinal("image_filename"))
+                        ? "" : reader.GetString(reader.GetOrdinal("image_filename")),
                     StartTime = reader.IsDBNull(reader.GetOrdinal("start_time"))
                         ? null : reader.GetDouble(reader.GetOrdinal("start_time")),
                     EndTime = reader.IsDBNull(reader.GetOrdinal("end_time"))
@@ -1629,6 +1636,7 @@ WHERE imageid IN ({idParams});";
                         MovieId = row.MovieId,
                         MovieTitle = row.MovieTitle,
                         MediaType = row.MediaType,
+                        Filename = row.Filename,
                         Url = url,
                         StartTime = row.StartTime,
                         EndTime = row.EndTime,
@@ -2583,6 +2591,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string Status { get; set; } = "";
             public int MovieId { get; set; }
             public string RandId { get; set; } = "";
+            public string Filename { get; set; } = "";
             public double? StartTime { get; set; }
             public double? EndTime { get; set; }
             public double? Fps { get; set; }
@@ -2604,6 +2613,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public int MovieId { get; set; }
             public string MovieTitle { get; set; } = "";
             public string MediaType { get; set; } = "";
+            public string Filename { get; set; } = "";
             public string Url { get; set; } = "";
             public double? StartTime { get; set; }
             public double? EndTime { get; set; }
