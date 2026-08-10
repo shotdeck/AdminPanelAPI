@@ -18,9 +18,10 @@ namespace ShotDeckSearch.Controllers
     {
         private const int PresignedUrlExpiryMinutes = 60;
 
-        // Movements the QC UI hides and reviewers can never action. They must
-        // not keep an image from counting as completed.
-        private static readonly string[] NonQcMovements = { "pov" };
+        // Movements reviewers are not expected to action: "pov" is hidden from
+        // the QC UI entirely, and "track" is visible but deliberately skipped.
+        // Neither may keep an image from counting as completed.
+        private static readonly string[] NonQcMovements = { "pov", "track" };
 
         private static readonly string NonQcMovementsSql =
             string.Join(",", NonQcMovements.Select(m => $"'{m}'"));
