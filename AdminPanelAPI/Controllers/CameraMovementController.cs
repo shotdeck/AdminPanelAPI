@@ -18,6 +18,13 @@ namespace ShotDeckSearch.Controllers
     {
         private const int PresignedUrlExpiryMinutes = 60;
 
+        // Movements the QC UI hides and reviewers can never action. They must
+        // not keep an image from counting as completed.
+        private static readonly string[] NonQcMovements = { "pov" };
+
+        private static readonly string NonQcMovementsSql =
+            string.Join(",", NonQcMovements.Select(m => $"'{m}'"));
+
         private readonly NpgsqlConnection _connection;
         private readonly IConfiguration _configuration;
         private readonly IHttpClientFactory _httpClientFactory;
@@ -938,6 +945,7 @@ ORDER BY is_admin DESC, lower(name);";
         public async Task<ActionResult<List<QcUserStats>>> GetUserStats(
             [FromQuery] string? from = null,
             [FromQuery] string? to = null,
+            [FromQuery] string? name = null,
             CancellationToken ct = default)
         {
             await EnsureOpenAsync(ct);
@@ -958,6 +966,10 @@ ORDER BY is_admin DESC, lower(name);";
             // incorrect); the range is applied to when a tag was last actioned.
             var completedRange = DateRangeSql("e.updated_at", fromDt, toExclusive);
 
+            // Non-admins may only request their own row.
+            var nameFilter = string.IsNullOrWhiteSpace(name)
+                ? "" : " WHERE lower(u.name) = lower(@name)";
+
             var sql = $@"
 SELECT u.name,
   (SELECT COUNT(*) FROM frl.frl_camera_movement_image_owner o
@@ -970,20 +982,22 @@ SELECT u.name,
        AND EXISTS (SELECT 1 FROM frl.frl_join_image_camera_movements e
                    WHERE e.imageid = o.imageid{completedRange})
        AND NOT EXISTS (SELECT 1 FROM frl.frl_join_image_camera_movements n
-                   WHERE n.imageid = o.imageid AND n.status NOT IN ('ok','bad'))) AS completed,
+                   WHERE n.imageid = o.imageid AND n.status NOT IN ('ok','bad')
+                     AND n.movement NOT IN ({NonQcMovementsSql}))) AS completed,
   (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name) AND cm.status = 'ok'{doneRange}) AS confirmed_tags,
   (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name) AND cm.status IN ('ok','bad'){doneRange}) AS reviewed_tags
-FROM frl.frl_camera_movement_users u
+FROM frl.frl_camera_movement_users u{nameFilter}
 ORDER BY u.is_admin DESC, lower(u.name);";
 
             var stats = new List<QcUserStats>();
             await using var cmd = new NpgsqlCommand(sql, _connection);
             if (fromDt.HasValue) cmd.Parameters.AddWithValue("@from", fromDt.Value);
             if (toExclusive.HasValue) cmd.Parameters.AddWithValue("@to", toExclusive.Value);
+            if (!string.IsNullOrWhiteSpace(name)) cmd.Parameters.AddWithValue("@name", name.Trim());
             await using var reader = await cmd.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
@@ -1153,6 +1167,28 @@ WHERE id = @id;";
             cmd.Parameters.AddWithValue("@name", name.Trim());
             var result = await cmd.ExecuteScalarAsync(ct);
             return result != null;
+        }
+
+        // A non-admin reviewer may only edit images they own. Requests that
+        // omit actingUser are allowed so clients on an older build keep
+        // working; the QC frontend always sends it.
+        private async Task<bool> CanEditImagesAsync(
+            string? actingUser, IEnumerable<int> imageIds, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(actingUser)) return true;
+            if (await IsAdminAsync(actingUser, ct)) return true;
+
+            var ids = imageIds.Distinct().ToArray();
+            if (ids.Length == 0) return true;
+
+            const string sql = @"
+SELECT 1 FROM frl.frl_camera_movement_image_owner
+WHERE imageid = ANY(@ids) AND lower(owner) <> lower(@owner)
+LIMIT 1;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@ids", ids);
+            cmd.Parameters.AddWithValue("@owner", actingUser.Trim());
+            return await cmd.ExecuteScalarAsync(ct) == null;
         }
 
         private async Task<bool> IsAdminAsync(string? name, CancellationToken ct)
@@ -1683,6 +1719,10 @@ WHERE imageid IN ({idParams});";
             var validStatuses = new HashSet<string> { "ok", "bad", "not_checked", "flagged" };
 
             await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            if (!await CanEditImagesAsync(
+                    request.ActingUser, request.Items.Select(i => i.ImageId), ct))
+                return StatusCode(403, new { error = "You can only review images assigned to you." });
 
             int updated = 0;
             foreach (var item in request.Items)
@@ -1800,6 +1840,9 @@ ORDER BY movement;";
                 return BadRequest(new { error = "newMovement is required." });
 
             await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            if (!await CanEditImagesAsync(request.ActingUser, new[] { request.ImageId }, ct))
+                return StatusCode(403, new { error = "You can only edit images assigned to you." });
 
             // Fetch confidence before deleting
             float? confidence = null;
@@ -1860,6 +1903,9 @@ ON CONFLICT (imageid, movement) DO UPDATE SET status = 'ok', updated_at = now();
                 return BadRequest(new { error = "movement is required." });
 
             await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            if (!await CanEditImagesAsync(request.ActingUser, new[] { request.ImageId }, ct))
+                return StatusCode(403, new { error = "You can only edit images assigned to you." });
 
             // Fetch confidence before deleting
             float? confidence = null;
@@ -1907,6 +1953,9 @@ WHERE imageid = @imageid AND movement = @movement;";
                 return BadRequest(new { error = "movement is required." });
 
             await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            if (!await CanEditImagesAsync(request.ActingUser, new[] { request.ImageId }, ct))
+                return StatusCode(403, new { error = "You can only edit images assigned to you." });
 
             const string sql = @"
 INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
@@ -2646,6 +2695,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
         public sealed class ReviewRequest
         {
             public List<ReviewItem> Items { get; set; } = new();
+            public string? ActingUser { get; set; }
         }
 
         public sealed class ReviewResponse
@@ -2663,6 +2713,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public int ImageId { get; set; }
             public string OldMovement { get; set; } = "";
             public string NewMovement { get; set; } = "";
+            public string? ActingUser { get; set; }
         }
 
         public sealed class ReassignResponse
@@ -2674,6 +2725,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
         {
             public int ImageId { get; set; }
             public string Movement { get; set; } = "";
+            public string? ActingUser { get; set; }
         }
 
         public sealed class DeleteTagResponse
@@ -2685,6 +2737,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
         {
             public int ImageId { get; set; }
             public string Movement { get; set; } = "";
+            public string? ActingUser { get; set; }
         }
 
         public sealed class AddTagResponse
