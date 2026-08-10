@@ -1169,17 +1169,18 @@ WHERE id = @id;";
             return result != null;
         }
 
-        // A non-admin reviewer may only edit images they own. Requests that
-        // omit actingUser are allowed so clients on an older build keep
-        // working; the QC frontend always sends it.
-        private async Task<bool> CanEditImagesAsync(
+        // A non-admin reviewer may only edit images they own; the admin may
+        // edit any. actingUser is required so a caller cannot opt out of the
+        // check by omitting it. Returns null when the edit is allowed.
+        private async Task<ActionResult?> CheckImageEditAsync(
             string? actingUser, IEnumerable<int> imageIds, CancellationToken ct)
         {
-            if (string.IsNullOrWhiteSpace(actingUser)) return true;
-            if (await IsAdminAsync(actingUser, ct)) return true;
+            if (string.IsNullOrWhiteSpace(actingUser))
+                return BadRequest(new { error = "actingUser is required." });
+            if (await IsAdminAsync(actingUser, ct)) return null;
 
             var ids = imageIds.Distinct().ToArray();
-            if (ids.Length == 0) return true;
+            if (ids.Length == 0) return null;
 
             const string sql = @"
 SELECT 1 FROM frl.frl_camera_movement_image_owner
@@ -1188,7 +1189,9 @@ LIMIT 1;";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@ids", ids);
             cmd.Parameters.AddWithValue("@owner", actingUser.Trim());
-            return await cmd.ExecuteScalarAsync(ct) == null;
+            if (await cmd.ExecuteScalarAsync(ct) != null)
+                return StatusCode(403, new { error = "You can only edit images assigned to you." });
+            return null;
         }
 
         private async Task<bool> IsAdminAsync(string? name, CancellationToken ct)
@@ -1720,9 +1723,9 @@ WHERE imageid IN ({idParams});";
 
             await EnsureOpenAsync(ct);
             await EnsureUsersTablesAsync(ct);
-            if (!await CanEditImagesAsync(
-                    request.ActingUser, request.Items.Select(i => i.ImageId), ct))
-                return StatusCode(403, new { error = "You can only review images assigned to you." });
+            var denied = await CheckImageEditAsync(
+                request.ActingUser, request.Items.Select(i => i.ImageId), ct);
+            if (denied != null) return denied;
 
             int updated = 0;
             foreach (var item in request.Items)
@@ -1841,8 +1844,9 @@ ORDER BY movement;";
 
             await EnsureOpenAsync(ct);
             await EnsureUsersTablesAsync(ct);
-            if (!await CanEditImagesAsync(request.ActingUser, new[] { request.ImageId }, ct))
-                return StatusCode(403, new { error = "You can only edit images assigned to you." });
+            var denied = await CheckImageEditAsync(
+                request.ActingUser, new[] { request.ImageId }, ct);
+            if (denied != null) return denied;
 
             // Fetch confidence before deleting
             float? confidence = null;
@@ -1904,8 +1908,9 @@ ON CONFLICT (imageid, movement) DO UPDATE SET status = 'ok', updated_at = now();
 
             await EnsureOpenAsync(ct);
             await EnsureUsersTablesAsync(ct);
-            if (!await CanEditImagesAsync(request.ActingUser, new[] { request.ImageId }, ct))
-                return StatusCode(403, new { error = "You can only edit images assigned to you." });
+            var denied = await CheckImageEditAsync(
+                request.ActingUser, new[] { request.ImageId }, ct);
+            if (denied != null) return denied;
 
             // Fetch confidence before deleting
             float? confidence = null;
@@ -1954,8 +1959,9 @@ WHERE imageid = @imageid AND movement = @movement;";
 
             await EnsureOpenAsync(ct);
             await EnsureUsersTablesAsync(ct);
-            if (!await CanEditImagesAsync(request.ActingUser, new[] { request.ImageId }, ct))
-                return StatusCode(403, new { error = "You can only edit images assigned to you." });
+            var denied = await CheckImageEditAsync(
+                request.ActingUser, new[] { request.ImageId }, ct);
+            if (denied != null) return denied;
 
             const string sql = @"
 INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
