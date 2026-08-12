@@ -202,7 +202,7 @@ ORDER BY media_type::text;";
             // 3. Process images in parallel (up to 5 concurrent VideoMAE calls)
             const int maxConcurrency = 5;
             var throttle = new SemaphoreSlim(maxConcurrency);
-            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, List<VideoMaeSegment>? Segments, bool Success)>();
+            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, List<VideoMaeSegment>? Segments, bool Success, string? Reason)>();
 
             var tasks = images.Select(async img =>
             {
@@ -238,21 +238,22 @@ ORDER BY media_type::text;";
 
                     if (!response.IsSuccessStatusCode)
                     {
+                        var reason = await ReadFailureReasonAsync(response, ct);
                         _logger.LogWarning(
-                            "VideoMAE API failed for image {ImageId}: HTTP {Status}",
-                            img.ImageId, (int)response.StatusCode);
-                        results.Add((img.ImageId, null, null, false));
+                            "VideoMAE API failed for image {ImageId}: HTTP {Status} {Reason}",
+                            img.ImageId, (int)response.StatusCode, reason);
+                        results.Add((img.ImageId, null, null, false, reason));
                         return;
                     }
 
                     var responseBody = await response.Content.ReadAsStringAsync(ct);
                     var result = JsonSerializer.Deserialize<VideoMaeResponse>(responseBody, JsonOpts);
-                    results.Add((img.ImageId, result?.OverallMovements, result?.Segments, true));
+                    results.Add((img.ImageId, result?.OverallMovements, result?.Segments, true, null));
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Failed to analyze image {ImageId}", img.ImageId);
-                    results.Add((img.ImageId, null, null, false));
+                    results.Add((img.ImageId, null, null, false, DescribeException(ex)));
                 }
                 finally
                 {
@@ -267,9 +268,12 @@ ORDER BY media_type::text;";
             {
                 if (!r.Success)
                 {
+                    await RecordFailureAsync(r.ImageId, r.Reason, ct);
                     failed++;
                     continue;
                 }
+
+                await ClearFailureAsync(r.ImageId, ct);
 
                 if (r.Movements == null || r.Movements.Count == 0)
                 {
@@ -602,6 +606,108 @@ LIMIT @limit;";
             return Ok(new ActiveJobsResponse { Jobs = jobs });
         }
 
+        // ── GET /api/admin/camera-movements/analyze/failures ───────────
+        // Images that failed analysis, with the reason reported by the
+        // analysis API. "Parked" means it hit the attempt limit and is no
+        // longer offered to fetches.
+        [HttpGet("analyze/failures")]
+        [ProducesResponseType(typeof(FailuresResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<FailuresResponse>> GetFailures(
+            [FromQuery] int limit = 200,
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureJobTablesAsync(ct);
+
+            if (limit < 1) limit = 1;
+            if (limit > 1000) limit = 1000;
+
+            const string sql = @"
+SELECT f.imageid, f.reason, f.attempts, f.first_failed, f.last_failed,
+       i.movieid, i.filename, mv.title, mv.year
+FROM frl.frl_camera_movement_failures f
+LEFT JOIN frl.frl_images i  ON i.idnum = f.imageid
+LEFT JOIN frl.frl_movies mv ON mv.idnum = i.movieid
+ORDER BY f.last_failed DESC
+LIMIT @limit;";
+
+            var items = new List<FailureItem>();
+            await using (var cmd = new NpgsqlCommand(sql, _connection))
+            {
+                cmd.Parameters.AddWithValue("@limit", limit);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    var attempts = reader.GetInt32(2);
+                    items.Add(new FailureItem
+                    {
+                        ImageId = reader.GetInt32(0),
+                        Reason = reader.GetString(1),
+                        Attempts = attempts,
+                        Parked = attempts >= MaxFailedAttempts,
+                        FirstFailed = reader.GetDateTime(3),
+                        LastFailed = reader.GetDateTime(4),
+                        MovieId = reader.IsDBNull(5) ? null : reader.GetInt32(5),
+                        Filename = reader.IsDBNull(6) ? null : reader.GetString(6),
+                        MovieTitle = reader.IsDBNull(7) ? null : reader.GetString(7),
+                        MovieYear = reader.IsDBNull(8) ? null : reader.GetInt32(8),
+                    });
+                }
+            }
+
+            var countSql = $@"
+SELECT count(*)::int AS total,
+       count(*) FILTER (WHERE attempts >= {MaxFailedAttempts})::int AS parked
+FROM frl.frl_camera_movement_failures;";
+
+            int total = 0, parked = 0;
+            await using (var cmd = new NpgsqlCommand(countSql, _connection))
+            {
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                {
+                    total = reader.GetInt32(0);
+                    parked = reader.GetInt32(1);
+                }
+            }
+
+            return Ok(new FailuresResponse
+            {
+                Failures = items,
+                Total = total,
+                Parked = parked,
+                MaxAttempts = MaxFailedAttempts,
+            });
+        }
+
+        // ── POST /api/admin/camera-movements/analyze/failures/retry ────
+        // Clears failures so they re-enter the fetch queue. Admin only.
+        // Without an imageId every recorded failure is released.
+        [HttpPost("analyze/failures/retry")]
+        [ProducesResponseType(typeof(object), StatusCodes.Status200OK)]
+        public async Task<ActionResult> RetryFailures(
+            [FromBody] RetryFailuresRequest request,
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureJobTablesAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+
+            if (!await IsAdminAsync(request.ActingUser, ct))
+                return StatusCode(403, new { error = "Only an admin can retry failures." });
+
+            var sql = request.ImageId.HasValue
+                ? "DELETE FROM frl.frl_camera_movement_failures WHERE imageid = @imageid;"
+                : "DELETE FROM frl.frl_camera_movement_failures;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            if (request.ImageId.HasValue)
+                cmd.Parameters.AddWithValue("@imageid", request.ImageId.Value);
+            var cleared = await cmd.ExecuteNonQueryAsync(ct);
+
+            return Ok(new { cleared });
+        }
+
         // ── POST /api/admin/camera-movements/analyze-movie ─────────────
         // Batch-analyze images for a specific movie: calls VideoMAE API for each, stores results.
         [HttpPost("analyze-movie")]
@@ -697,7 +803,7 @@ LIMIT @limit;";
             // 3. Process images in parallel (up to 5 concurrent VideoMAE calls)
             const int maxConcurrency = 5;
             var throttle = new SemaphoreSlim(maxConcurrency);
-            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, List<VideoMaeSegment>? Segments, bool Success)>();
+            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, List<VideoMaeSegment>? Segments, bool Success, string? Reason)>();
 
             var tasks = images.Select(async img =>
             {
@@ -733,21 +839,22 @@ LIMIT @limit;";
 
                     if (!response.IsSuccessStatusCode)
                     {
+                        var reason = await ReadFailureReasonAsync(response, ct);
                         _logger.LogWarning(
-                            "VideoMAE API failed for image {ImageId}: HTTP {Status}",
-                            img.ImageId, (int)response.StatusCode);
-                        results.Add((img.ImageId, null, null, false));
+                            "VideoMAE API failed for image {ImageId}: HTTP {Status} {Reason}",
+                            img.ImageId, (int)response.StatusCode, reason);
+                        results.Add((img.ImageId, null, null, false, reason));
                         return;
                     }
 
                     var responseBody = await response.Content.ReadAsStringAsync(ct);
                     var result = JsonSerializer.Deserialize<VideoMaeResponse>(responseBody, JsonOpts);
-                    results.Add((img.ImageId, result?.OverallMovements, result?.Segments, true));
+                    results.Add((img.ImageId, result?.OverallMovements, result?.Segments, true, null));
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Failed to analyze image {ImageId}", img.ImageId);
-                    results.Add((img.ImageId, null, null, false));
+                    results.Add((img.ImageId, null, null, false, DescribeException(ex)));
                 }
                 finally
                 {
@@ -762,9 +869,12 @@ LIMIT @limit;";
             {
                 if (!r.Success)
                 {
+                    await RecordFailureAsync(r.ImageId, r.Reason, ct);
                     failed++;
                     continue;
                 }
+
+                await ClearFailureAsync(r.ImageId, ct);
 
                 if (r.Movements == null || r.Movements.Count == 0)
                 {
@@ -2065,6 +2175,10 @@ ORDER BY created_at DESC;";
         // crashed/closed session), so the image can be picked up again.
         private const int ClaimTtlMinutes = 15;
 
+        // After this many failed attempts an image is parked: kept on the
+        // failures list for inspection but no longer offered to fetches.
+        private const int MaxFailedAttempts = 3;
+
         private async Task EnsureJobTablesAsync(CancellationToken ct)
         {
             const string sql = @"
@@ -2085,7 +2199,16 @@ CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_claims (
     claimed_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_cmc_job_id     ON frl.frl_camera_movement_claims (job_id);
-CREATE INDEX IF NOT EXISTS idx_cmc_claimed_at ON frl.frl_camera_movement_claims (claimed_at);";
+CREATE INDEX IF NOT EXISTS idx_cmc_claimed_at ON frl.frl_camera_movement_claims (claimed_at);
+CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_failures (
+    imageid       INTEGER      PRIMARY KEY,
+    reason        TEXT         NOT NULL,
+    attempts      INTEGER      NOT NULL DEFAULT 1,
+    first_failed  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    last_failed   TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cmf_attempts    ON frl.frl_camera_movement_failures (attempts);
+CREATE INDEX IF NOT EXISTS idx_cmf_last_failed ON frl.frl_camera_movement_failures (last_failed DESC);";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
         }
@@ -2173,6 +2296,12 @@ WITH candidates AS (
           SELECT 1 FROM frl.frl_camera_movement_claims c
           WHERE c.imageid = i.idnum
             AND c.claimed_at > now() - INTERVAL '{ClaimTtlMinutes} minutes')
+      -- Park clips that keep failing. Without this they sit at the head of the
+      -- popularity-ordered queue and are retried on every single fetch.
+      AND NOT EXISTS (
+          SELECT 1 FROM frl.frl_camera_movement_failures f
+          WHERE f.imageid = i.idnum
+            AND f.attempts >= {MaxFailedAttempts})
       {mediaClause}
     ORDER BY i.weighted_score DESC
     LIMIT @limit
@@ -2208,6 +2337,81 @@ WHERE idnum IN (SELECT imageid FROM claimed);";
                 });
             }
             return images;
+        }
+
+        // The analysis API reports the real cause in the response body (e.g.
+        // "Failed to download clip: HTTP 404" for a clip missing from R2), so
+        // prefer it over the bare status code. FastAPI wraps it in "detail".
+        private static async Task<string> ReadFailureReasonAsync(
+            HttpResponseMessage response, CancellationToken ct)
+        {
+            var status = $"HTTP {(int)response.StatusCode}";
+            string body;
+            try
+            {
+                body = await response.Content.ReadAsStringAsync(ct);
+            }
+            catch
+            {
+                return status;
+            }
+
+            if (string.IsNullOrWhiteSpace(body)) return status;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                    doc.RootElement.TryGetProperty("detail", out var detail))
+                {
+                    var text = detail.ValueKind == JsonValueKind.String
+                        ? detail.GetString() : detail.ToString();
+                    if (!string.IsNullOrWhiteSpace(text)) return $"{status}: {text}";
+                }
+            }
+            catch (JsonException)
+            {
+                // not JSON; fall through to the raw body
+            }
+
+            return $"{status}: {Truncate(body, 400)}";
+        }
+
+        private static string DescribeException(Exception ex) =>
+            ex is TaskCanceledException or OperationCanceledException
+                ? "Timed out waiting for the analysis API"
+                : $"{ex.GetType().Name}: {Truncate(ex.Message, 400)}";
+
+        private static string Truncate(string value, int max)
+        {
+            value = value.Trim();
+            return value.Length <= max ? value : value[..max] + "…";
+        }
+
+        private async Task RecordFailureAsync(
+            int imageId, string? reason, CancellationToken ct)
+        {
+            const string sql = @"
+INSERT INTO frl.frl_camera_movement_failures (imageid, reason)
+VALUES (@imageid, @reason)
+ON CONFLICT (imageid) DO UPDATE
+SET reason      = EXCLUDED.reason,
+    attempts    = frl.frl_camera_movement_failures.attempts + 1,
+    last_failed = now();";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@imageid", imageId);
+            cmd.Parameters.AddWithValue("@reason", reason ?? "Unknown error");
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        // An image that eventually analyses fine shouldn't stay on the list.
+        private async Task ClearFailureAsync(int imageId, CancellationToken ct)
+        {
+            const string sql =
+                "DELETE FROM frl.frl_camera_movement_failures WHERE imageid = @imageid;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@imageid", imageId);
+            await cmd.ExecuteNonQueryAsync(ct);
         }
 
         private async Task ReleaseClaimsAsync(List<int> imageIds, CancellationToken ct)
@@ -2520,6 +2724,34 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
         }
 
         // ── DTOs ───────────────────────────────────────────────────────
+
+        public sealed class FailureItem
+        {
+            public int ImageId { get; set; }
+            public string Reason { get; set; } = "";
+            public int Attempts { get; set; }
+            public bool Parked { get; set; }
+            public DateTime FirstFailed { get; set; }
+            public DateTime LastFailed { get; set; }
+            public int? MovieId { get; set; }
+            public string? Filename { get; set; }
+            public string? MovieTitle { get; set; }
+            public int? MovieYear { get; set; }
+        }
+
+        public sealed class FailuresResponse
+        {
+            public List<FailureItem> Failures { get; set; } = new();
+            public int Total { get; set; }
+            public int Parked { get; set; }
+            public int MaxAttempts { get; set; }
+        }
+
+        public sealed class RetryFailuresRequest
+        {
+            public int? ImageId { get; set; }
+            public string? ActingUser { get; set; }
+        }
 
         public sealed class QueueItem
         {
