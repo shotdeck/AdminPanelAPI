@@ -84,6 +84,9 @@ builder.Services.AddHttpClient<ITrackDetailsService, TrackDetailsService>();
 builder.Services.AddScoped<IAudioIdentifyService, AudioIdentifyService>();
 builder.Services.AddHostedService<MusicIdentificationWorker>();
 
+// Movie source files in R2 (dashboard file browser)
+builder.Services.AddSingleton<IMovieFileStorageService, MovieFileStorageService>();
+
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
 
