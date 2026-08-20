@@ -17,6 +17,8 @@ namespace ShotDeckSearch.Controllers
     [Route("api/admin/movie-files")]
     public sealed class MovieFilesController : ControllerBase
     {
+        private const string PosterBaseUrl = "https://image.tmdb.org/t/p/w342";
+
         private readonly IMovieFileStorageService _storage;
         private readonly Lazy<NpgsqlConnection> _connection;
         private readonly ILogger<MovieFilesController> _logger;
@@ -210,7 +212,7 @@ namespace ShotDeckSearch.Controllers
             try
             {
                 const string sql = @"
-SELECT idnum, title, year, media_type::text AS media_type
+SELECT idnum, title, year, media_type::text AS media_type, poster
 FROM frl.frl_movies
 WHERE title ILIKE @search
 ORDER BY (title ILIKE @prefix) DESC, title ASC, year DESC NULLS LAST
@@ -230,7 +232,8 @@ LIMIT @limit;";
                         id = reader.GetInt32(0),
                         title = reader.IsDBNull(1) ? "" : reader.GetString(1),
                         year = reader.IsDBNull(2) ? (int?)null : reader.GetInt32(2),
-                        mediaType = reader.IsDBNull(3) ? "" : reader.GetString(3)
+                        mediaType = reader.IsDBNull(3) ? "" : reader.GetString(3),
+                        poster = reader.IsDBNull(4) ? null : PosterBaseUrl + reader.GetString(4)
                     });
                 }
 
@@ -244,7 +247,8 @@ LIMIT @limit;";
 
         /// <summary>
         /// Titles for numeric folder names, so the browser can show
-        /// "1042 — Heat (1995)" instead of a bare id.
+        /// "1042 — Heat (1995)" instead of a bare id, plus the poster the
+        /// grid view draws. Called a page of folders at a time.
         /// </summary>
         [HttpGet("movie-titles")]
         public async Task<IActionResult> GetMovieTitles(
@@ -273,7 +277,7 @@ LIMIT @limit;";
             try
             {
                 const string sql = @"
-SELECT idnum, title, year
+SELECT idnum, title, year, media_type::text AS media_type, poster
 FROM frl.frl_movies
 WHERE idnum = ANY(@ids);";
 
@@ -288,7 +292,9 @@ WHERE idnum = ANY(@ids);";
                     {
                         id = reader.GetInt32(0),
                         title = reader.IsDBNull(1) ? "" : reader.GetString(1),
-                        year = reader.IsDBNull(2) ? (int?)null : reader.GetInt32(2)
+                        year = reader.IsDBNull(2) ? (int?)null : reader.GetInt32(2),
+                        mediaType = reader.IsDBNull(3) ? "" : reader.GetString(3),
+                        poster = reader.IsDBNull(4) ? null : PosterBaseUrl + reader.GetString(4)
                     });
                 }
 
