@@ -102,7 +102,7 @@ namespace ShotDeckSearch.Controllers
             return Ok(new { status = "ok", hasToken });
         }
 
-        [HttpGet("healthtest")]
+        [HttpGet("healthtest2")]
         [ProducesResponseType(Microsoft.AspNetCore.Http.StatusCodes.Status200OK)]
         public ActionResult HealthTest()
         {
