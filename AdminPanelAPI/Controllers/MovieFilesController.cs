@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
 using System.Data;
+using System.Text.Json;
 
 namespace ShotDeckSearch.Controllers
 {
@@ -20,15 +21,18 @@ namespace ShotDeckSearch.Controllers
         private const string PosterBaseUrl = "https://image.tmdb.org/t/p/w342";
 
         private readonly IMovieFileStorageService _storage;
+        private readonly IMovieTranscodeService _transcode;
         private readonly Lazy<NpgsqlConnection> _connection;
         private readonly ILogger<MovieFilesController> _logger;
 
         public MovieFilesController(
             IMovieFileStorageService storage,
+            IMovieTranscodeService transcode,
             Lazy<NpgsqlConnection> connection,
             ILogger<MovieFilesController> logger)
         {
             _storage = storage;
+            _transcode = transcode;
             _connection = connection;
             _logger = logger;
         }
@@ -305,6 +309,73 @@ WHERE idnum = ANY(@ids);";
                 if (mustClose) await connection.CloseAsync();
             }
         }
+
+        /// <summary>The HandBrake presets the transcode app offers, for the dropdown.</summary>
+        [HttpGet("transcode/presets")]
+        public async Task<IActionResult> GetTranscodePresets(CancellationToken ct = default) =>
+            Relay(await _transcode.GetPresetsAsync(ct));
+
+        /// <summary>
+        /// Add presets from a HandBrake preset export. The document is relayed
+        /// verbatim and validated by the transcode app, which rejects any preset
+        /// using a feature it can't reproduce in ffmpeg.
+        /// </summary>
+        [HttpPost("transcode/presets")]
+        public async Task<IActionResult> ImportTranscodePreset(
+            [FromBody] JsonElement document,
+            [FromQuery] bool overwrite = false,
+            CancellationToken ct = default) =>
+            Relay(await _transcode.ImportPresetAsync(document.GetRawText(), overwrite, ct));
+
+        [HttpDelete("transcode/presets/{name}")]
+        public async Task<IActionResult> DeleteTranscodePreset(
+            string name, CancellationToken ct = default) =>
+            Relay(await _transcode.DeletePresetAsync(name, ct));
+
+        /// <summary>
+        /// Start an SF proxy encode of an HD master. Returns immediately with a
+        /// job id: the encode runs on Modal and is polled through transcode/{jobId}.
+        /// The output is written next to the source as "{name}_SF.mp4" and an
+        /// existing one is only replaced when overwrite is set.
+        /// </summary>
+        [HttpPost("transcode")]
+        public async Task<IActionResult> CreateTranscodeJob(
+            [FromBody] CreateTranscodeJobRequest request, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(request.Key))
+                return BadRequest(new { error = "key is required" });
+
+            return Relay(await _transcode.CreateJobAsync(
+                request.Key, request.Preset, request.Overwrite, ct));
+        }
+
+        [HttpGet("transcode/{jobId}")]
+        public async Task<IActionResult> GetTranscodeJob(
+            string jobId, CancellationToken ct = default) =>
+            Relay(await _transcode.GetJobAsync(jobId, ct));
+
+        /// <summary>Recent jobs for one source, so a reload can restore a running bar.</summary>
+        [HttpGet("transcode")]
+        public async Task<IActionResult> FindTranscodeJobs(
+            [FromQuery] string key, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                return BadRequest(new { error = "key is required" });
+
+            return Relay(await _transcode.FindJobsAsync(key, ct));
+        }
+
+        [HttpDelete("transcode/{jobId}")]
+        public async Task<IActionResult> CancelTranscodeJob(
+            string jobId, CancellationToken ct = default) =>
+            Relay(await _transcode.CancelJobAsync(jobId, ct));
+
+        private ContentResult Relay(TranscodeResult result) => new()
+        {
+            StatusCode = (int)result.Status,
+            Content = result.Body,
+            ContentType = "application/json"
+        };
 
         private async Task<IActionResult> GuardAsync<T>(Func<Task<T>> action)
         {

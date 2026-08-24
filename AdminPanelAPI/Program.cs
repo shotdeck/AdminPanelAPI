@@ -86,6 +86,7 @@ builder.Services.AddHostedService<MusicIdentificationWorker>();
 
 // Movie source files in R2 (dashboard file browser)
 builder.Services.AddSingleton<IMovieFileStorageService, MovieFileStorageService>();
+builder.Services.AddSingleton<IMovieTranscodeService, MovieTranscodeService>();
 
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();

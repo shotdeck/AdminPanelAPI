@@ -135,6 +135,14 @@ namespace AdminPanelAPI.Models
         public bool DeleteSource { get; set; } = true;
     }
 
+    /// <summary>Start an SF proxy encode of the HD master at Key.</summary>
+    public sealed class CreateTranscodeJobRequest
+    {
+        public string Key { get; set; } = "";
+        public string? Preset { get; set; }
+        public bool Overwrite { get; set; }
+    }
+
     public sealed class MovePrefixResponse
     {
         public string SourcePrefix { get; set; } = "";
