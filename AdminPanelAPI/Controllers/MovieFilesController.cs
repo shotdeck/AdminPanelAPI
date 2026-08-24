@@ -246,6 +246,43 @@ LIMIT @limit;";
         }
 
         /// <summary>
+        /// The media types actually present in frl_movies, so the browser can
+        /// offer them as a filter without hard-coding the enum.
+        /// </summary>
+        [HttpGet("media-types")]
+        public async Task<IActionResult> GetMediaTypes(CancellationToken ct = default)
+        {
+            var connection = _connection.Value;
+            var mustClose = false;
+            if (connection.State != ConnectionState.Open)
+            {
+                await connection.OpenAsync(ct);
+                mustClose = true;
+            }
+
+            try
+            {
+                const string sql = @"
+SELECT DISTINCT media_type::text AS media_type
+FROM frl.frl_movies
+WHERE media_type IS NOT NULL
+ORDER BY media_type;";
+
+                await using var cmd = new NpgsqlCommand(sql, connection);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                var mediaTypes = new List<string>();
+                while (await reader.ReadAsync(ct))
+                    mediaTypes.Add(reader.GetString(0));
+
+                return Ok(new { mediaTypes });
+            }
+            finally
+            {
+                if (mustClose) await connection.CloseAsync();
+            }
+        }
+
+        /// <summary>
         /// Titles for numeric folder names, so the browser can show
         /// "1042 — Heat (1995)" instead of a bare id, plus the poster the
         /// grid view draws. Called a page of folders at a time.
