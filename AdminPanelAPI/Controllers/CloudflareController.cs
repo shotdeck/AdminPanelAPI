@@ -102,13 +102,7 @@ namespace ShotDeckSearch.Controllers
             return Ok(new { status = "ok", hasToken });
         }
 
-        [HttpGet("healthtest2")]
-        [ProducesResponseType(Microsoft.AspNetCore.Http.StatusCodes.Status200OK)]
-        public ActionResult HealthTest()
-        {
-            var hasToken = !string.IsNullOrEmpty(_config["CLOUDFLARE:CF_API_TOKEN"]);
-            return Ok(new { status = "ok", hasToken });
-        }
+       
 
         // ── GET /api/admin/cloudflare/overview ──────────────────────────
         [HttpGet("overview")]
