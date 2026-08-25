@@ -24,6 +24,11 @@ builder.Services.AddApplicationInsightsTelemetry(options =>
 });
 
 
+// Move the tunnel off a loopback port another slot on this worker already
+// owns, keeping ConnectionStrings:Default in step. Must run before anything
+// reads the connection string.
+TunnelPortSelector.Apply(builder.Configuration);
+
 // SSH tunnel (optional, you had this)
 // Singleton so the health endpoint can report the tunnel's live state.
 builder.Services.AddSingleton<SshTunnelService>();
