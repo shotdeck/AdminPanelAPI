@@ -25,7 +25,9 @@ builder.Services.AddApplicationInsightsTelemetry(options =>
 
 
 // SSH tunnel (optional, you had this)
-builder.Services.AddHostedService<SshTunnelService>();
+// Singleton so the health endpoint can report the tunnel's live state.
+builder.Services.AddSingleton<SshTunnelService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<SshTunnelService>());
 
 // Database connection (scoped, lazy - only opened when first accessed)
 builder.Services.AddScoped<Lazy<NpgsqlConnection>>(sp =>
