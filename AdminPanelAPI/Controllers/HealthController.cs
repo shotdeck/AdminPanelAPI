@@ -1,5 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace ShotDeckSearch.Controllers
 {
@@ -85,6 +87,43 @@ namespace ShotDeckSearch.Controllers
             };
 
             return reachable ? Ok(body) : StatusCode(StatusCodes.Status503ServiceUnavailable, body);
+        }
+
+        /// <summary>
+        /// Fingerprints of every configuration key, so prod and a deployment
+        /// slot can be diffed when they behave differently. Values are never
+        /// returned: settings ticked "Deployment slot setting" do not swap, and
+        /// a missing or differing secret shows up as a length/hash mismatch.
+        /// </summary>
+        [HttpGet("config")]
+        public IActionResult GetConfigFingerprints()
+        {
+            var settings = new List<object>();
+
+            foreach (var (key, value) in _configuration.AsEnumerable().OrderBy(p => p.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                if (value is null) continue; // section node rather than a value
+
+                settings.Add(new
+                {
+                    key,
+                    length = value.Length,
+                    fingerprint = Fingerprint(value),
+                    isEmpty = value.Length == 0
+                });
+            }
+
+            return Ok(new { count = settings.Count, settings });
+        }
+
+        /// <summary>
+        /// First 8 hex characters of the SHA-256 of a value: enough to tell two
+        /// slots' settings apart, not enough to reconstruct the value.
+        /// </summary>
+        private static string Fingerprint(string value)
+        {
+            var hash = SHA256.HashData(Encoding.UTF8.GetBytes(value));
+            return Convert.ToHexString(hash)[..8].ToLowerInvariant();
         }
     }
 }
