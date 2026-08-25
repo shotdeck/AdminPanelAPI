@@ -76,6 +76,7 @@ namespace ShotDeckSearch.Controllers
                 tunnel = new
                 {
                     connected = status.Connected,
+                    usingExistingForward = status.UsingExistingForward,
                     keySource = status.KeySource,
                     keyAvailable = status.KeyAvailable,
                     endpoint = status.Endpoint,
