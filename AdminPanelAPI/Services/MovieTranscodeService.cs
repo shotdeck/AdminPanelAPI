@@ -27,6 +27,9 @@ namespace AdminPanelAPI.Services
         Task<TranscodeResult> FindJobsAsync(string sourceKey, CancellationToken ct);
 
         Task<TranscodeResult> CancelJobAsync(string jobId, CancellationToken ct);
+
+        /// <summary>Container and stream metadata for one object, read with ffprobe.</summary>
+        Task<TranscodeResult> ProbeAsync(string key, CancellationToken ct);
     }
 
     /// <summary>Raw JSON plus status, so the controller can relay the upstream body verbatim.</summary>
@@ -89,6 +92,15 @@ namespace AdminPanelAPI.Services
 
         public Task<TranscodeResult> CancelJobAsync(string jobId, CancellationToken ct) =>
             SendAsync(HttpMethod.Delete, $"/jobs/{Uri.EscapeDataString(jobId)}", ct);
+
+        public Task<TranscodeResult> ProbeAsync(string key, CancellationToken ct)
+        {
+            var query = $"?key={Uri.EscapeDataString(key)}";
+            if (!string.IsNullOrWhiteSpace(_bucketName))
+                query += $"&bucket={Uri.EscapeDataString(_bucketName)}";
+
+            return SendAsync(HttpMethod.Get, "/probe" + query, ct);
+        }
 
         private async Task<TranscodeResult> SendAsync(
             HttpMethod method, string pathAndQuery, CancellationToken ct, string? jsonBody = null)

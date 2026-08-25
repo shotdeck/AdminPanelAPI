@@ -407,6 +407,22 @@ WHERE idnum = ANY(@ids);";
             string jobId, CancellationToken ct = default) =>
             Relay(await _transcode.CancelJobAsync(jobId, ct));
 
+        /// <summary>
+        /// What one file actually is: container, video, audio, subtitle and
+        /// chapter facts read with ffprobe rather than guessed from the name.
+        /// Probed by the transcode app, which already has ffmpeg and reads the
+        /// object's header ranges over a presigned URL.
+        /// </summary>
+        [HttpGet("details")]
+        public async Task<IActionResult> GetFileDetails(
+            [FromQuery] string key, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                return BadRequest(new { error = "key is required" });
+
+            return Relay(await _transcode.ProbeAsync(key, ct));
+        }
+
         private ContentResult Relay(TranscodeResult result) => new()
         {
             StatusCode = (int)result.Status,
