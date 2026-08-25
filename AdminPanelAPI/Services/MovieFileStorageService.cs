@@ -69,7 +69,7 @@ namespace AdminPanelAPI.Services
                 RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         private static readonly Regex SlimPattern =
-            new(@"(^|[^a-z0-9])(proxy|slim|sd|low|540p?|720p?)([^a-z0-9]|$)",
+            new(@"(^|[^a-z0-9])(sf|proxy|slim|sd|low|540p?|720p?)([^a-z0-9]|$)",
                 RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         private readonly AmazonS3Client _client;
