@@ -34,7 +34,12 @@ steps:
     configuration: '$(buildConfiguration)'
 
 # ✅ Publish the ZIP(s) created in $(Build.ArtifactStagingDirectory) as a Build Artifact named "drop"
+# Only from main: the release pipeline deploys every "drop" artifact, so
+# publishing from PR validation builds deploys twice per merge - and two
+# overlapping deploys leave the previous worker holding the SSH tunnel's local
+# port, which takes the database down.
 - task: PublishBuildArtifacts@1
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   inputs:
     PathtoPublish: '$(Build.ArtifactStagingDirectory)'
     ArtifactName: 'drop'
