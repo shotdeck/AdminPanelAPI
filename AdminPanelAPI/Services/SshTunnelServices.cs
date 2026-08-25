@@ -1,25 +1,65 @@
-﻿using Renci.SshNet;
+﻿using Npgsql;
+using Renci.SshNet;
 using ConnectionInfo = Renci.SshNet.ConnectionInfo;
+
+/// <summary>
+/// A point-in-time view of the tunnel, so an operator can tell whether the
+/// database is unreachable because the tunnel never came up, dropped, or is
+/// misconfigured — without reading the container's stdout.
+/// </summary>
+public sealed record SshTunnelStatus(
+    bool Connected,
+    string KeySource,
+    bool KeyAvailable,
+    string Endpoint,
+    int Attempts,
+    DateTimeOffset? ConnectedSince,
+    DateTimeOffset? LastErrorAt,
+    string? LastError);
 
 public class SshTunnelService : IHostedService, IDisposable
 {
+    private const int MaxBackoffMs = 60_000;
+
     private SshClient? _sshClient;
     private ForwardedPortLocal? _portForward;
-    private readonly string _sshPrivateKey;
+    private readonly string? _sshPrivateKey;
     private readonly IConfiguration _configuration;
+    private readonly ILogger<SshTunnelService> _logger;
 
     // background supervision
     private readonly CancellationTokenSource _cts = new();
     private Task? _loopTask;
 
+    // observable state
+    private volatile bool _connected;
+    private volatile string _keySource = "unknown";
+    private volatile bool _keyAvailable;
+    private volatile string _endpoint = "";
+    private volatile string? _lastError;
+    private int _attempts;
+    private DateTimeOffset? _connectedSince;
+    private DateTimeOffset? _lastErrorAt;
+
     public Task TunnelReady => _tunnelReady.Task;
     private readonly TaskCompletionSource _tunnelReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public SshTunnelService(IConfiguration configuration)
+    public SshTunnelService(IConfiguration configuration, ILogger<SshTunnelService> logger)
     {
         _sshPrivateKey = configuration["SSH_PRIVATE_KEY"]; // base64 PEM in App Settings
         _configuration = configuration;
+        _logger = logger;
     }
+
+    public SshTunnelStatus Status => new(
+        _connected,
+        _keySource,
+        _keyAvailable,
+        _endpoint,
+        Volatile.Read(ref _attempts),
+        _connectedSince,
+        _lastErrorAt,
+        _lastError);
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -44,8 +84,6 @@ public class SshTunnelService : IHostedService, IDisposable
 
     private async Task RunLoopAsync(CancellationToken ct)
     {
-        
-
         var sshHost = _configuration["SshTunnel:SshHost"];
         var sshPort = _configuration.GetValue<int>("SshTunnel:SshPort");
         var sshUser = _configuration["SshTunnel:SshUser"];
@@ -58,22 +96,37 @@ public class SshTunnelService : IHostedService, IDisposable
         var localBindPort = _configuration.GetValue<uint>("SshTunnel:LocalBindPort");
 
         var backoffMs = _configuration.GetValue<int>("SshTunnel:ReconnectDelayMs", 2000);
+        var delayMs = backoffMs;
 
+        var usingInlineKey = !string.IsNullOrWhiteSpace(_sshPrivateKey);
+        _keySource = usingInlineKey ? "SSH_PRIVATE_KEY" : $"file:{sshKeyPath}";
+        _keyAvailable = usingInlineKey || (!string.IsNullOrWhiteSpace(sshKeyPath) && File.Exists(sshKeyPath));
+        _endpoint = $"{sshUser}@{sshHost}:{sshPort} → {remoteDbHost}:{remoteDbPort} (local {localBindHost}:{localBindPort})";
+
+        _logger.LogInformation(
+            "SSH tunnel configured: {Endpoint}; key from {KeySource} (available: {KeyAvailable})",
+            _endpoint, _keySource, _keyAvailable);
 
         while (!ct.IsCancellationRequested)
         {
+            Interlocked.Increment(ref _attempts);
             try
             {
-                // --- Build key (same as your code) ---
+                // --- Build key ---
                 PrivateKeyFile privateKey;
-                if (!string.IsNullOrWhiteSpace(_sshPrivateKey))
+                if (usingInlineKey)
                 {
-                    byte[] pemBytes = Convert.FromBase64String(_sshPrivateKey);
+                    byte[] pemBytes = Convert.FromBase64String(_sshPrivateKey!);
                     using var keyStream = new MemoryStream(pemBytes);
                     privateKey = new PrivateKeyFile(keyStream);
                 }
                 else
                 {
+                    if (string.IsNullOrWhiteSpace(sshKeyPath) || !File.Exists(sshKeyPath))
+                        throw new FileNotFoundException(
+                            "SSH_PRIVATE_KEY is not set and the key file is missing, so the tunnel cannot start.",
+                            sshKeyPath ?? "(SshTunnel:SshKeyPath unset)");
+
                     privateKey = new PrivateKeyFile(sshKeyPath);
                 }
 
@@ -90,24 +143,37 @@ public class SshTunnelService : IHostedService, IDisposable
 
                 _sshClient = new SshClient(connectionInfo)
                 {
-                    // **KEY FIX**: send SSH keep-alives so NAT/SNAT doesn’t drop the idle session
+                    // send SSH keep-alives so NAT/SNAT doesn't drop the idle session
                     KeepAliveInterval = TimeSpan.FromSeconds(30)
                 };
 
                 _sshClient.ErrorOccurred += (_, e) =>
-                    Console.WriteLine("SSH error: " + e.Exception?.Message);
+                {
+                    RecordError(e.Exception);
+                    _logger.LogWarning(e.Exception, "SSH error on the tunnel session");
+                };
 
                 _sshClient.Connect();
 
                 // --- Start local forward ---
                 _portForward = new ForwardedPortLocal(localBindHost, localBindPort, remoteDbHost, remoteDbPort);
                 _portForward.Exception += (_, e) =>
-                    Console.WriteLine("Port forward exception: " + e.Exception?.Message);
+                {
+                    RecordError(e.Exception);
+                    _logger.LogWarning(e.Exception, "Port forward exception");
+                };
 
                 _sshClient.AddForwardedPort(_portForward);
                 _portForward.Start();
 
-                Console.WriteLine($"✅ SSH tunnel established on {localBindHost}:{localBindPort} → {remoteDbHost}:{remoteDbPort}");
+                // Sockets pooled through the previous forward are dead once it is
+                // torn down, so drop them rather than handing them to a request.
+                NpgsqlConnection.ClearAllPools();
+
+                _connected = true;
+                _connectedSince = DateTimeOffset.UtcNow;
+                delayMs = backoffMs;
+                _logger.LogInformation("SSH tunnel established: {Endpoint}", _endpoint);
                 if (!_tunnelReady.Task.IsCompleted)
                     _tunnelReady.SetResult(); // signal readiness once
 
@@ -117,7 +183,8 @@ public class SshTunnelService : IHostedService, IDisposable
                     await Task.Delay(1000, ct);
                 }
 
-                Console.WriteLine("⚠️ Tunnel no longer active; will reconnect…");
+                if (!ct.IsCancellationRequested)
+                    _logger.LogWarning("SSH tunnel no longer active; reconnecting");
             }
             catch (OperationCanceledException)
             {
@@ -125,19 +192,32 @@ public class SshTunnelService : IHostedService, IDisposable
             }
             catch (Exception ex)
             {
-                Console.WriteLine("❌ Tunnel loop error: " + ex.Message);
+                RecordError(ex);
+                _logger.LogError(ex, "SSH tunnel could not be established ({KeySource})", _keySource);
                 if (!_tunnelReady.Task.IsCompleted)
                     _tunnelReady.SetException(ex);
             }
             finally
             {
+                _connected = false;
+                _connectedSince = null;
                 TearDown();
             }
 
-            // small backoff before retry
-            if (!ct.IsCancellationRequested)
-                await Task.Delay(backoffMs, ct);
+            if (ct.IsCancellationRequested) break;
+
+            // Back off so a rejecting or rate-limiting SSH host isn't hammered
+            // (repeated fast retries can get the whole instance banned).
+            try { await Task.Delay(delayMs, ct); } catch (OperationCanceledException) { break; }
+            delayMs = Math.Min(delayMs * 2, MaxBackoffMs);
         }
+    }
+
+    private void RecordError(Exception? ex)
+    {
+        if (ex is null) return;
+        _lastError = $"{ex.GetType().Name}: {ex.Message}";
+        _lastErrorAt = DateTimeOffset.UtcNow;
     }
 
     private void TearDown()
