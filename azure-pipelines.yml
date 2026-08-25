@@ -6,6 +6,10 @@
 trigger:
 - main
 
+# Only build on merges to main: a pull request build published a second
+# artifact, so every merge deployed twice.
+pr: none
+
 pool:
   vmImage: 'windows-latest'
 
