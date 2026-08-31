@@ -23,6 +23,8 @@ public interface IMovieProcessingJobRepository
     Task<List<string>> GetBoundaryFilenamesAsync(int movieId, CancellationToken cancellationToken);
 
     Task<List<string>> GetLiveImageFilenamesAsync(int movieId, CancellationToken cancellationToken);
+
+    Task<MovieMissingClipSummaryResponse> GetMissingClipSummaryAsync(int limit, CancellationToken cancellationToken);
 }
 
 public class MovieProcessingJobRepository : IMovieProcessingJobRepository
@@ -215,6 +217,78 @@ LIMIT @limit;";
         }
 
         return movieIds;
+    }
+
+    public async Task<MovieMissingClipSummaryResponse> GetMissingClipSummaryAsync(
+    int limit,
+    CancellationToken cancellationToken)
+    {
+        const string sql = @"
+WITH clips AS (
+    SELECT DISTINCT i.movieid, i.randid
+    FROM frl.frl_images i
+    JOIN frl.frl_imagehistory h
+      ON h.imageid = i.idnum
+     AND h.action = 'Shot Time Autodetected'
+    WHERE i.status = 'live'
+      AND i.movieid IS NOT NULL
+      AND i.movieid > 0
+      AND i.randid IS NOT NULL
+),
+agg AS (
+    SELECT
+        c.movieid,
+        COUNT(*) AS live_images,
+        COUNT(*) FILTER (WHERE s.filename IS NULL) AS missing
+    FROM clips c
+    LEFT JOIN frl.frl_image_scene_boundaries s
+      ON s.movieid = c.movieid
+     AND s.filename = c.randid
+    GROUP BY c.movieid
+    HAVING COUNT(*) FILTER (WHERE s.filename IS NULL) > 0
+)
+SELECT
+    a.movieid,
+    a.live_images,
+    a.missing,
+    EXISTS (
+        SELECT 1
+        FROM frl.frl_movie_processing_jobs j
+        WHERE j.movieid = a.movieid
+          AND j.status = 'Completed'
+    ) AS has_completed_job,
+    (COUNT(*) OVER ())::int AS total_movies,
+    (SUM(a.missing) OVER ())::bigint AS total_missing
+FROM agg a
+ORDER BY a.missing DESC, a.movieid
+LIMIT @limit;";
+
+        var response = new MovieMissingClipSummaryResponse();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 600;
+        cmd.Parameters.AddWithValue("limit", limit <= 0 ? int.MaxValue : limit);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            response.TotalMovies = reader.GetInt32(4);
+            response.TotalMissingBoundaries = reader.GetInt64(5);
+
+            response.Movies.Add(new MovieMissingClipSummary
+            {
+                MovieId = reader.GetInt32(0),
+                LiveImages = (int)reader.GetInt64(1),
+                MissingBoundaries = (int)reader.GetInt64(2),
+                HasCompletedJob = reader.GetBoolean(3)
+            });
+        }
+
+        return response;
     }
 
     public async Task<List<string>> GetBoundaryFilenamesAsync(

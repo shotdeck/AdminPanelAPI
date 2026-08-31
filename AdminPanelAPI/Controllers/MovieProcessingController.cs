@@ -140,6 +140,20 @@ SELECT
         }
 
         /// <summary>
+        /// Reports every movie that still has live images without a scene boundary,
+        /// worst first, along with the totals across all movies.
+        /// </summary>
+        [HttpGet("missing-clips-summary")]
+        public async Task<IActionResult> GetMissingClipsSummary(
+            [FromQuery] int limit = 100,
+            CancellationToken cancellationToken = default)
+        {
+            var summary = await _jobRepository.GetMissingClipSummaryAsync(limit, cancellationToken);
+
+            return Ok(summary);
+        }
+
+        /// <summary>
         /// Queues movies that completed the pipeline but still have images without
         /// a scene boundary, so only the missed clips get scene detection.
         /// </summary>
