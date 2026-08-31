@@ -347,13 +347,13 @@ LIMIT @limit;";
 
                             // Hierarchy inference: backfill missing parent levels
                             // from existing DB data when a child level is known
-                            if (cityName != null && countryId == null && correctedCountry == null)
+                            if (cityName != null && countryId == null && string.IsNullOrWhiteSpace(correctedCountry))
                             {
                                 var cityLower = cityName.ToLowerInvariant();
                                 if (cityHierarchy.TryGetValue(cityLower, out var ch))
                                 {
                                     countryId ??= ch.CountryId;
-                                    correctedCountry ??= ch.CountryName;
+                                    if (string.IsNullOrWhiteSpace(correctedCountry)) correctedCountry = ch.CountryName;
                                     continentId ??= ch.ContinentId;
                                     planetId ??= ch.PlanetId;
                                     if (regionName == null && ch.RegionId.HasValue)
@@ -365,13 +365,13 @@ LIMIT @limit;";
                                     }
                                 }
                             }
-                            else if (regionName != null && countryId == null && correctedCountry == null)
+                            else if (regionName != null && countryId == null && string.IsNullOrWhiteSpace(correctedCountry))
                             {
                                 var regionLower = regionName.ToLowerInvariant();
                                 if (regionHierarchy.TryGetValue(regionLower, out var rh))
                                 {
                                     countryId ??= rh.CountryId;
-                                    correctedCountry ??= rh.CountryName;
+                                    if (string.IsNullOrWhiteSpace(correctedCountry)) correctedCountry = rh.CountryName;
                                     continentId ??= rh.ContinentId;
                                     planetId ??= rh.PlanetId;
                                 }
