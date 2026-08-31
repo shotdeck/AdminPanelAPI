@@ -10,17 +10,20 @@ namespace AdminPanelAPI.Controllers
     {
         private readonly IMovieProcessingJobRepository _jobRepository;
         private readonly IMovieJobQueue _jobQueue;
+        private readonly IMovieProcessingService _processingService;
         private readonly IConfiguration _configuration;
         private readonly NpgsqlConnection _connection;
 
         public MovieProcessingController(
             IMovieProcessingJobRepository jobRepository,
             IMovieJobQueue jobQueue,
+            IMovieProcessingService processingService,
             NpgsqlConnection connection,
             IConfiguration configuration)
         {
             _jobRepository = jobRepository;
             _jobQueue = jobQueue;
+            _processingService = processingService;
             _configuration = configuration;
             _connection = connection;
         }
@@ -96,12 +99,17 @@ SELECT
             int movieId,
             [FromQuery] double threshold = 0.7,
             [FromQuery] bool overwrite = false,
+            [FromQuery] bool missingOnly = false,
             CancellationToken cancellationToken = default)
         {
+            if (overwrite && missingOnly)
+                return BadRequest(new { error = "overwrite and missingOnly cannot both be set." });
+
             var jobId = await _jobRepository.CreateJobAsync(
                 movieId,
                 threshold,
                 overwrite,
+                missingOnly,
                 cancellationToken);
 
             await _jobQueue.QueueJobAsync(jobId, cancellationToken);
@@ -112,7 +120,70 @@ SELECT
                 movieId,
                 threshold,
                 overwrite,
+                missingOnly,
                 status = "Queued"
+            });
+        }
+
+        /// <summary>
+        /// Reports which clips of an already processed movie still have no scene
+        /// boundary, and which live images have no clip in R2 at all.
+        /// </summary>
+        [HttpGet("missing-clips/{movieId:int}")]
+        public async Task<IActionResult> GetMissingClips(
+            int movieId,
+            CancellationToken cancellationToken = default)
+        {
+            var report = await _processingService.GetMissingClipReportAsync(movieId, cancellationToken);
+
+            return Ok(report);
+        }
+
+        /// <summary>
+        /// Queues movies that completed the pipeline but still have images without
+        /// a scene boundary, so only the missed clips get scene detection.
+        /// </summary>
+        [HttpPost("reprocess-missing-batch")]
+        public async Task<IActionResult> ReprocessMissingBatch(
+            [FromQuery] int count = 50,
+            [FromQuery] double threshold = 0.7,
+            CancellationToken cancellationToken = default)
+        {
+            if (count <= 0)
+                return BadRequest(new { error = "count must be greater than 0" });
+
+            var movieIds = await _jobRepository.GetMovieIdsWithMissingClipsAsync(
+                count,
+                cancellationToken);
+
+            var jobs = new List<object>();
+
+            foreach (var movieId in movieIds)
+            {
+                var jobId = await _jobRepository.CreateJobAsync(
+                    movieId,
+                    threshold,
+                    false,
+                    true,
+                    cancellationToken);
+
+                await _jobQueue.QueueJobAsync(jobId, cancellationToken);
+
+                jobs.Add(new
+                {
+                    jobId,
+                    movieId,
+                    status = "Queued"
+                });
+            }
+
+            return Ok(new
+            {
+                requested = count,
+                queued = jobs.Count,
+                threshold,
+                missingOnly = true,
+                jobs
             });
         }
 
@@ -140,6 +211,7 @@ SELECT
                     movieId,
                     threshold,
                     overwrite,
+                    false,
                     cancellationToken);
 
                 await _jobQueue.QueueJobAsync(jobId, cancellationToken);
