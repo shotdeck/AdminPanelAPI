@@ -6,6 +6,7 @@
         public int MovieId { get; set; }
         public double Threshold { get; set; }
         public bool Overwrite { get; set; }
+        public bool MissingOnly { get; set; }
 
         public string Status { get; set; } = "";
         public string? CurrentStep { get; set; }
