@@ -230,6 +230,18 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
+        /// Return how many transcript words a movie currently has.
+        /// </summary>
+        [HttpGet("word-count/{movieId:int}")]
+        public async Task<IActionResult> GetWordCount(
+            int movieId,
+            CancellationToken cancellationToken = default)
+        {
+            var wordCount = await _jobRepository.GetMovieWordCountAsync(movieId, cancellationToken);
+            return Ok(new { movieId, wordCount });
+        }
+
+        /// <summary>
         /// Queue a batch of untranscribed movies for dialogue transcription.
         /// </summary>
         [HttpPost("transcribe-batch")]
