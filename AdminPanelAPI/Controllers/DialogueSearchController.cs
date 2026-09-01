@@ -96,6 +96,36 @@ namespace AdminPanelAPI.Controllers
             return await UploadToR2AndQueueAsync(movieId.Value, file, transcribe, cancellationToken);
         }
 
+        /// <summary>
+        /// Resolve the movie id from a file name without uploading the file.
+        /// Lets the client fail fast (before sending a multi-GB upload) when the
+        /// name can't be parsed or no matching movie exists in frl_movies.
+        /// </summary>
+        [HttpGet("resolve-movie")]
+        public async Task<IActionResult> ResolveMovieFromFileName(
+            [FromQuery] string fileName,
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(fileName))
+                return BadRequest(new { error = "No file name provided." });
+
+            if (!TryParseTitleAndYear(fileName, out var title, out var year))
+                return BadRequest(new
+                {
+                    error = $"Could not parse a title and year from file name '{fileName}'. " +
+                            "Expected a name like 'The Boss Baby (2017)_BR.HD.01_SF.mp4'."
+                });
+
+            var movieId = await LookupMovieIdAsync(title, year, cancellationToken);
+            if (movieId == null)
+                return NotFound(new
+                {
+                    error = $"No movie found in frl_movies matching title '{title}' and year {year}."
+                });
+
+            return Ok(new { movieId = movieId.Value, title, year });
+        }
+
         private async Task<IActionResult> UploadToR2AndQueueAsync(
             int movieId,
             IFormFile file,
