@@ -342,8 +342,9 @@ ORDER BY media_type::text;";
         // ── POST /api/admin/camera-movements/login ─────────────────────
         // Per-reviewer login: pick a name + enter that reviewer's password.
         // Admins authenticate against the CAMERAMOVEMENTPASSWORD app setting
-        // (changeable in Azure); everyone else against their PBKDF2 hash that
-        // an admin set. Never stores or returns the plaintext password.
+        // (changeable in Azure) or their own stored password when one is set;
+        // everyone else against their PBKDF2 hash that an admin set. Never
+        // stores or returns the plaintext password.
         [HttpPost("login")]
         [ProducesResponseType(typeof(LoginResponse), StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status401Unauthorized)]
@@ -387,12 +388,13 @@ ORDER BY media_type::text;";
             if (isAdmin)
             {
                 var expected = _configuration["CAMERAMOVEMENTPASSWORD"];
-                if (string.IsNullOrEmpty(expected))
+                if (string.IsNullOrEmpty(expected) && string.IsNullOrEmpty(hash))
                     return StatusCode(StatusCodes.Status503ServiceUnavailable,
                         new LoginResponse { Ok = false, Error = "Admin password not configured." });
-                ok = CryptographicOperations.FixedTimeEquals(
-                    Encoding.UTF8.GetBytes(password),
-                    Encoding.UTF8.GetBytes(expected));
+                ok = (!string.IsNullOrEmpty(expected) && CryptographicOperations.FixedTimeEquals(
+                        Encoding.UTF8.GetBytes(password),
+                        Encoding.UTF8.GetBytes(expected))) ||
+                    (!string.IsNullOrEmpty(hash) && VerifyHashedPassword(password, hash));
             }
             else
             {
