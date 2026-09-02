@@ -347,6 +347,34 @@ WHERE idnum = ANY(@ids);";
             }
         }
 
+        /// <summary>
+        /// Which video copies each movie folder holds, so the tagging page can
+        /// tell an HD-only movie ("HD Uploaded") from one whose SF proxy exists
+        /// ("SF Created"), and knows which file a tagger has to watch.
+        /// </summary>
+        [HttpGet("movie-variants")]
+        [ProducesResponseType(typeof(IEnumerable<MovieVariantsDto>), StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetMovieVariants(
+            [FromQuery] string? ids, CancellationToken ct = default)
+        {
+            var movieIds = (ids ?? "")
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(part => int.TryParse(part, out var id) ? id : (int?)null)
+                .Where(id => id.HasValue)
+                .Select(id => id!.Value)
+                .Distinct()
+                .Take(200)
+                .ToArray();
+
+            if (movieIds.Length == 0)
+                return Ok(new { movies = Array.Empty<MovieVariantsDto>() });
+
+            return await GuardAsync(async () => new
+            {
+                movies = await _storage.GetMovieVariantsAsync(movieIds, ct)
+            });
+        }
+
         /// <summary>The HandBrake presets the transcode app offers, for the dropdown.</summary>
         [HttpGet("transcode/presets")]
         public async Task<IActionResult> GetTranscodePresets(CancellationToken ct = default) =>
