@@ -54,6 +54,18 @@ namespace AdminPanelAPI.Models
         public string StagingRoot { get; set; } = "";
     }
 
+    /// <summary>
+    /// Which video copies a movie's folder holds, which is what decides whether
+    /// the movie is at the "HD Uploaded" or "SF Created" stage of tagging, and
+    /// where the HD file a tagger has to watch lives.
+    /// </summary>
+    public sealed class MovieVariantsDto
+    {
+        public int MovieId { get; set; }
+        public string? HdKey { get; set; }
+        public string? SlimKey { get; set; }
+    }
+
     public sealed class CreateFolderRequest
     {
         public string Prefix { get; set; } = "";

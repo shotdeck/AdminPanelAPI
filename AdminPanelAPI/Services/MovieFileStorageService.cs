@@ -20,6 +20,9 @@ namespace AdminPanelAPI.Services
         Task<MovieFileListResponse> ListAsync(
             string prefix, bool mp4Only, string? continuationToken, int pageSize, CancellationToken ct);
 
+        Task<IReadOnlyList<MovieVariantsDto>> GetMovieVariantsAsync(
+            IEnumerable<int> movieIds, CancellationToken ct);
+
         Task CreateFolderAsync(string prefix, CancellationToken ct);
 
         Task<PresignedUploadResponse> CreateSingleUploadAsync(
@@ -63,6 +66,10 @@ namespace AdminPanelAPI.Services
 
         private const int PresignedUrlExpiryMinutes = 60;
         private const int MaxListPageSize = 1000;
+        private const int VariantLookupConcurrency = 8;
+
+        private static readonly string[] VideoExtensions =
+            { ".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".ts", ".mxf", ".mpg", ".mpeg" };
 
         private static readonly Regex HdPattern =
             new(@"(^|[^a-z0-9])(hd|1080p?|2160p?|4k|uhd)([^a-z0-9]|$)",
@@ -160,6 +167,76 @@ namespace AdminPanelAPI.Services
                 NextToken = response.IsTruncated == true ? response.NextContinuationToken : null,
                 StagingRoot = StagingRoot
             };
+        }
+
+        /// <summary>
+        /// The HD and slimmed video each movie folder holds, if any. One listing
+        /// per movie, run a few at a time: the tagging page asks for a page of
+        /// movies at once and only needs the folder's own files.
+        /// </summary>
+        public async Task<IReadOnlyList<MovieVariantsDto>> GetMovieVariantsAsync(
+            IEnumerable<int> movieIds, CancellationToken ct)
+        {
+            var ids = movieIds.Distinct().ToArray();
+            var results = new MovieVariantsDto[ids.Length];
+
+            using var gate = new SemaphoreSlim(VariantLookupConcurrency);
+            await Task.WhenAll(ids.Select(async (id, index) =>
+            {
+                await gate.WaitAsync(ct);
+                try
+                {
+                    results[index] = await GetMovieVariantsAsync(id, ct);
+                }
+                finally
+                {
+                    gate.Release();
+                }
+            }));
+
+            return results;
+        }
+
+        private async Task<MovieVariantsDto> GetMovieVariantsAsync(int movieId, CancellationToken ct)
+        {
+            var summary = new MovieVariantsDto { MovieId = movieId };
+            var prefix = movieId.ToString() + "/";
+            string? token = null;
+
+            do
+            {
+                var response = await _client.ListObjectsV2Async(new ListObjectsV2Request
+                {
+                    BucketName = _bucketName,
+                    Prefix = prefix,
+                    Delimiter = "/",
+                    MaxKeys = MaxListPageSize,
+                    ContinuationToken = token
+                }, ct);
+
+                foreach (var obj in response.S3Objects ?? new List<S3Object>())
+                {
+                    var name = obj.Key[prefix.Length..];
+                    if (name.Length == 0 || !IsVideoFile(name))
+                        continue;
+
+                    switch (DetectVariant(name))
+                    {
+                        case MovieFileVariant.Slim:
+                            summary.SlimKey ??= obj.Key;
+                            break;
+                        case MovieFileVariant.Hd:
+                        case MovieFileVariant.Unknown:
+                            summary.HdKey ??= obj.Key;
+                            break;
+                    }
+                }
+
+                token = response.IsTruncated == true ? response.NextContinuationToken : null;
+            }
+            while (token != null && (summary.HdKey == null || summary.SlimKey == null));
+
+            return summary;
         }
 
         public async Task CreateFolderAsync(string prefix, CancellationToken ct)
@@ -438,6 +515,9 @@ namespace AdminPanelAPI.Services
         }
 
         // ── Keys, names and variants ───────────────────────────────────
+
+        public static bool IsVideoFile(string fileName) =>
+            VideoExtensions.Any(ext => fileName.EndsWith(ext, StringComparison.OrdinalIgnoreCase));
 
         public static MovieFileVariant DetectVariant(string fileName)
         {
