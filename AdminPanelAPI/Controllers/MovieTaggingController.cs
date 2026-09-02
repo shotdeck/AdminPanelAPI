@@ -39,6 +39,9 @@ namespace ShotDeckSearch.Controllers
         /// <summary>Playback this close to the end counts as watched through.</summary>
         private const int WatchedToleranceSeconds = 15;
 
+        /// <summary>Ceiling for a captured frame's preview data URI.</summary>
+        private const int MaxThumbnailCharacters = 400_000;
+
         private readonly NpgsqlConnection _connection;
 
         public MovieTaggingController(NpgsqlConnection connection)
@@ -65,6 +68,14 @@ namespace ShotDeckSearch.Controllers
         {
             public double PositionSeconds { get; set; }
             public double DurationSeconds { get; set; }
+            public string? ActingUser { get; set; }
+        }
+
+        public sealed class KeyImageRequest
+        {
+            public int MovieId { get; set; }
+            public double PositionSeconds { get; set; }
+            public string? Thumbnail { get; set; }
             public string? ActingUser { get; set; }
         }
 
@@ -315,6 +326,117 @@ RETURNING watch_position_seconds, watch_duration_seconds, status;";
             });
         }
 
+        /// <summary>Frames the tagger picked out of a movie, earliest first.</summary>
+        [HttpGet("key-images")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetKeyImages(
+            [FromQuery] int movieId, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            const string sql = @"
+SELECT id, movie_id, position_seconds, thumbnail, captured_by, created_at
+FROM frl.frl_movie_key_images
+WHERE movie_id = @movieId
+ORDER BY position_seconds;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+
+            var images = new List<object>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                images.Add(new
+                {
+                    id = reader.GetInt64(0),
+                    movieId = reader.GetInt32(1),
+                    positionSeconds = (double)reader.GetDecimal(2),
+                    thumbnail = reader.IsDBNull(3) ? null : reader.GetString(3),
+                    capturedBy = reader.IsDBNull(4) ? null : reader.GetString(4),
+                    createdAt = reader.GetDateTime(5)
+                });
+            }
+
+            return Ok(new { images });
+        }
+
+        /// <summary>
+        /// Keep a frame the tagger picked. The timestamp is what will be cut
+        /// from the master later; the thumbnail is only the preview, so picking
+        /// the same frame twice just refreshes it.
+        /// </summary>
+        [HttpPost("key-images")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        public async Task<IActionResult> AddKeyImage(
+            [FromBody] KeyImageRequest request, CancellationToken ct = default)
+        {
+            var actingUser = (request.ActingUser ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(actingUser))
+                return BadRequest(new { error = "actingUser is required." });
+            if (request.PositionSeconds < 0)
+                return BadRequest(new { error = "positionSeconds must not be negative." });
+            if (request.Thumbnail != null && request.Thumbnail.Length > MaxThumbnailCharacters)
+                return BadRequest(new { error = "thumbnail is too large." });
+
+            await EnsureReadyAsync(ct);
+            if (!await CanCaptureAsync(request.MovieId, actingUser, ct))
+                return StatusCode(403, new { error = "That movie is not allocated to you." });
+
+            const string sql = @"
+INSERT INTO frl.frl_movie_key_images (movie_id, position_seconds, thumbnail, captured_by)
+VALUES (@movieId, @position, @thumbnail, @actingUser)
+ON CONFLICT (movie_id, position_seconds) DO UPDATE
+    SET thumbnail = COALESCE(EXCLUDED.thumbnail, frl.frl_movie_key_images.thumbnail),
+        captured_by = EXCLUDED.captured_by
+RETURNING id, created_at;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", request.MovieId);
+            cmd.Parameters.AddWithValue("@position", Math.Round((decimal)request.PositionSeconds, 3));
+            cmd.Parameters.AddWithValue("@thumbnail", (object?)request.Thumbnail ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@actingUser", actingUser);
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            await reader.ReadAsync(ct);
+            return Ok(new
+            {
+                id = reader.GetInt64(0),
+                movieId = request.MovieId,
+                positionSeconds = request.PositionSeconds,
+                capturedBy = actingUser,
+                createdAt = reader.GetDateTime(1)
+            });
+        }
+
+        /// <summary>Drop a frame the tagger picked by mistake.</summary>
+        [HttpDelete("key-images/{id:long}")]
+        [ProducesResponseType(StatusCodes.Status204NoContent)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        public async Task<IActionResult> DeleteKeyImage(
+            long id, [FromQuery] string? actingUser = null, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            const string movieSql =
+                "SELECT movie_id FROM frl.frl_movie_key_images WHERE id = @id;";
+            await using (var lookup = new NpgsqlCommand(movieSql, _connection))
+            {
+                lookup.Parameters.AddWithValue("@id", id);
+                if (await lookup.ExecuteScalarAsync(ct) is not int movieId)
+                    return NoContent();
+                if (!await CanCaptureAsync(movieId, (actingUser ?? "").Trim(), ct))
+                    return StatusCode(403, new { error = "That movie is not allocated to you." });
+            }
+
+            const string sql = "DELETE FROM frl.frl_movie_key_images WHERE id = @id;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@id", id);
+            await cmd.ExecuteNonQueryAsync(ct);
+            return NoContent();
+        }
+
         /// <summary>Remove an allocation, putting the movie back in the pool.</summary>
         [HttpDelete("assignments/{movieId:int}")]
         [ProducesResponseType(StatusCodes.Status204NoContent)]
@@ -406,9 +528,34 @@ SET status = 'movie_watched', watched_at = COALESCE(watched_at, updated_at)
 WHERE status = 'done';
 UPDATE frl.frl_movie_tagger_assignments
 SET status = 'tagger_allocated'
-WHERE status IN ('not_started', 'in_progress');";
+WHERE status IN ('not_started', 'in_progress');
+CREATE TABLE IF NOT EXISTS frl.frl_movie_key_images (
+    id               BIGSERIAL     PRIMARY KEY,
+    movie_id         INTEGER       NOT NULL,
+    position_seconds NUMERIC(10,3) NOT NULL,
+    thumbnail        TEXT,
+    captured_by      VARCHAR(120),
+    created_at       TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_fmki_movie_position
+    ON frl.frl_movie_key_images (movie_id, position_seconds);";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        /// <summary>Admins, and the tagger the movie is allocated to, may pick frames.</summary>
+        private async Task<bool> CanCaptureAsync(int movieId, string actingUser, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(actingUser)) return false;
+            if (await IsAdminAsync(actingUser, ct)) return true;
+
+            const string sql = @"
+SELECT 1 FROM frl.frl_movie_tagger_assignments
+WHERE movie_id = @movieId AND lower(tagger) = lower(@actingUser) LIMIT 1;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@actingUser", actingUser);
+            return await cmd.ExecuteScalarAsync(ct) != null;
         }
 
         private async Task<bool> IsAdminAsync(string? name, CancellationToken ct)
