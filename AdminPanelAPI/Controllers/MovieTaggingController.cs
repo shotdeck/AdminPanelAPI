@@ -101,6 +101,7 @@ namespace ShotDeckSearch.Controllers
         {
             public int MovieId { get; set; }
             public double PositionSeconds { get; set; }
+            public int? FrameNumber { get; set; }
             public string? Thumbnail { get; set; }
             public string? ActingUser { get; set; }
         }
@@ -422,10 +423,12 @@ ORDER BY position_seconds;";
                 return StatusCode(403, new { error = "That movie is not allocated to you." });
 
             const string sql = @"
-INSERT INTO frl.frl_movie_key_images (movie_id, position_seconds, thumbnail, captured_by)
-VALUES (@movieId, @position, @thumbnail, @actingUser)
+INSERT INTO frl.frl_movie_key_images
+    (movie_id, position_seconds, frame_number, thumbnail, captured_by)
+VALUES (@movieId, @position, @frame, @thumbnail, @actingUser)
 ON CONFLICT (movie_id, position_seconds) DO UPDATE
     SET thumbnail = COALESCE(EXCLUDED.thumbnail, frl.frl_movie_key_images.thumbnail),
+        frame_number = COALESCE(EXCLUDED.frame_number, frl.frl_movie_key_images.frame_number),
         captured_by = EXCLUDED.captured_by,
         source = 'tagger',
         decision = 'kept'
@@ -434,6 +437,7 @@ RETURNING id, created_at;";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", request.MovieId);
             cmd.Parameters.AddWithValue("@position", Math.Round((decimal)request.PositionSeconds, 3));
+            cmd.Parameters.AddWithValue("@frame", (object?)request.FrameNumber ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@thumbnail", (object?)request.Thumbnail ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@actingUser", actingUser);
 
@@ -444,6 +448,7 @@ RETURNING id, created_at;";
                 id = reader.GetInt64(0),
                 movieId = request.MovieId,
                 positionSeconds = request.PositionSeconds,
+                frameNumber = request.FrameNumber,
                 capturedBy = actingUser,
                 createdAt = reader.GetDateTime(1)
             });
