@@ -562,8 +562,9 @@ RETURNING id, created_at;";
         }
 
         /// <summary>
-        /// Proposals still waiting on the tagger, best first. Each carries the
-        /// master frame number the still will eventually be cut at.
+        /// Proposals still waiting on the tagger, in the order they appear in
+        /// the film. Each carries the master frame number the still will
+        /// eventually be cut at.
         /// </summary>
         [HttpGet("key-image-proposals")]
         [ProducesResponseType(StatusCodes.Status200OK)]
@@ -579,7 +580,7 @@ RETURNING id, created_at;";
 SELECT id, position_seconds, frame_number, score, image_key, created_at
 FROM frl.frl_movie_key_images
 WHERE movie_id = @movieId AND decision = 'proposed'
-ORDER BY score DESC NULLS LAST, position_seconds
+ORDER BY position_seconds
 LIMIT @limit OFFSET @offset;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -725,11 +726,55 @@ ON CONFLICT (movie_id, position_seconds) DO NOTHING;";
             return await CountProposalsAsync(movieId, ct);
         }
 
+        /// <summary>
+        /// Columns that would hold prose about the film, best first. Which of
+        /// them frl_movies actually has varies, so it is discovered once and
+        /// whichever exists is appended to the title.
+        /// </summary>
+        private static readonly string[] DescriptionColumns =
+        {
+            "synopsis", "overview", "plot", "description", "logline", "summary", "tagline"
+        };
+
+        private static string? _descriptionColumn;
+        private static bool _descriptionColumnKnown;
+
+        /// <summary>The prose column frl_movies has, or null if it has none.</summary>
+        private async Task<string?> DescriptionColumnAsync(CancellationToken ct)
+        {
+            if (_descriptionColumnKnown)
+                return _descriptionColumn;
+
+            const string sql = @"
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'frl' AND table_name = 'frl_movies'
+  AND column_name = ANY(@names)
+  AND data_type IN ('text', 'character varying', 'character');";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@names", DescriptionColumns);
+
+            var found = new List<string>();
+            await using (var reader = await cmd.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                    found.Add(reader.GetString(0));
+            }
+
+            _descriptionColumn = DescriptionColumns.FirstOrDefault(found.Contains);
+            _descriptionColumnKnown = true;
+            return _descriptionColumn;
+        }
+
         /// <summary>What the film is, for scoring how relevant a frame is to it.</summary>
         private async Task<string?> MovieDescriptionAsync(int movieId, CancellationToken ct)
         {
-            const string sql =
-                "SELECT title, year FROM frl.frl_movies WHERE idnum = @movieId LIMIT 1;";
+            var prose = await DescriptionColumnAsync(ct);
+            var sql = prose == null
+                ? "SELECT title, year, NULL FROM frl.frl_movies WHERE idnum = @movieId LIMIT 1;"
+                : $"SELECT title, year, \"{prose}\" FROM frl.frl_movies WHERE idnum = @movieId LIMIT 1;";
+
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
 
@@ -738,7 +783,14 @@ ON CONFLICT (movie_id, position_seconds) DO NOTHING;";
                 return null;
 
             var title = reader.GetString(0);
-            return reader.IsDBNull(1) ? title : $"{title} ({reader.GetValue(1)})";
+            if (!reader.IsDBNull(1))
+                title = $"{title} ({reader.GetValue(1)})";
+
+            if (reader.IsDBNull(2))
+                return title;
+
+            var text = reader.GetString(2).Trim();
+            return text.Length == 0 ? title : $"{title}. {text}";
         }
 
         /// <summary>Remove an allocation, putting the movie back in the pool.</summary>
