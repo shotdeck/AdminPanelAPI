@@ -86,6 +86,7 @@ namespace ShotDeckSearch.Controllers
         public sealed class AnalysisRequest
         {
             public int MovieId { get; set; }
+            public string? Description { get; set; }
             public string? ActingUser { get; set; }
         }
 
@@ -499,9 +500,26 @@ RETURNING id, created_at;";
             if (string.IsNullOrWhiteSpace(sourceKey))
                 return BadRequest(new { error = "That movie has no SF proxy to analyse yet." });
 
+            var description = (request.Description ?? "").Trim();
+            if (description.Length == 0)
+                description = await MovieDescriptionAsync(request.MovieId, ct) ?? "";
+
             var result = await _analysis.StartAsync(
-                sourceKey, request.MovieId, await MovieDescriptionAsync(request.MovieId, ct), ct);
+                sourceKey, request.MovieId, description, ct);
             return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
+        }
+
+        /// <summary>
+        /// What the analysis will be told the film is, unless the tagger edits
+        /// it: frames are scored partly on how well they match this.
+        /// </summary>
+        [HttpGet("key-image-analysis/description")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetKeyImageDescription(
+            [FromQuery] int movieId, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+            return Ok(new { description = await MovieDescriptionAsync(movieId, ct) ?? "" });
         }
 
         /// <summary>
