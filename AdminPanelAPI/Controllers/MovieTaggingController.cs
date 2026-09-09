@@ -507,7 +507,7 @@ RETURNING id, created_at;";
 
             var description = (request.Description ?? "").Trim();
             if (description.Length == 0)
-                description = await MovieDescriptionAsync(request.MovieId, ct) ?? "";
+                description = (await MovieDescriptionAsync(request.MovieId, ct)).Description ?? "";
 
             var result = await _analysis.StartAsync(
                 sourceKey, request.MovieId, description, ct);
@@ -524,7 +524,13 @@ RETURNING id, created_at;";
             [FromQuery] int movieId, CancellationToken ct = default)
         {
             await EnsureReadyAsync(ct);
-            return Ok(new { description = await MovieDescriptionAsync(movieId, ct) ?? "" });
+            var (description, column) = await MovieDescriptionAsync(movieId, ct);
+            return Ok(new
+            {
+                description = description ?? "",
+                proseColumn = column,
+                proseColumnsAvailable = await DescriptionColumnsAsync(ct)
+            });
         }
 
         /// <summary>
@@ -732,33 +738,35 @@ ON CONFLICT (movie_id, position_seconds) DO NOTHING;";
         }
 
         /// <summary>
-        /// Columns that would hold prose about the film, best first. Which of
-        /// them frl_movies actually has varies, so it is discovered once and
-        /// whichever exists is appended to the title.
+        /// Name patterns for a column holding prose about the film. Guessing
+        /// exact names missed the one frl_movies actually uses, so every text
+        /// column whose name reads like a description is a candidate and the
+        /// longest value a film has among them is used.
         /// </summary>
-        private static readonly string[] DescriptionColumns =
+        private static readonly string[] DescriptionPatterns =
         {
-            "synopsis", "overview", "plot", "description", "logline", "summary", "tagline"
+            "%synops%", "%overview%", "%plot%", "%descript%", "%logline%",
+            "%summar%", "%story%", "%blurb%", "%tagline%", "%abstract%"
         };
 
-        private static string? _descriptionColumn;
-        private static bool _descriptionColumnKnown;
+        private static string[]? _descriptionColumns;
 
-        /// <summary>The prose column frl_movies has, or null if it has none.</summary>
-        private async Task<string?> DescriptionColumnAsync(CancellationToken ct)
+        /// <summary>The prose-ish text columns frl_movies actually has.</summary>
+        private async Task<string[]> DescriptionColumnsAsync(CancellationToken ct)
         {
-            if (_descriptionColumnKnown)
-                return _descriptionColumn;
+            if (_descriptionColumns != null)
+                return _descriptionColumns;
 
             const string sql = @"
 SELECT column_name
 FROM information_schema.columns
 WHERE table_schema = 'frl' AND table_name = 'frl_movies'
-  AND column_name = ANY(@names)
-  AND data_type IN ('text', 'character varying', 'character');";
+  AND data_type IN ('text', 'character varying', 'character')
+  AND column_name ILIKE ANY(@patterns)
+ORDER BY column_name;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@names", DescriptionColumns);
+            cmd.Parameters.AddWithValue("@patterns", DescriptionPatterns);
 
             var found = new List<string>();
             await using (var reader = await cmd.ExecuteReaderAsync(ct))
@@ -767,35 +775,46 @@ WHERE table_schema = 'frl' AND table_name = 'frl_movies'
                     found.Add(reader.GetString(0));
             }
 
-            _descriptionColumn = DescriptionColumns.FirstOrDefault(found.Contains);
-            _descriptionColumnKnown = true;
-            return _descriptionColumn;
+            _descriptionColumns = found.ToArray();
+            return _descriptionColumns;
         }
 
-        /// <summary>What the film is, for scoring how relevant a frame is to it.</summary>
-        private async Task<string?> MovieDescriptionAsync(int movieId, CancellationToken ct)
+        /// <summary>
+        /// What the film is, for scoring how relevant a frame is to it, plus
+        /// the column the prose came from so a missing synopsis can be told
+        /// apart from a column this never found.
+        /// </summary>
+        private async Task<(string? Description, string? Column)> MovieDescriptionAsync(
+            int movieId, CancellationToken ct)
         {
-            var prose = await DescriptionColumnAsync(ct);
-            var sql = prose == null
-                ? "SELECT title, year, NULL FROM frl.frl_movies WHERE idnum = @movieId LIMIT 1;"
-                : $"SELECT title, year, \"{prose}\" FROM frl.frl_movies WHERE idnum = @movieId LIMIT 1;";
+            var candidates = await DescriptionColumnsAsync(ct);
+            var columns = string.Concat(candidates.Select(c => $", \"{c}\""));
+            var sql = $"SELECT title, year{columns} FROM frl.frl_movies " +
+                "WHERE idnum = @movieId LIMIT 1;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
 
             await using var reader = await cmd.ExecuteReaderAsync(ct);
             if (!await reader.ReadAsync(ct) || reader.IsDBNull(0))
-                return null;
+                return (null, null);
 
             var title = reader.GetString(0);
             if (!reader.IsDBNull(1))
                 title = $"{title} ({reader.GetValue(1)})";
 
-            if (reader.IsDBNull(2))
-                return title;
+            var best = "";
+            string? from = null;
+            for (var i = 0; i < candidates.Length; i++)
+            {
+                if (reader.IsDBNull(i + 2)) continue;
+                var value = reader.GetString(i + 2).Trim();
+                if (value.Length <= best.Length) continue;
+                best = value;
+                from = candidates[i];
+            }
 
-            var text = reader.GetString(2).Trim();
-            return text.Length == 0 ? title : $"{title}. {text}";
+            return (best.Length == 0 ? title : $"{title}. {best}", from);
         }
 
         /// <summary>Remove an allocation, putting the movie back in the pool.</summary>
