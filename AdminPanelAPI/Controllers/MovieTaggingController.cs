@@ -738,6 +738,16 @@ ON CONFLICT (movie_id, position_seconds) DO NOTHING;";
         }
 
         /// <summary>
+        /// What the analysis looks for when a film has no synopsis stored: the
+        /// text a frame is matched against, phrased as the picture it should be
+        /// rather than as an instruction, since scoring is image/text similarity.
+        /// </summary>
+        private const string FrameCriteria =
+            "A cinematic, well-composed film still: sharp focus, strong " +
+            "lighting and colour, faces lit and eyes open, a moment that " +
+            "looks emblematic of the film.";
+
+        /// <summary>
         /// Name patterns for a column holding prose about the film. Guessing
         /// exact names missed the one frl_movies actually uses, so every text
         /// column whose name reads like a description is a candidate and the
@@ -814,7 +824,9 @@ ORDER BY column_name;";
                 from = candidates[i];
             }
 
-            return (best.Length == 0 ? title : $"{title}. {best}", from);
+            return (best.Length == 0
+                ? $"{title}. {FrameCriteria}"
+                : $"{title}. {best}", from);
         }
 
         /// <summary>Remove an allocation, putting the movie back in the pool.</summary>
