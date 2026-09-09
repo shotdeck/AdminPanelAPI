@@ -1,7 +1,9 @@
+using AdminPanelAPI.Services;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
 using System.Data;
+using System.Text.Json;
 
 namespace ShotDeckSearch.Controllers
 {
@@ -42,11 +44,21 @@ namespace ShotDeckSearch.Controllers
         /// <summary>Ceiling for a captured frame's preview data URI.</summary>
         private const int MaxThumbnailCharacters = 400_000;
 
-        private readonly NpgsqlConnection _connection;
+        /// <summary>How many proposals one page of the grid may ask for.</summary>
+        private const int MaxProposalPageSize = 500;
 
-        public MovieTaggingController(NpgsqlConnection connection)
+        private readonly NpgsqlConnection _connection;
+        private readonly IMovieFileStorageService _storage;
+        private readonly IKeyImageAnalysisService _analysis;
+
+        public MovieTaggingController(
+            NpgsqlConnection connection,
+            IMovieFileStorageService storage,
+            IKeyImageAnalysisService analysis)
         {
             _connection = connection;
+            _storage = storage;
+            _analysis = analysis;
         }
 
         public sealed class AssignRequest
@@ -68,6 +80,19 @@ namespace ShotDeckSearch.Controllers
         {
             public double PositionSeconds { get; set; }
             public double DurationSeconds { get; set; }
+            public string? ActingUser { get; set; }
+        }
+
+        public sealed class AnalysisRequest
+        {
+            public int MovieId { get; set; }
+            public string? ActingUser { get; set; }
+        }
+
+        public sealed class DecisionRequest
+        {
+            public long[]? Ids { get; set; }
+            public string? Decision { get; set; }
             public string? ActingUser { get; set; }
         }
 
@@ -326,7 +351,11 @@ RETURNING watch_position_seconds, watch_duration_seconds, status;";
             });
         }
 
-        /// <summary>Frames the tagger picked out of a movie, earliest first.</summary>
+        /// <summary>
+        /// The movie's kept frames, earliest first — the ones a tagger picked
+        /// while watching plus the proposals they kept. Proposals still waiting
+        /// on a decision are read from key-image-proposals instead.
+        /// </summary>
         [HttpGet("key-images")]
         [ProducesResponseType(StatusCodes.Status200OK)]
         public async Task<IActionResult> GetKeyImages(
@@ -335,9 +364,10 @@ RETURNING watch_position_seconds, watch_duration_seconds, status;";
             await EnsureReadyAsync(ct);
 
             const string sql = @"
-SELECT id, movie_id, position_seconds, thumbnail, captured_by, created_at
+SELECT id, movie_id, position_seconds, thumbnail, captured_by, created_at,
+       frame_number, source, score, image_key
 FROM frl.frl_movie_key_images
-WHERE movie_id = @movieId
+WHERE movie_id = @movieId AND decision = 'kept'
 ORDER BY position_seconds;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -347,6 +377,7 @@ ORDER BY position_seconds;";
             await using var reader = await cmd.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
+                var imageKey = reader.IsDBNull(9) ? null : reader.GetString(9);
                 images.Add(new
                 {
                     id = reader.GetInt64(0),
@@ -354,7 +385,12 @@ ORDER BY position_seconds;";
                     positionSeconds = (double)reader.GetDecimal(2),
                     thumbnail = reader.IsDBNull(3) ? null : reader.GetString(3),
                     capturedBy = reader.IsDBNull(4) ? null : reader.GetString(4),
-                    createdAt = reader.GetDateTime(5)
+                    createdAt = reader.GetDateTime(5),
+                    frameNumber = reader.IsDBNull(6) ? (int?)null : reader.GetInt32(6),
+                    source = reader.GetString(7),
+                    score = reader.IsDBNull(8) ? (double?)null : (double)reader.GetDecimal(8),
+                    imageKey,
+                    imageUrl = imageKey == null ? null : _storage.CreateDownloadUrl(imageKey, false)
                 });
             }
 
@@ -389,7 +425,9 @@ INSERT INTO frl.frl_movie_key_images (movie_id, position_seconds, thumbnail, cap
 VALUES (@movieId, @position, @thumbnail, @actingUser)
 ON CONFLICT (movie_id, position_seconds) DO UPDATE
     SET thumbnail = COALESCE(EXCLUDED.thumbnail, frl.frl_movie_key_images.thumbnail),
-        captured_by = EXCLUDED.captured_by
+        captured_by = EXCLUDED.captured_by,
+        source = 'tagger',
+        decision = 'kept'
 RETURNING id, created_at;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -435,6 +473,254 @@ RETURNING id, created_at;";
             cmd.Parameters.AddWithValue("@id", id);
             await cmd.ExecuteNonQueryAsync(ct);
             return NoContent();
+        }
+
+        /// <summary>
+        /// Start the analysis that proposes key frames for a watched movie. It
+        /// reads the movie's SF proxy, not the master, and takes minutes, so
+        /// this only hands back a job to poll.
+        /// </summary>
+        [HttpPost("key-image-analysis")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        public async Task<IActionResult> StartKeyImageAnalysis(
+            [FromBody] AnalysisRequest request, CancellationToken ct = default)
+        {
+            var actingUser = (request.ActingUser ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(actingUser))
+                return BadRequest(new { error = "actingUser is required." });
+
+            await EnsureReadyAsync(ct);
+            if (!await CanCaptureAsync(request.MovieId, actingUser, ct))
+                return StatusCode(403, new { error = "That movie is not allocated to you." });
+
+            var variants = await _storage.GetMovieVariantsAsync(new[] { request.MovieId }, ct);
+            var sourceKey = variants.FirstOrDefault()?.SlimKey;
+            if (string.IsNullOrWhiteSpace(sourceKey))
+                return BadRequest(new { error = "That movie has no SF proxy to analyse yet." });
+
+            var result = await _analysis.StartAsync(
+                sourceKey, request.MovieId, await MovieDescriptionAsync(request.MovieId, ct), ct);
+            return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
+        }
+
+        /// <summary>
+        /// How an analysis job is getting on. Once it finishes, its proposals
+        /// are pulled back and stored against the movie as undecided frames,
+        /// which is what the tagger's grid then reads.
+        /// </summary>
+        [HttpGet("key-image-analysis/{jobId}")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetKeyImageAnalysis(
+            string jobId, [FromQuery] int movieId, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            var stored = movieId > 0 ? await CountProposalsAsync(movieId, ct) : 0;
+            var wantProposals = movieId > 0 && stored == 0;
+
+            var result = await _analysis.GetJobAsync(jobId, wantProposals, ct);
+            if (!result.IsSuccess)
+                return StatusCode((int)result.Status, result.Body);
+
+            using var document = JsonDocument.Parse(result.Body);
+            var job = document.RootElement;
+            var status = job.TryGetProperty("status", out var value) ? value.GetString() : null;
+
+            if (wantProposals && status == "completed" &&
+                job.TryGetProperty("proposals", out var proposals) &&
+                proposals.ValueKind == JsonValueKind.Array)
+                stored = await StoreProposalsAsync(movieId, proposals, ct);
+
+            return Ok(new
+            {
+                jobId = job.TryGetProperty("jobId", out var id) ? id.GetString() : jobId,
+                status,
+                stage = job.TryGetProperty("stage", out var stage) ? stage.GetString() : null,
+                progress = job.TryGetProperty("progress", out var done) ? done.GetDouble() : 0,
+                error = job.TryGetProperty("error", out var error) ? error.GetString() : null,
+                proposed = stored
+            });
+        }
+
+        /// <summary>
+        /// Proposals still waiting on the tagger, best first. Each carries the
+        /// master frame number the still will eventually be cut at.
+        /// </summary>
+        [HttpGet("key-image-proposals")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetKeyImageProposals(
+            [FromQuery] int movieId,
+            [FromQuery] int limit = 120,
+            [FromQuery] int offset = 0,
+            CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            const string sql = @"
+SELECT id, position_seconds, frame_number, score, image_key, created_at
+FROM frl.frl_movie_key_images
+WHERE movie_id = @movieId AND decision = 'proposed'
+ORDER BY score DESC NULLS LAST, position_seconds
+LIMIT @limit OFFSET @offset;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, MaxProposalPageSize));
+            cmd.Parameters.AddWithValue("@offset", Math.Max(0, offset));
+
+            var proposals = new List<object>();
+            await using (var reader = await cmd.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                {
+                    var imageKey = reader.IsDBNull(4) ? null : reader.GetString(4);
+                    proposals.Add(new
+                    {
+                        id = reader.GetInt64(0),
+                        movieId,
+                        positionSeconds = (double)reader.GetDecimal(1),
+                        frameNumber = reader.IsDBNull(2) ? (int?)null : reader.GetInt32(2),
+                        score = reader.IsDBNull(3) ? (double?)null : (double)reader.GetDecimal(3),
+                        imageKey,
+                        imageUrl = imageKey == null ? null : _storage.CreateDownloadUrl(imageKey, false),
+                        createdAt = reader.GetDateTime(5)
+                    });
+                }
+            }
+
+            return Ok(new { proposals, total = await CountProposalsAsync(movieId, ct) });
+        }
+
+        /// <summary>
+        /// Keep or discard a selection of proposals. Discarding leaves the row
+        /// behind so the same frame is not proposed again; keeping turns it into
+        /// one of the movie's key images.
+        /// </summary>
+        [HttpPost("key-images/decide")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        public async Task<IActionResult> DecideKeyImages(
+            [FromBody] DecisionRequest request, CancellationToken ct = default)
+        {
+            var actingUser = (request.ActingUser ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(actingUser))
+                return BadRequest(new { error = "actingUser is required." });
+
+            var decision = (request.Decision ?? "").Trim().ToLowerInvariant();
+            if (decision is not ("kept" or "discarded"))
+                return BadRequest(new { error = "decision must be kept or discarded." });
+
+            var ids = (request.Ids ?? Array.Empty<long>()).Distinct().ToArray();
+            if (ids.Length == 0)
+                return BadRequest(new { error = "ids is required." });
+
+            await EnsureReadyAsync(ct);
+
+            const string movieSql =
+                "SELECT DISTINCT movie_id FROM frl.frl_movie_key_images WHERE id = ANY(@ids);";
+            var movieIds = new List<int>();
+            await using (var lookup = new NpgsqlCommand(movieSql, _connection))
+            {
+                lookup.Parameters.AddWithValue("@ids", ids);
+                await using var reader = await lookup.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                    movieIds.Add(reader.GetInt32(0));
+            }
+
+            foreach (var movieId in movieIds)
+                if (!await CanCaptureAsync(movieId, actingUser, ct))
+                    return StatusCode(403, new { error = "That movie is not allocated to you." });
+
+            const string sql = @"
+UPDATE frl.frl_movie_key_images
+SET decision = @decision, decided_by = @actingUser, decided_at = now()
+WHERE id = ANY(@ids);";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@ids", ids);
+            cmd.Parameters.AddWithValue("@decision", decision);
+            cmd.Parameters.AddWithValue("@actingUser", actingUser);
+            var affected = await cmd.ExecuteNonQueryAsync(ct);
+
+            var remaining = new Dictionary<int, int>();
+            foreach (var movieId in movieIds)
+                remaining[movieId] = await CountProposalsAsync(movieId, ct);
+
+            return Ok(new { decision, decided = affected, remaining });
+        }
+
+        /// <summary>Proposals for one movie the tagger has yet to decide on.</summary>
+        private async Task<int> CountProposalsAsync(int movieId, CancellationToken ct)
+        {
+            const string sql = @"
+SELECT count(*) FROM frl.frl_movie_key_images
+WHERE movie_id = @movieId AND decision = 'proposed';";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            return (int)(long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
+        }
+
+        /// <summary>
+        /// Put a finished job's proposals in the key image table as undecided
+        /// frames. A frame the tagger already picked by hand keeps its own row.
+        /// </summary>
+        private async Task<int> StoreProposalsAsync(
+            int movieId, JsonElement proposals, CancellationToken ct)
+        {
+            var positions = new List<decimal>();
+            var frames = new List<int>();
+            var scores = new List<decimal>();
+            var keys = new List<string>();
+
+            foreach (var proposal in proposals.EnumerateArray())
+            {
+                if (!proposal.TryGetProperty("imageKey", out var key) ||
+                    key.GetString() is not { Length: > 0 } imageKey)
+                    continue;
+
+                positions.Add(Math.Round(proposal.GetProperty("seconds").GetDecimal(), 3));
+                frames.Add(proposal.GetProperty("frame").GetInt32());
+                scores.Add(proposal.TryGetProperty("score", out var score) ? score.GetDecimal() : 0m);
+                keys.Add(imageKey);
+            }
+
+            if (positions.Count == 0)
+                return 0;
+
+            const string sql = @"
+INSERT INTO frl.frl_movie_key_images
+    (movie_id, position_seconds, frame_number, score, image_key, source, decision)
+SELECT @movieId, position, frame, score, image_key, 'ai', 'proposed'
+FROM unnest(@positions, @frames, @scores, @keys)
+    AS proposal(position, frame, score, image_key)
+ON CONFLICT (movie_id, position_seconds) DO NOTHING;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@positions", positions.ToArray());
+            cmd.Parameters.AddWithValue("@frames", frames.ToArray());
+            cmd.Parameters.AddWithValue("@scores", scores.ToArray());
+            cmd.Parameters.AddWithValue("@keys", keys.ToArray());
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            return await CountProposalsAsync(movieId, ct);
+        }
+
+        /// <summary>What the film is, for scoring how relevant a frame is to it.</summary>
+        private async Task<string?> MovieDescriptionAsync(int movieId, CancellationToken ct)
+        {
+            const string sql =
+                "SELECT title, year FROM frl.frl_movies WHERE idnum = @movieId LIMIT 1;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct) || reader.IsDBNull(0))
+                return null;
+
+            var title = reader.GetString(0);
+            return reader.IsDBNull(1) ? title : $"{title} ({reader.GetValue(1)})";
         }
 
         /// <summary>Remove an allocation, putting the movie back in the pool.</summary>
@@ -538,7 +824,17 @@ CREATE TABLE IF NOT EXISTS frl.frl_movie_key_images (
     created_at       TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_fmki_movie_position
-    ON frl.frl_movie_key_images (movie_id, position_seconds);";
+    ON frl.frl_movie_key_images (movie_id, position_seconds);
+ALTER TABLE frl.frl_movie_key_images
+    ADD COLUMN IF NOT EXISTS frame_number INTEGER,
+    ADD COLUMN IF NOT EXISTS source       VARCHAR(16)  NOT NULL DEFAULT 'tagger',
+    ADD COLUMN IF NOT EXISTS decision     VARCHAR(16)  NOT NULL DEFAULT 'kept',
+    ADD COLUMN IF NOT EXISTS score        NUMERIC(6,3),
+    ADD COLUMN IF NOT EXISTS image_key    TEXT,
+    ADD COLUMN IF NOT EXISTS decided_by   VARCHAR(120),
+    ADD COLUMN IF NOT EXISTS decided_at   TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_fmki_movie_decision
+    ON frl.frl_movie_key_images (movie_id, decision);";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
         }
