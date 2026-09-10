@@ -50,15 +50,18 @@ namespace ShotDeckSearch.Controllers
         private readonly NpgsqlConnection _connection;
         private readonly IMovieFileStorageService _storage;
         private readonly IKeyImageAnalysisService _analysis;
+        private readonly IFilmSynopsisService _synopsis;
 
         public MovieTaggingController(
             NpgsqlConnection connection,
             IMovieFileStorageService storage,
-            IKeyImageAnalysisService analysis)
+            IKeyImageAnalysisService analysis,
+            IFilmSynopsisService synopsis)
         {
             _connection = connection;
             _storage = storage;
             _analysis = analysis;
+            _synopsis = synopsis;
         }
 
         public sealed class AssignRequest
@@ -524,11 +527,12 @@ RETURNING id, created_at;";
             [FromQuery] int movieId, CancellationToken ct = default)
         {
             await EnsureReadyAsync(ct);
-            var (description, column) = await MovieDescriptionAsync(movieId, ct);
+            var (description, source) = await MovieDescriptionAsync(movieId, ct);
             return Ok(new
             {
                 description = description ?? "",
-                proseColumn = column,
+                proseColumn = source == WikipediaSource ? null : source,
+                proseSource = source,
                 proseColumnsAvailable = await DescriptionColumnsAsync(ct)
             });
         }
@@ -789,12 +793,17 @@ ORDER BY column_name;";
             return _descriptionColumns;
         }
 
+        /// <summary>Marks prose that came from Wikipedia rather than a column.</summary>
+        private const string WikipediaSource = "wikipedia";
+
         /// <summary>
         /// What the film is, for scoring how relevant a frame is to it, plus
-        /// the column the prose came from so a missing synopsis can be told
-        /// apart from a column this never found.
+        /// where the prose came from so a missing synopsis can be told apart
+        /// from a column this never found. frl_movies holds no synopsis today,
+        /// so a film's plot is looked up on Wikipedia; failing that, the text
+        /// falls back to the picture the analysis wants of any film.
         /// </summary>
-        private async Task<(string? Description, string? Column)> MovieDescriptionAsync(
+        private async Task<(string? Description, string? Source)> MovieDescriptionAsync(
             int movieId, CancellationToken ct)
         {
             var candidates = await DescriptionColumnsAsync(ct);
@@ -802,31 +811,42 @@ ORDER BY column_name;";
             var sql = $"SELECT title, year{columns} FROM frl.frl_movies " +
                 "WHERE idnum = @movieId LIMIT 1;";
 
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@movieId", movieId);
-
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            if (!await reader.ReadAsync(ct) || reader.IsDBNull(0))
-                return (null, null);
-
-            var title = reader.GetString(0);
-            if (!reader.IsDBNull(1))
-                title = $"{title} ({reader.GetValue(1)})";
-
+            string name;
+            int? year = null;
             var best = "";
             string? from = null;
-            for (var i = 0; i < candidates.Length; i++)
+
+            await using (var cmd = new NpgsqlCommand(sql, _connection))
             {
-                if (reader.IsDBNull(i + 2)) continue;
-                var value = reader.GetString(i + 2).Trim();
-                if (value.Length <= best.Length) continue;
-                best = value;
-                from = candidates[i];
+                cmd.Parameters.AddWithValue("@movieId", movieId);
+
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                if (!await reader.ReadAsync(ct) || reader.IsDBNull(0))
+                    return (null, null);
+
+                name = reader.GetString(0).Trim();
+                if (!reader.IsDBNull(1) &&
+                    int.TryParse(reader.GetValue(1)?.ToString(), out var stored))
+                    year = stored;
+
+                for (var i = 0; i < candidates.Length; i++)
+                {
+                    if (reader.IsDBNull(i + 2)) continue;
+                    var value = reader.GetString(i + 2).Trim();
+                    if (value.Length <= best.Length) continue;
+                    best = value;
+                    from = candidates[i];
+                }
             }
 
-            return (best.Length == 0
-                ? $"{title}. {FrameCriteria}"
-                : $"{title}. {best}", from);
+            var title = year is null ? name : $"{name} ({year})";
+            if (best.Length > 0)
+                return ($"{title}. {best}", from);
+
+            var plot = await _synopsis.LookupAsync(name, year, ct);
+            return plot is { Length: > 0 }
+                ? ($"{title}. {plot}", WikipediaSource)
+                : ($"{title}. {FrameCriteria}", null);
         }
 
         /// <summary>Remove an allocation, putting the movie back in the pool.</summary>

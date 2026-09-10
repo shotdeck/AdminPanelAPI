@@ -95,6 +95,7 @@ builder.Services.AddHostedService<MusicIdentificationWorker>();
 builder.Services.AddSingleton<IMovieFileStorageService, MovieFileStorageService>();
 builder.Services.AddSingleton<IMovieTranscodeService, MovieTranscodeService>();
 builder.Services.AddSingleton<IKeyImageAnalysisService, KeyImageAnalysisService>();
+builder.Services.AddSingleton<IFilmSynopsisService, FilmSynopsisService>();
 
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
