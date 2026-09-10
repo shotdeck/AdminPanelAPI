@@ -370,7 +370,7 @@ RETURNING watch_position_seconds, watch_duration_seconds, status;";
 
             const string sql = @"
 SELECT id, movie_id, position_seconds, thumbnail, captured_by, created_at,
-       frame_number, source, score, image_key
+       frame_number, source, score, image_key, look_score, story_score
 FROM frl.frl_movie_key_images
 WHERE movie_id = @movieId AND decision = 'kept'
 ORDER BY position_seconds;";
@@ -395,7 +395,9 @@ ORDER BY position_seconds;";
                     source = reader.GetString(7),
                     score = reader.IsDBNull(8) ? (double?)null : (double)reader.GetDecimal(8),
                     imageKey,
-                    imageUrl = imageKey == null ? null : _storage.CreateDownloadUrl(imageKey, false)
+                    imageUrl = imageKey == null ? null : _storage.CreateDownloadUrl(imageKey, false),
+                    lookScore = reader.IsDBNull(10) ? (double?)null : (double)reader.GetDecimal(10),
+                    storyScore = reader.IsDBNull(11) ? (double?)null : (double)reader.GetDecimal(11)
                 });
             }
 
@@ -592,7 +594,8 @@ RETURNING id, created_at;";
             await EnsureReadyAsync(ct);
 
             const string sql = @"
-SELECT id, position_seconds, frame_number, score, image_key, created_at
+SELECT id, position_seconds, frame_number, score, image_key, created_at,
+       look_score, story_score
 FROM frl.frl_movie_key_images
 WHERE movie_id = @movieId AND decision = 'proposed'
 ORDER BY position_seconds
@@ -618,7 +621,9 @@ LIMIT @limit OFFSET @offset;";
                         score = reader.IsDBNull(3) ? (double?)null : (double)reader.GetDecimal(3),
                         imageKey,
                         imageUrl = imageKey == null ? null : _storage.CreateDownloadUrl(imageKey, false),
-                        createdAt = reader.GetDateTime(5)
+                        createdAt = reader.GetDateTime(5),
+                        lookScore = reader.IsDBNull(6) ? (double?)null : (double)reader.GetDecimal(6),
+                        storyScore = reader.IsDBNull(7) ? (double?)null : (double)reader.GetDecimal(7)
                     });
                 }
             }
@@ -705,6 +710,8 @@ WHERE movie_id = @movieId AND decision = 'proposed';";
             var positions = new List<decimal>();
             var frames = new List<int>();
             var scores = new List<decimal>();
+            var looks = new List<decimal>();
+            var stories = new List<decimal>();
             var keys = new List<string>();
 
             foreach (var proposal in proposals.EnumerateArray())
@@ -716,6 +723,8 @@ WHERE movie_id = @movieId AND decision = 'proposed';";
                 positions.Add(Math.Round(proposal.GetProperty("seconds").GetDecimal(), 3));
                 frames.Add(proposal.GetProperty("frame").GetInt32());
                 scores.Add(proposal.TryGetProperty("score", out var score) ? score.GetDecimal() : 0m);
+                looks.Add(Half(proposal, "look"));
+                stories.Add(Half(proposal, "story"));
                 keys.Add(imageKey);
             }
 
@@ -724,10 +733,11 @@ WHERE movie_id = @movieId AND decision = 'proposed';";
 
             const string sql = @"
 INSERT INTO frl.frl_movie_key_images
-    (movie_id, position_seconds, frame_number, score, image_key, source, decision)
-SELECT @movieId, position, frame, score, image_key, 'ai', 'proposed'
-FROM unnest(@positions, @frames, @scores, @keys)
-    AS proposal(position, frame, score, image_key)
+    (movie_id, position_seconds, frame_number, score, look_score, story_score,
+     image_key, source, decision)
+SELECT @movieId, position, frame, score, look, story, image_key, 'ai', 'proposed'
+FROM unnest(@positions, @frames, @scores, @looks, @stories, @keys)
+    AS proposal(position, frame, score, look, story, image_key)
 ON CONFLICT (movie_id, position_seconds) DO NOTHING;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -735,11 +745,23 @@ ON CONFLICT (movie_id, position_seconds) DO NOTHING;";
             cmd.Parameters.AddWithValue("@positions", positions.ToArray());
             cmd.Parameters.AddWithValue("@frames", frames.ToArray());
             cmd.Parameters.AddWithValue("@scores", scores.ToArray());
+            cmd.Parameters.AddWithValue("@looks", looks.ToArray());
+            cmd.Parameters.AddWithValue("@stories", stories.ToArray());
             cmd.Parameters.AddWithValue("@keys", keys.ToArray());
             await cmd.ExecuteNonQueryAsync(ct);
 
             return await CountProposalsAsync(movieId, ct);
         }
+
+        /// <summary>
+        /// One half of a proposal's score, 0..1 within the run. Analyses from
+        /// before the halves were reported have neither.
+        /// </summary>
+        private static decimal Half(JsonElement proposal, string name) =>
+            proposal.TryGetProperty(name, out var value) &&
+            value.ValueKind == JsonValueKind.Number
+                ? Math.Round(value.GetDecimal(), 3)
+                : 0m;
 
         /// <summary>
         /// What the analysis looks for when a film has no synopsis stored: the
@@ -956,6 +978,8 @@ ALTER TABLE frl.frl_movie_key_images
     ADD COLUMN IF NOT EXISTS source       VARCHAR(16)  NOT NULL DEFAULT 'tagger',
     ADD COLUMN IF NOT EXISTS decision     VARCHAR(16)  NOT NULL DEFAULT 'kept',
     ADD COLUMN IF NOT EXISTS score        NUMERIC(6,3),
+    ADD COLUMN IF NOT EXISTS look_score   NUMERIC(6,3),
+    ADD COLUMN IF NOT EXISTS story_score  NUMERIC(6,3),
     ADD COLUMN IF NOT EXISTS image_key    TEXT,
     ADD COLUMN IF NOT EXISTS decided_by   VARCHAR(120),
     ADD COLUMN IF NOT EXISTS decided_at   TIMESTAMPTZ;
