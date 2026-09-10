@@ -702,7 +702,9 @@ WHERE movie_id = @movieId AND decision = 'proposed';";
 
         /// <summary>
         /// Put a finished job's proposals in the key image table as undecided
-        /// frames. A frame the tagger already picked by hand keeps its own row.
+        /// frames. Re-analysing a movie refreshes the scores of frames still
+        /// awaiting a decision; a frame already decided, or picked by hand, is
+        /// left exactly as it is.
         /// </summary>
         private async Task<int> StoreProposalsAsync(
             int movieId, JsonElement proposals, CancellationToken ct)
@@ -738,7 +740,13 @@ INSERT INTO frl.frl_movie_key_images
 SELECT @movieId, position, frame, score, look, story, image_key, 'ai', 'proposed'
 FROM unnest(@positions, @frames, @scores, @looks, @stories, @keys)
     AS proposal(position, frame, score, look, story, image_key)
-ON CONFLICT (movie_id, position_seconds) DO NOTHING;";
+ON CONFLICT (movie_id, position_seconds) DO UPDATE
+    SET score       = EXCLUDED.score,
+        look_score  = EXCLUDED.look_score,
+        story_score = EXCLUDED.story_score,
+        image_key   = EXCLUDED.image_key
+    WHERE frl.frl_movie_key_images.decision = 'proposed'
+      AND frl.frl_movie_key_images.source = 'ai';";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
