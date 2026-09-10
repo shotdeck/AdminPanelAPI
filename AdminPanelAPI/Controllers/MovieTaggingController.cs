@@ -56,6 +56,12 @@ namespace ShotDeckSearch.Controllers
         /// <summary>How many proposals one page of the grid may ask for.</summary>
         private const int MaxProposalPageSize = 500;
 
+        /// <summary>
+        /// Where the key-image service puts frames cut from a master, as
+        /// opposed to the proxy-sized pictures an analysis proposes.
+        /// </summary>
+        private const string StillsFolder = "/keyimages/stills/";
+
         private readonly NpgsqlConnection _connection;
         private readonly IMovieFileStorageService _storage;
         private readonly IKeyImageAnalysisService _analysis;
@@ -465,6 +471,89 @@ RETURNING id, created_at;";
                 frameNumber = request.FrameNumber,
                 capturedBy = actingUser,
                 createdAt = reader.GetDateTime(1)
+            });
+        }
+
+        /// <summary>
+        /// The kept frame at the master's own resolution. A frame picked while
+        /// watching only has the browser's preview, so the still is cut off the
+        /// master on first ask and remembered on the row from then on.
+        /// </summary>
+        [HttpPost("key-images/{id:long}/still")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<IActionResult> CutKeyImageStill(
+            long id, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            int movieId;
+            int? frameNumber;
+            double positionSeconds;
+            string? imageKey;
+
+            const string lookupSql = @"
+SELECT movie_id, frame_number, position_seconds, image_key
+FROM frl.frl_movie_key_images
+WHERE id = @id;";
+            await using (var lookup = new NpgsqlCommand(lookupSql, _connection))
+            {
+                lookup.Parameters.AddWithValue("@id", id);
+                await using var row = await lookup.ExecuteReaderAsync(ct);
+                if (!await row.ReadAsync(ct))
+                    return NotFound(new { error = "No such key image." });
+
+                movieId = row.GetInt32(0);
+                frameNumber = row.IsDBNull(1) ? null : row.GetInt32(1);
+                positionSeconds = (double)row.GetDecimal(2);
+                imageKey = row.IsDBNull(3) ? null : row.GetString(3);
+            }
+
+            if (imageKey != null && imageKey.Contains(StillsFolder))
+                return Ok(new
+                {
+                    imageKey,
+                    imageUrl = _storage.CreateDownloadUrl(imageKey, false),
+                    cut = false
+                });
+
+            var variants = await _storage.GetMovieVariantsAsync(new[] { movieId }, ct);
+            var masterKey = variants.FirstOrDefault()?.HdKey;
+            if (string.IsNullOrWhiteSpace(masterKey))
+                return BadRequest(new { error = "That movie has no HD master to cut from." });
+
+            var result = await _analysis.CutStillAsync(
+                masterKey, frameNumber, frameNumber.HasValue ? null : positionSeconds, ct);
+            if (!result.IsSuccess)
+                return StatusCode((int)result.Status, result.Body);
+
+            using var document = JsonDocument.Parse(result.Body);
+            if (!document.RootElement.TryGetProperty("imageKey", out var cutKey) ||
+                cutKey.GetString() is not { Length: > 0 } stillKey)
+                return StatusCode(502, new { error = "The still service returned no image." });
+
+            var cutFrame = document.RootElement.TryGetProperty("frame", out var frame) &&
+                frame.TryGetInt32(out var number) ? number : frameNumber;
+
+            const string saveSql = @"
+UPDATE frl.frl_movie_key_images
+SET image_key = @imageKey,
+    frame_number = COALESCE(@frame, frame_number)
+WHERE id = @id;";
+            await using (var save = new NpgsqlCommand(saveSql, _connection))
+            {
+                save.Parameters.AddWithValue("@imageKey", stillKey);
+                save.Parameters.AddWithValue("@frame", (object?)cutFrame ?? DBNull.Value);
+                save.Parameters.AddWithValue("@id", id);
+                await save.ExecuteNonQueryAsync(ct);
+            }
+
+            return Ok(new
+            {
+                imageKey = stillKey,
+                imageUrl = _storage.CreateDownloadUrl(stillKey, false),
+                frameNumber = cutFrame,
+                cut = true
             });
         }
 

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Text.Json;
 
@@ -17,6 +18,13 @@ namespace AdminPanelAPI.Services
         Task<TranscodeResult> GetJobAsync(string jobId, bool includeProposals, CancellationToken ct);
 
         Task<TranscodeResult> FindJobsAsync(string sourceKey, CancellationToken ct);
+
+        /// <summary>
+        /// Cut one frame of a master at its own resolution and put it in R2.
+        /// Unlike an analysis this is a single decode, so it answers inline.
+        /// </summary>
+        Task<TranscodeResult> CutStillAsync(
+            string sourceKey, int? frameNumber, double? seconds, CancellationToken ct);
     }
 
     public sealed class KeyImageAnalysisService : IKeyImageAnalysisService
@@ -60,6 +68,20 @@ namespace AdminPanelAPI.Services
 
         public Task<TranscodeResult> FindJobsAsync(string sourceKey, CancellationToken ct) =>
             SendAsync(HttpMethod.Get, $"/analysis?key={Uri.EscapeDataString(sourceKey)}", ct);
+
+        public Task<TranscodeResult> CutStillAsync(
+            string sourceKey, int? frameNumber, double? seconds, CancellationToken ct)
+        {
+            var query = $"?key={Uri.EscapeDataString(sourceKey)}";
+            if (frameNumber.HasValue)
+                query += $"&frame={frameNumber.Value}";
+            else if (seconds.HasValue)
+                query += $"&seconds={seconds.Value.ToString("0.###", CultureInfo.InvariantCulture)}";
+            if (!string.IsNullOrWhiteSpace(_bucketName))
+                query += $"&bucket={Uri.EscapeDataString(_bucketName)}";
+
+            return SendAsync(HttpMethod.Post, "/still" + query, ct);
+        }
 
         private async Task<TranscodeResult> SendAsync(
             HttpMethod method, string pathAndQuery, CancellationToken ct)
