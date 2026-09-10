@@ -597,11 +597,11 @@ RETURNING id, created_at;";
         /// Proposals still waiting on the tagger. Each carries the master frame
         /// number the still will eventually be cut at.
         ///
-        /// Without a blend they come in the order they appear in the film. With
-        /// one they come best-first on a weighted mix of the two halves of the
-        /// score, 0 being how the frame looks and 1 how much it matches the
-        /// film's description, so a page holds the frames that win at that
-        /// setting.
+        /// A blend picks which frames a page holds — 0 weighs how the frame
+        /// looks, 1 how much it matches the film's description, between the two
+        /// — but the page still arrives in the order the frames appear in the
+        /// film, since that is how a tagger reads a movie. byScore = true gives
+        /// the page best-first instead.
         /// </summary>
         [HttpGet("key-image-proposals")]
         [ProducesResponseType(StatusCodes.Status200OK)]
@@ -610,20 +610,29 @@ RETURNING id, created_at;";
             [FromQuery] int limit = 120,
             [FromQuery] int offset = 0,
             [FromQuery] double? blend = null,
+            [FromQuery] bool byScore = false,
             CancellationToken ct = default)
         {
             await EnsureReadyAsync(ct);
 
-            var sql = @"
-SELECT id, position_seconds, frame_number, score, image_key, created_at,
-       look_score, story_score, source
+            const string columns = @"id, position_seconds, frame_number, score, image_key,
+       created_at, look_score, story_score, source";
+
+            var page = @"
+SELECT " + columns + @"
 FROM frl.frl_movie_key_images
 WHERE movie_id = @movieId AND decision = 'proposed'
 ORDER BY " + (blend.HasValue
                 ? @"(1 - @blend) * COALESCE(look_score, 0) +
                     @blend * COALESCE(story_score, 0) DESC, position_seconds"
-                : "position_seconds") + @"
-LIMIT @limit OFFSET @offset;";
+                : byScore
+                    ? "score DESC, position_seconds"
+                    : "position_seconds") + @"
+LIMIT @limit OFFSET @offset";
+
+            var sql = blend.HasValue && !byScore
+                ? "SELECT * FROM (" + page + ") ranked ORDER BY position_seconds;"
+                : page + ";";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
