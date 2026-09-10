@@ -2,6 +2,7 @@ using AdminPanelAPI.Services;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
+using System.Collections.Concurrent;
 using System.Data;
 using System.Text.Json;
 
@@ -43,6 +44,14 @@ namespace ShotDeckSearch.Controllers
 
         /// <summary>Ceiling for a captured frame's preview data URI.</summary>
         private const int MaxThumbnailCharacters = 400_000;
+
+        /// <summary>
+        /// Analysis jobs whose proposals have been pulled back already, so the
+        /// polls that follow a completed job do not fetch a thousand of them
+        /// again. Storing is idempotent, so losing this on a restart only costs
+        /// one extra fetch.
+        /// </summary>
+        private static readonly ConcurrentDictionary<string, int> StoredJobs = new();
 
         /// <summary>How many proposals one page of the grid may ask for.</summary>
         private const int MaxProposalPageSize = 500;
@@ -552,7 +561,10 @@ RETURNING id, created_at;";
             await EnsureReadyAsync(ct);
 
             var stored = movieId > 0 ? await CountProposalsAsync(movieId, ct) : 0;
-            var wantProposals = movieId > 0 && stored == 0;
+            // Re-analysing a movie that already has proposals has to pull the
+            // new run's frames too, so this follows the job rather than
+            // whether the movie has any proposals at all.
+            var wantProposals = movieId > 0 && !StoredJobs.ContainsKey(jobId);
 
             var result = await _analysis.GetJobAsync(jobId, wantProposals, ct);
             if (!result.IsSuccess)
@@ -565,7 +577,10 @@ RETURNING id, created_at;";
             if (wantProposals && status == "completed" &&
                 job.TryGetProperty("proposals", out var proposals) &&
                 proposals.ValueKind == JsonValueKind.Array)
+            {
                 stored = await StoreProposalsAsync(movieId, proposals, ct);
+                StoredJobs[jobId] = stored;
+            }
 
             return Ok(new
             {
