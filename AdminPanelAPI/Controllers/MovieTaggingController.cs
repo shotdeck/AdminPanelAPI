@@ -594,9 +594,14 @@ RETURNING id, created_at;";
         }
 
         /// <summary>
-        /// Proposals still waiting on the tagger, in the order they appear in
-        /// the film. Each carries the master frame number the still will
-        /// eventually be cut at.
+        /// Proposals still waiting on the tagger. Each carries the master frame
+        /// number the still will eventually be cut at.
+        ///
+        /// Without a blend they come in the order they appear in the film. With
+        /// one they come best-first on a weighted mix of the two halves of the
+        /// score, 0 being how the frame looks and 1 how much it matches the
+        /// film's description, so a page holds the frames that win at that
+        /// setting.
         /// </summary>
         [HttpGet("key-image-proposals")]
         [ProducesResponseType(StatusCodes.Status200OK)]
@@ -604,20 +609,26 @@ RETURNING id, created_at;";
             [FromQuery] int movieId,
             [FromQuery] int limit = 120,
             [FromQuery] int offset = 0,
+            [FromQuery] double? blend = null,
             CancellationToken ct = default)
         {
             await EnsureReadyAsync(ct);
 
-            const string sql = @"
+            var sql = @"
 SELECT id, position_seconds, frame_number, score, image_key, created_at,
-       look_score, story_score
+       look_score, story_score, source
 FROM frl.frl_movie_key_images
 WHERE movie_id = @movieId AND decision = 'proposed'
-ORDER BY position_seconds
+ORDER BY " + (blend.HasValue
+                ? @"(1 - @blend) * COALESCE(look_score, 0) +
+                    @blend * COALESCE(story_score, 0) DESC, position_seconds"
+                : "position_seconds") + @"
 LIMIT @limit OFFSET @offset;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
+            if (blend.HasValue)
+                cmd.Parameters.AddWithValue("@blend", (decimal)Math.Clamp(blend.Value, 0, 1));
             cmd.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, MaxProposalPageSize));
             cmd.Parameters.AddWithValue("@offset", Math.Max(0, offset));
 
@@ -638,7 +649,8 @@ LIMIT @limit OFFSET @offset;";
                         imageUrl = imageKey == null ? null : _storage.CreateDownloadUrl(imageKey, false),
                         createdAt = reader.GetDateTime(5),
                         lookScore = reader.IsDBNull(6) ? (double?)null : (double)reader.GetDecimal(6),
-                        storyScore = reader.IsDBNull(7) ? (double?)null : (double)reader.GetDecimal(7)
+                        storyScore = reader.IsDBNull(7) ? (double?)null : (double)reader.GetDecimal(7),
+                        source = reader.IsDBNull(8) ? null : reader.GetString(8)
                     });
                 }
             }
@@ -717,9 +729,10 @@ WHERE movie_id = @movieId AND decision = 'proposed';";
 
         /// <summary>
         /// Put a finished job's proposals in the key image table as undecided
-        /// frames. Re-analysing a movie refreshes the scores of frames still
-        /// awaiting a decision; a frame already decided, or picked by hand, is
-        /// left exactly as it is.
+        /// frames, so the grid holds this run and only this run: frames still
+        /// awaiting a decision take the new scores, and ones the run no longer
+        /// proposes go. A frame already decided, or picked by hand, is left
+        /// exactly as it is.
         /// </summary>
         private async Task<int> StoreProposalsAsync(
             int movieId, JsonElement proposals, CancellationToken ct)
@@ -761,7 +774,13 @@ ON CONFLICT (movie_id, position_seconds) DO UPDATE
         story_score = EXCLUDED.story_score,
         image_key   = EXCLUDED.image_key
     WHERE frl.frl_movie_key_images.decision = 'proposed'
-      AND frl.frl_movie_key_images.source = 'ai';";
+      AND frl.frl_movie_key_images.source = 'ai';
+
+DELETE FROM frl.frl_movie_key_images
+WHERE movie_id = @movieId
+  AND decision = 'proposed'
+  AND source = 'ai'
+  AND position_seconds <> ALL(@positions);";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
