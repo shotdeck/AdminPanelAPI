@@ -729,10 +729,11 @@ WHERE movie_id = @movieId AND decision = 'proposed';";
 
         /// <summary>
         /// Put a finished job's proposals in the key image table as undecided
-        /// frames, so the grid holds this run and only this run: frames still
-        /// awaiting a decision take the new scores, and ones the run no longer
-        /// proposes go. A frame already decided, or picked by hand, is left
-        /// exactly as it is.
+        /// frames, so the movie holds this run and only this run: a frame the
+        /// run still proposes keeps whatever was decided about it and takes the
+        /// new scores, and every other frame the analysis produced goes, so
+        /// re-analysing does not pile run on run. Frames picked by hand while
+        /// watching are not the analysis's to remove and survive untouched.
         /// </summary>
         private async Task<int> StoreProposalsAsync(
             int movieId, JsonElement proposals, CancellationToken ct)
@@ -778,7 +779,6 @@ ON CONFLICT (movie_id, position_seconds) DO UPDATE
 
 DELETE FROM frl.frl_movie_key_images
 WHERE movie_id = @movieId
-  AND decision = 'proposed'
   AND source = 'ai'
   AND position_seconds <> ALL(@positions);";
 
