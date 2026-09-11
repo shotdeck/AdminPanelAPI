@@ -96,6 +96,11 @@ builder.Services.AddSingleton<IMovieFileStorageService, MovieFileStorageService>
 builder.Services.AddSingleton<IMovieTranscodeService, MovieTranscodeService>();
 builder.Services.AddSingleton<IKeyImageAnalysisService, KeyImageAnalysisService>();
 builder.Services.AddSingleton<IFilmSynopsisService, FilmSynopsisService>();
+builder.Services.AddSingleton<IWalkthroughService, WalkthroughService>();
+
+// Describes and analyses a movie as soon as its SF proxy exists, so a tagger
+// who finishes watching finds the walkthrough and the proposals waiting.
+builder.Services.AddHostedService<MoviePreparationWorker>();
 
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();

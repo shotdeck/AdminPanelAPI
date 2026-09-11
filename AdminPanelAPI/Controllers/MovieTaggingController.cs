@@ -66,17 +66,20 @@ namespace ShotDeckSearch.Controllers
         private readonly IMovieFileStorageService _storage;
         private readonly IKeyImageAnalysisService _analysis;
         private readonly IFilmSynopsisService _synopsis;
+        private readonly IWalkthroughService _walkthrough;
 
         public MovieTaggingController(
             NpgsqlConnection connection,
             IMovieFileStorageService storage,
             IKeyImageAnalysisService analysis,
-            IFilmSynopsisService synopsis)
+            IFilmSynopsisService synopsis,
+            IWalkthroughService walkthrough)
         {
             _connection = connection;
             _storage = storage;
             _analysis = analysis;
             _synopsis = synopsis;
+            _walkthrough = walkthrough;
         }
 
         public sealed class AssignRequest
@@ -105,6 +108,19 @@ namespace ShotDeckSearch.Controllers
         {
             public int MovieId { get; set; }
             public string? Description { get; set; }
+            public string? ActingUser { get; set; }
+
+            /// <summary>
+            /// Analyse even though a run started for this movie by itself is
+            /// still going, for a tagger who wants their own description used
+            /// rather than the film's synopsis.
+            /// </summary>
+            public bool Force { get; set; }
+        }
+
+        public sealed class WalkthroughRequest
+        {
+            public int MovieId { get; set; }
             public string? ActingUser { get; set; }
         }
 
@@ -603,6 +619,25 @@ WHERE id = @id;";
             if (!await CanCaptureAsync(request.MovieId, actingUser, ct))
                 return StatusCode(403, new { error = "That movie is not allocated to you." });
 
+            // A movie is analysed by itself once its SF proxy appears, so the
+            // button often has nothing to do: say so rather than paying for the
+            // same run twice over.
+            var preparation = await MoviePreparationStore.GetAsync(_connection, request.MovieId, ct);
+            if (!request.Force &&
+                preparation?.AnalysisStatus == MoviePreparationStore.Running &&
+                preparation.AnalysisJobId is { Length: > 0 })
+            {
+                return Conflict(new
+                {
+                    error = "This movie is already being analysed in the background.",
+                    jobId = preparation.AnalysisJobId,
+                    stage = preparation.AnalysisStage,
+                    progress = preparation.AnalysisProgress,
+                    startedAt = preparation.StartedAt,
+                    automatic = true
+                });
+            }
+
             var variants = await _storage.GetMovieVariantsAsync(new[] { request.MovieId }, ct);
             var sourceKey = variants.FirstOrDefault()?.SlimKey;
             if (string.IsNullOrWhiteSpace(sourceKey))
@@ -614,6 +649,144 @@ WHERE id = @id;";
 
             var result = await _analysis.StartAsync(
                 sourceKey, request.MovieId, description, ct);
+            return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
+        }
+
+        /// <summary>
+        /// What has been done to this movie without anybody asking: the
+        /// walkthrough and the key image analysis that start off the back of its
+        /// SF proxy appearing. This is what the tagging page shows as the
+        /// movie's preparation status, and what tells the Analyse button a run
+        /// is already going.
+        /// </summary>
+        [HttpGet("preparation")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetPreparation(
+            [FromQuery] int movieId = 0,
+            [FromQuery] string? movieIds = null,
+            CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            if (!string.IsNullOrWhiteSpace(movieIds))
+            {
+                var ids = movieIds.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(part => int.TryParse(part.Trim(), out var id) ? id : 0)
+                    .Where(id => id > 0);
+                var rows = await MoviePreparationStore.ListAsync(_connection, ids, ct);
+                return Ok(new { movies = rows.Select(Preparation) });
+            }
+
+            var row = await MoviePreparationStore.GetAsync(_connection, movieId, ct);
+            return row == null
+                ? Ok(new { movieId, prepared = false })
+                : Ok(Preparation(row));
+        }
+
+        private static object Preparation(MoviePreparationRow row) => new
+        {
+            movieId = row.MovieId,
+            prepared = true,
+            sourceKey = row.SourceKey,
+            running = row.Running,
+            startedAt = row.StartedAt,
+            updatedAt = row.UpdatedAt,
+            walkthrough = new
+            {
+                jobId = row.WalkthroughJobId,
+                status = row.WalkthroughStatus,
+                stage = row.WalkthroughStage,
+                progress = row.WalkthroughProgress,
+                shots = row.WalkthroughShots,
+                error = row.WalkthroughError
+            },
+            analysis = new
+            {
+                jobId = row.AnalysisJobId,
+                status = row.AnalysisStatus,
+                stage = row.AnalysisStage,
+                progress = row.AnalysisProgress,
+                proposals = row.AnalysisProposals,
+                error = row.AnalysisError
+            }
+        };
+
+        /// <summary>
+        /// The film described shot by shot: a timestamped account of what is on
+        /// screen, cut from the SF proxy. Read back out of R2, so it survives
+        /// the job that made it.
+        /// </summary>
+        [HttpGet("walkthrough")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<IActionResult> GetWalkthrough(
+            [FromQuery] int movieId, CancellationToken ct = default)
+        {
+            var variants = await _storage.GetMovieVariantsAsync(new[] { movieId }, ct);
+            var sourceKey = variants.FirstOrDefault()?.SlimKey;
+            if (string.IsNullOrWhiteSpace(sourceKey))
+                return NotFound(new { error = "That movie has no SF proxy." });
+
+            var result = await _walkthrough.GetStoredAsync(sourceKey, ct);
+            return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
+        }
+
+        /// <summary>
+        /// Describe the movie shot by shot now. Movies get this by themselves
+        /// once their SF proxy appears, so this is for the ones whose proxy was
+        /// made before that, and for a re-run.
+        /// </summary>
+        [HttpPost("walkthrough")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status409Conflict)]
+        public async Task<IActionResult> StartWalkthrough(
+            [FromBody] WalkthroughRequest request, CancellationToken ct = default)
+        {
+            var actingUser = (request.ActingUser ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(actingUser))
+                return BadRequest(new { error = "actingUser is required." });
+
+            await EnsureReadyAsync(ct);
+            if (!await CanCaptureAsync(request.MovieId, actingUser, ct))
+                return StatusCode(403, new { error = "That movie is not allocated to you." });
+
+            var existing = await MoviePreparationStore.GetAsync(_connection, request.MovieId, ct);
+            if (existing?.WalkthroughStatus == MoviePreparationStore.Running &&
+                existing.WalkthroughJobId is { Length: > 0 })
+            {
+                return Conflict(new
+                {
+                    error = "This movie is already being described in the background.",
+                    jobId = existing.WalkthroughJobId,
+                    stage = existing.WalkthroughStage,
+                    progress = existing.WalkthroughProgress,
+                    automatic = true
+                });
+            }
+
+            var variants = await _storage.GetMovieVariantsAsync(new[] { request.MovieId }, ct);
+            var sourceKey = variants.FirstOrDefault()?.SlimKey;
+            if (string.IsNullOrWhiteSpace(sourceKey))
+                return BadRequest(new { error = "That movie has no SF proxy to describe yet." });
+
+            var result = await _walkthrough.StartAsync(sourceKey, request.MovieId, ct);
+            if (result.IsSuccess)
+            {
+                using var document = JsonDocument.Parse(result.Body);
+                var jobId = document.RootElement.TryGetProperty("jobId", out var id)
+                    ? id.GetString() : null;
+                if (jobId is { Length: > 0 })
+                {
+                    // Recorded so the worker follows this run too and stores
+                    // where it got to, rather than the page having to.
+                    await MoviePreparationStore.TryClaimAsync(
+                        _connection, request.MovieId, sourceKey, ct);
+                    await MoviePreparationStore.SetJobAsync(
+                        _connection, request.MovieId, "walkthrough", jobId,
+                        MoviePreparationStore.Running, null, ct);
+                }
+            }
+
             return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
         }
 
@@ -631,7 +804,7 @@ WHERE id = @id;";
             return Ok(new
             {
                 description = description ?? "",
-                proseColumn = source == WikipediaSource ? null : source,
+                proseColumn = source == MovieDescriptions.WikipediaSource ? null : source,
                 proseSource = source,
                 proseColumnsAvailable = await DescriptionColumnsAsync(ct)
             });
@@ -814,202 +987,19 @@ WHERE id = ANY(@ids);";
             return Ok(new { decision, decided = affected, remaining });
         }
 
-        /// <summary>Proposals for one movie the tagger has yet to decide on.</summary>
-        private async Task<int> CountProposalsAsync(int movieId, CancellationToken ct)
-        {
-            const string sql = @"
-SELECT count(*) FROM frl.frl_movie_key_images
-WHERE movie_id = @movieId AND decision = 'proposed';";
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@movieId", movieId);
-            return (int)(long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
-        }
+        private Task<int> CountProposalsAsync(int movieId, CancellationToken ct) =>
+            KeyImageProposalStore.CountAsync(_connection, movieId, ct);
 
-        /// <summary>
-        /// Put a finished job's proposals in the key image table as undecided
-        /// frames, so the movie holds this run and only this run: a frame the
-        /// run still proposes keeps whatever was decided about it and takes the
-        /// new scores, and every other frame the analysis produced goes, so
-        /// re-analysing does not pile run on run. Frames picked by hand while
-        /// watching are not the analysis's to remove and survive untouched.
-        /// </summary>
-        private async Task<int> StoreProposalsAsync(
-            int movieId, JsonElement proposals, CancellationToken ct)
-        {
-            var positions = new List<decimal>();
-            var frames = new List<int>();
-            var scores = new List<decimal>();
-            var looks = new List<decimal>();
-            var stories = new List<decimal>();
-            var keys = new List<string>();
+        private Task<int> StoreProposalsAsync(
+            int movieId, JsonElement proposals, CancellationToken ct) =>
+            KeyImageProposalStore.StoreAsync(_connection, movieId, proposals, ct);
 
-            foreach (var proposal in proposals.EnumerateArray())
-            {
-                if (!proposal.TryGetProperty("imageKey", out var key) ||
-                    key.GetString() is not { Length: > 0 } imageKey)
-                    continue;
+        private Task<string[]> DescriptionColumnsAsync(CancellationToken ct) =>
+            MovieDescriptions.ColumnsAsync(_connection, ct);
 
-                positions.Add(Math.Round(proposal.GetProperty("seconds").GetDecimal(), 3));
-                frames.Add(proposal.GetProperty("frame").GetInt32());
-                scores.Add(proposal.TryGetProperty("score", out var score) ? score.GetDecimal() : 0m);
-                looks.Add(Half(proposal, "look"));
-                stories.Add(Half(proposal, "story"));
-                keys.Add(imageKey);
-            }
-
-            if (positions.Count == 0)
-                return 0;
-
-            const string sql = @"
-INSERT INTO frl.frl_movie_key_images
-    (movie_id, position_seconds, frame_number, score, look_score, story_score,
-     image_key, source, decision)
-SELECT @movieId, position, frame, score, look, story, image_key, 'ai', 'proposed'
-FROM unnest(@positions, @frames, @scores, @looks, @stories, @keys)
-    AS proposal(position, frame, score, look, story, image_key)
-ON CONFLICT (movie_id, position_seconds) DO UPDATE
-    SET score       = EXCLUDED.score,
-        look_score  = EXCLUDED.look_score,
-        story_score = EXCLUDED.story_score,
-        image_key   = EXCLUDED.image_key
-    WHERE frl.frl_movie_key_images.decision = 'proposed'
-      AND frl.frl_movie_key_images.source = 'ai';
-
-DELETE FROM frl.frl_movie_key_images
-WHERE movie_id = @movieId
-  AND source = 'ai'
-  AND position_seconds <> ALL(@positions);";
-
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@movieId", movieId);
-            cmd.Parameters.AddWithValue("@positions", positions.ToArray());
-            cmd.Parameters.AddWithValue("@frames", frames.ToArray());
-            cmd.Parameters.AddWithValue("@scores", scores.ToArray());
-            cmd.Parameters.AddWithValue("@looks", looks.ToArray());
-            cmd.Parameters.AddWithValue("@stories", stories.ToArray());
-            cmd.Parameters.AddWithValue("@keys", keys.ToArray());
-            await cmd.ExecuteNonQueryAsync(ct);
-
-            return await CountProposalsAsync(movieId, ct);
-        }
-
-        /// <summary>
-        /// One half of a proposal's score, 0..1 within the run. Analyses from
-        /// before the halves were reported have neither.
-        /// </summary>
-        private static decimal Half(JsonElement proposal, string name) =>
-            proposal.TryGetProperty(name, out var value) &&
-            value.ValueKind == JsonValueKind.Number
-                ? Math.Round(value.GetDecimal(), 3)
-                : 0m;
-
-        /// <summary>
-        /// What the analysis looks for when a film has no synopsis stored: the
-        /// text a frame is matched against, phrased as the picture it should be
-        /// rather than as an instruction, since scoring is image/text similarity.
-        /// </summary>
-        private const string FrameCriteria =
-            "A cinematic, well-composed film still: sharp focus, strong " +
-            "lighting and colour, faces lit and eyes open, a moment that " +
-            "looks emblematic of the film.";
-
-        /// <summary>
-        /// Name patterns for a column holding prose about the film. Guessing
-        /// exact names missed the one frl_movies actually uses, so every text
-        /// column whose name reads like a description is a candidate and the
-        /// longest value a film has among them is used.
-        /// </summary>
-        private static readonly string[] DescriptionPatterns =
-        {
-            "%synops%", "%overview%", "%plot%", "%descript%", "%logline%",
-            "%summar%", "%story%", "%blurb%", "%tagline%", "%abstract%"
-        };
-
-        private static string[]? _descriptionColumns;
-
-        /// <summary>The prose-ish text columns frl_movies actually has.</summary>
-        private async Task<string[]> DescriptionColumnsAsync(CancellationToken ct)
-        {
-            if (_descriptionColumns != null)
-                return _descriptionColumns;
-
-            const string sql = @"
-SELECT column_name
-FROM information_schema.columns
-WHERE table_schema = 'frl' AND table_name = 'frl_movies'
-  AND data_type IN ('text', 'character varying', 'character')
-  AND column_name ILIKE ANY(@patterns)
-ORDER BY column_name;";
-
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@patterns", DescriptionPatterns);
-
-            var found = new List<string>();
-            await using (var reader = await cmd.ExecuteReaderAsync(ct))
-            {
-                while (await reader.ReadAsync(ct))
-                    found.Add(reader.GetString(0));
-            }
-
-            _descriptionColumns = found.ToArray();
-            return _descriptionColumns;
-        }
-
-        /// <summary>Marks prose that came from Wikipedia rather than a column.</summary>
-        private const string WikipediaSource = "wikipedia";
-
-        /// <summary>
-        /// What the film is, for scoring how relevant a frame is to it, plus
-        /// where the prose came from so a missing synopsis can be told apart
-        /// from a column this never found. frl_movies holds no synopsis today,
-        /// so a film's plot is looked up on Wikipedia; failing that, the text
-        /// falls back to the picture the analysis wants of any film.
-        /// </summary>
-        private async Task<(string? Description, string? Source)> MovieDescriptionAsync(
-            int movieId, CancellationToken ct)
-        {
-            var candidates = await DescriptionColumnsAsync(ct);
-            var columns = string.Concat(candidates.Select(c => $", \"{c}\""));
-            var sql = $"SELECT title, year{columns} FROM frl.frl_movies " +
-                "WHERE idnum = @movieId LIMIT 1;";
-
-            string name;
-            int? year = null;
-            var best = "";
-            string? from = null;
-
-            await using (var cmd = new NpgsqlCommand(sql, _connection))
-            {
-                cmd.Parameters.AddWithValue("@movieId", movieId);
-
-                await using var reader = await cmd.ExecuteReaderAsync(ct);
-                if (!await reader.ReadAsync(ct) || reader.IsDBNull(0))
-                    return (null, null);
-
-                name = reader.GetString(0).Trim();
-                if (!reader.IsDBNull(1) &&
-                    int.TryParse(reader.GetValue(1)?.ToString(), out var stored))
-                    year = stored;
-
-                for (var i = 0; i < candidates.Length; i++)
-                {
-                    if (reader.IsDBNull(i + 2)) continue;
-                    var value = reader.GetString(i + 2).Trim();
-                    if (value.Length <= best.Length) continue;
-                    best = value;
-                    from = candidates[i];
-                }
-            }
-
-            var title = year is null ? name : $"{name} ({year})";
-            if (best.Length > 0)
-                return ($"{title}. {best}", from);
-
-            var plot = await _synopsis.LookupAsync(name, year, ct);
-            return plot is { Length: > 0 }
-                ? ($"{title}. {plot}", WikipediaSource)
-                : ($"{title}. {FrameCriteria}", null);
-        }
+        private Task<(string? Description, string? Source)> MovieDescriptionAsync(
+            int movieId, CancellationToken ct) =>
+            MovieDescriptions.ForAsync(_connection, _synopsis, movieId, ct);
 
         /// <summary>Remove an allocation, putting the movie back in the pool.</summary>
         [HttpDelete("assignments/{movieId:int}")]
@@ -1124,7 +1114,8 @@ ALTER TABLE frl.frl_movie_key_images
     ADD COLUMN IF NOT EXISTS decided_by   VARCHAR(120),
     ADD COLUMN IF NOT EXISTS decided_at   TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_fmki_movie_decision
-    ON frl.frl_movie_key_images (movie_id, decision);";
+    ON frl.frl_movie_key_images (movie_id, decision);"
+                + MoviePreparationStore.Schema;
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
         }
