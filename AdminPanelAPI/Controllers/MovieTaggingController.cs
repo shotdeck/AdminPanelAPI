@@ -728,7 +728,7 @@ WHERE id = @id;";
                 return NotFound(new { error = "That movie has no SF proxy." });
 
             var result = await _walkthrough.GetStoredAsync(sourceKey, ct);
-            return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
+            return Relay(result);
         }
 
         /// <summary>
@@ -770,25 +770,32 @@ WHERE id = @id;";
                 return BadRequest(new { error = "That movie has no SF proxy to describe yet." });
 
             var result = await _walkthrough.StartAsync(sourceKey, request.MovieId, ct);
-            if (result.IsSuccess)
+            if (!result.IsSuccess)
+                return Relay(result);
+
+            using var document = JsonDocument.Parse(result.Body);
+            var jobId = document.RootElement.TryGetProperty("jobId", out var id)
+                ? id.GetString() : null;
+            if (jobId is { Length: > 0 })
             {
-                using var document = JsonDocument.Parse(result.Body);
-                var jobId = document.RootElement.TryGetProperty("jobId", out var id)
-                    ? id.GetString() : null;
-                if (jobId is { Length: > 0 })
-                {
-                    // Recorded so the worker follows this run too and stores
-                    // where it got to, rather than the page having to.
-                    await MoviePreparationStore.TryClaimAsync(
-                        _connection, request.MovieId, sourceKey, ct);
-                    await MoviePreparationStore.SetJobAsync(
-                        _connection, request.MovieId, "walkthrough", jobId,
-                        MoviePreparationStore.Running, null, ct);
-                }
+                // Recorded so the worker follows this run too and stores where it
+                // got to, rather than the page having to.
+                await MoviePreparationStore.TryClaimAsync(
+                    _connection, request.MovieId, sourceKey, ct);
+                await MoviePreparationStore.SetJobAsync(
+                    _connection, request.MovieId, "walkthrough", jobId,
+                    MoviePreparationStore.Running, null, ct);
             }
 
-            return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
+            return Relay(result);
         }
+
+        private ContentResult Relay(TranscodeResult result) => new()
+        {
+            StatusCode = (int)result.Status,
+            Content = result.Body,
+            ContentType = "application/json"
+        };
 
         /// <summary>
         /// What the analysis will be told the film is, unless the tagger edits
