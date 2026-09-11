@@ -19,6 +19,13 @@ namespace AdminPanelAPI.Services
         public int? WalkthroughShots { get; init; }
         public string? WalkthroughError { get; init; }
 
+        public string? StoryJobId { get; init; }
+        public string StoryStatus { get; init; } = "idle";
+        public string? StoryStage { get; init; }
+        public double StoryProgress { get; init; }
+        public int? StoryRated { get; init; }
+        public string? StoryError { get; init; }
+
         public string? AnalysisJobId { get; init; }
         public string AnalysisStatus { get; init; } = "idle";
         public string? AnalysisStage { get; init; }
@@ -30,7 +37,9 @@ namespace AdminPanelAPI.Services
         public DateTimeOffset UpdatedAt { get; init; }
 
         public bool Running =>
-            WalkthroughStatus == "running" || AnalysisStatus == "running";
+            WalkthroughStatus == "running" ||
+            StoryStatus == "running" ||
+            AnalysisStatus == "running";
     }
 
     /// <summary>Reads and writes the preparation row for a movie.</summary>
@@ -42,7 +51,7 @@ namespace AdminPanelAPI.Services
         public const string Idle = "idle";
 
         /// <summary>
-        /// Mirrors migrations/035, so a slot that has not had migrations run
+        /// Mirrors migrations/035 and 036, so a slot that has not had migrations run
         /// still works — the same approach the tagging tables take.
         /// </summary>
         public const string Schema = @"
@@ -65,11 +74,20 @@ CREATE TABLE IF NOT EXISTS frl.frl_movie_preparation (
     updated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_fmp_running
-    ON frl.frl_movie_preparation (walkthrough_status, analysis_status);";
+    ON frl.frl_movie_preparation (walkthrough_status, analysis_status);
+ALTER TABLE frl.frl_movie_preparation
+    ADD COLUMN IF NOT EXISTS story_job_id   VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS story_status   VARCHAR(16)  NOT NULL DEFAULT 'idle',
+    ADD COLUMN IF NOT EXISTS story_stage    VARCHAR(32),
+    ADD COLUMN IF NOT EXISTS story_progress NUMERIC(5,3) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS story_rated    INTEGER,
+    ADD COLUMN IF NOT EXISTS story_error    TEXT;";
 
         private const string Columns = @"movie_id, source_key,
        walkthrough_job_id, walkthrough_status, walkthrough_stage,
        walkthrough_progress, walkthrough_shots, walkthrough_error,
+       story_job_id, story_status, story_stage,
+       story_progress, story_rated, story_error,
        analysis_job_id, analysis_status, analysis_stage,
        analysis_progress, analysis_proposals, analysis_error,
        started_at, updated_at";
@@ -97,7 +115,9 @@ CREATE INDEX IF NOT EXISTS idx_fmp_running
         {
             var sql = $@"
 SELECT {Columns} FROM frl.frl_movie_preparation
-WHERE walkthrough_status = 'running' OR analysis_status = 'running'
+WHERE walkthrough_status = 'running'
+   OR story_status = 'running'
+   OR analysis_status = 'running'
 ORDER BY started_at;";
             await using var cmd = new NpgsqlCommand(sql, connection);
 
@@ -151,6 +171,12 @@ ON CONFLICT (movie_id) DO UPDATE
         walkthrough_progress = 0,
         walkthrough_shots    = NULL,
         walkthrough_error    = NULL,
+        story_job_id         = NULL,
+        story_status         = 'idle',
+        story_stage          = NULL,
+        story_progress       = 0,
+        story_rated          = NULL,
+        story_error          = NULL,
         analysis_job_id      = NULL,
         analysis_status      = 'idle',
         analysis_stage       = NULL,
@@ -161,6 +187,7 @@ ON CONFLICT (movie_id) DO UPDATE
         updated_at           = now()
     WHERE frl.frl_movie_preparation.source_key <> EXCLUDED.source_key
       AND frl.frl_movie_preparation.walkthrough_status <> 'running'
+      AND frl.frl_movie_preparation.story_status <> 'running'
       AND frl.frl_movie_preparation.analysis_status <> 'running'
 RETURNING movie_id;";
 
@@ -204,7 +231,12 @@ WHERE movie_id = @movieId;";
             string? error,
             CancellationToken ct)
         {
-            var countColumn = job == "walkthrough" ? "walkthrough_shots" : "analysis_proposals";
+            var countColumn = job switch
+            {
+                "walkthrough" => "walkthrough_shots",
+                "story" => "story_rated",
+                _ => "analysis_proposals"
+            };
             var sql = $@"
 UPDATE frl.frl_movie_preparation
 SET {job}_status = @status, {job}_stage = @stage, {job}_progress = @progress,
@@ -246,14 +278,20 @@ WHERE movie_id = @movieId;";
             WalkthroughProgress = (double)reader.GetDecimal(5),
             WalkthroughShots = reader.IsDBNull(6) ? null : reader.GetInt32(6),
             WalkthroughError = reader.IsDBNull(7) ? null : reader.GetString(7),
-            AnalysisJobId = reader.IsDBNull(8) ? null : reader.GetString(8),
-            AnalysisStatus = reader.GetString(9),
-            AnalysisStage = reader.IsDBNull(10) ? null : reader.GetString(10),
-            AnalysisProgress = (double)reader.GetDecimal(11),
-            AnalysisProposals = reader.IsDBNull(12) ? null : reader.GetInt32(12),
-            AnalysisError = reader.IsDBNull(13) ? null : reader.GetString(13),
-            StartedAt = reader.GetFieldValue<DateTimeOffset>(14),
-            UpdatedAt = reader.GetFieldValue<DateTimeOffset>(15)
+            StoryJobId = reader.IsDBNull(8) ? null : reader.GetString(8),
+            StoryStatus = reader.GetString(9),
+            StoryStage = reader.IsDBNull(10) ? null : reader.GetString(10),
+            StoryProgress = (double)reader.GetDecimal(11),
+            StoryRated = reader.IsDBNull(12) ? null : reader.GetInt32(12),
+            StoryError = reader.IsDBNull(13) ? null : reader.GetString(13),
+            AnalysisJobId = reader.IsDBNull(14) ? null : reader.GetString(14),
+            AnalysisStatus = reader.GetString(15),
+            AnalysisStage = reader.IsDBNull(16) ? null : reader.GetString(16),
+            AnalysisProgress = (double)reader.GetDecimal(17),
+            AnalysisProposals = reader.IsDBNull(18) ? null : reader.GetInt32(18),
+            AnalysisError = reader.IsDBNull(19) ? null : reader.GetString(19),
+            StartedAt = reader.GetFieldValue<DateTimeOffset>(20),
+            UpdatedAt = reader.GetFieldValue<DateTimeOffset>(21)
         };
     }
 }
