@@ -11,14 +11,33 @@ namespace AdminPanelAPI.Services
     public static class KeyImageProposalStore
     {
         /// <summary>Proposals for one movie the tagger has yet to decide on.</summary>
+        public static Task<int> CountAsync(
+            NpgsqlConnection connection, int movieId, CancellationToken ct) =>
+            CountAsync(connection, movieId, null, null, ct);
+
+        /// <summary>
+        /// The same count over one stretch of the film, for a shot read out of
+        /// the movie's walkthrough.
+        /// </summary>
         public static async Task<int> CountAsync(
-            NpgsqlConnection connection, int movieId, CancellationToken ct)
+            NpgsqlConnection connection,
+            int movieId,
+            double? fromSeconds,
+            double? toSeconds,
+            CancellationToken ct)
         {
-            const string sql = @"
+            var sql = @"
 SELECT count(*) FROM frl.frl_movie_key_images
-WHERE movie_id = @movieId AND decision = 'proposed';";
+WHERE movie_id = @movieId AND decision = 'proposed'" +
+                (fromSeconds.HasValue ? " AND position_seconds >= @fromSeconds" : "") +
+                (toSeconds.HasValue ? " AND position_seconds <= @toSeconds" : "") + ";";
+
             await using var cmd = new NpgsqlCommand(sql, connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
+            if (fromSeconds.HasValue)
+                cmd.Parameters.AddWithValue("@fromSeconds", (decimal)fromSeconds.Value);
+            if (toSeconds.HasValue)
+                cmd.Parameters.AddWithValue("@toSeconds", (decimal)toSeconds.Value);
             return (int)(long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
         }
 
@@ -31,7 +50,11 @@ WHERE movie_id = @movieId AND decision = 'proposed';";
         /// watching are not the analysis's to remove and survive untouched.
         /// </summary>
         public static async Task<int> StoreAsync(
-            NpgsqlConnection connection, int movieId, JsonElement proposals, CancellationToken ct)
+            NpgsqlConnection connection,
+            int movieId,
+            JsonElement proposals,
+            string? storyFrom,
+            CancellationToken ct)
         {
             var positions = new List<decimal>();
             var frames = new List<int>();
@@ -60,14 +83,16 @@ WHERE movie_id = @movieId AND decision = 'proposed';";
             const string sql = @"
 INSERT INTO frl.frl_movie_key_images
     (movie_id, position_seconds, frame_number, score, look_score, story_score,
-     image_key, source, decision)
-SELECT @movieId, position, frame, score, look, story, image_key, 'ai', 'proposed'
+     story_from, image_key, source, decision)
+SELECT @movieId, position, frame, score, look, story, @storyFrom, image_key,
+       'ai', 'proposed'
 FROM unnest(@positions, @frames, @scores, @looks, @stories, @keys)
     AS proposal(position, frame, score, look, story, image_key)
 ON CONFLICT (movie_id, position_seconds) DO UPDATE
     SET score       = EXCLUDED.score,
         look_score  = EXCLUDED.look_score,
         story_score = EXCLUDED.story_score,
+        story_from  = EXCLUDED.story_from,
         image_key   = EXCLUDED.image_key
     WHERE frl.frl_movie_key_images.decision = 'proposed'
       AND frl.frl_movie_key_images.source = 'ai';
@@ -85,6 +110,8 @@ WHERE movie_id = @movieId
             cmd.Parameters.AddWithValue("@looks", looks.ToArray());
             cmd.Parameters.AddWithValue("@stories", stories.ToArray());
             cmd.Parameters.AddWithValue("@keys", keys.ToArray());
+            cmd.Parameters.AddWithValue(
+                "@storyFrom", (object?)storyFrom ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync(ct);
 
             return await CountAsync(connection, movieId, ct);

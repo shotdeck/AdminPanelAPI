@@ -857,7 +857,8 @@ WHERE id = @id;";
                 job.TryGetProperty("proposals", out var proposals) &&
                 proposals.ValueKind == JsonValueKind.Array)
             {
-                stored = await StoreProposalsAsync(movieId, proposals, ct);
+                stored = await StoreProposalsAsync(
+                    movieId, proposals, StoryFrom(job), ct);
                 StoredJobs[jobId] = stored;
             }
 
@@ -881,6 +882,10 @@ WHERE id = @id;";
         /// — but the page still arrives in the order the frames appear in the
         /// film, since that is how a tagger reads a movie. byScore = true gives
         /// the page best-first instead.
+        ///
+        /// fromSeconds/toSeconds narrow the page to one stretch of the film, so
+        /// a shot found in the walkthrough can show the frames proposed out of
+        /// it; total then counts that stretch rather than the whole movie.
         /// </summary>
         [HttpGet("key-image-proposals")]
         [ProducesResponseType(StatusCodes.Status200OK)]
@@ -890,17 +895,23 @@ WHERE id = @id;";
             [FromQuery] int offset = 0,
             [FromQuery] double? blend = null,
             [FromQuery] bool byScore = false,
+            [FromQuery] double? fromSeconds = null,
+            [FromQuery] double? toSeconds = null,
             CancellationToken ct = default)
         {
             await EnsureReadyAsync(ct);
 
             const string columns = @"id, position_seconds, frame_number, score, image_key,
-       created_at, look_score, story_score, source";
+       created_at, look_score, story_score, source, story_from";
+
+            var window =
+                (fromSeconds.HasValue ? " AND position_seconds >= @fromSeconds" : "") +
+                (toSeconds.HasValue ? " AND position_seconds <= @toSeconds" : "");
 
             var page = @"
 SELECT " + columns + @"
 FROM frl.frl_movie_key_images
-WHERE movie_id = @movieId AND decision = 'proposed'
+WHERE movie_id = @movieId AND decision = 'proposed'" + window + @"
 ORDER BY " + (blend.HasValue
                 ? @"(1 - @blend) * COALESCE(look_score, 0) +
                     @blend * COALESCE(story_score, 0) DESC, position_seconds"
@@ -917,6 +928,10 @@ LIMIT @limit OFFSET @offset";
             cmd.Parameters.AddWithValue("@movieId", movieId);
             if (blend.HasValue)
                 cmd.Parameters.AddWithValue("@blend", (decimal)Math.Clamp(blend.Value, 0, 1));
+            if (fromSeconds.HasValue)
+                cmd.Parameters.AddWithValue("@fromSeconds", (decimal)fromSeconds.Value);
+            if (toSeconds.HasValue)
+                cmd.Parameters.AddWithValue("@toSeconds", (decimal)toSeconds.Value);
             cmd.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, MaxProposalPageSize));
             cmd.Parameters.AddWithValue("@offset", Math.Max(0, offset));
 
@@ -938,12 +953,18 @@ LIMIT @limit OFFSET @offset";
                         createdAt = reader.GetDateTime(5),
                         lookScore = reader.IsDBNull(6) ? (double?)null : (double)reader.GetDecimal(6),
                         storyScore = reader.IsDBNull(7) ? (double?)null : (double)reader.GetDecimal(7),
-                        source = reader.IsDBNull(8) ? null : reader.GetString(8)
+                        source = reader.IsDBNull(8) ? null : reader.GetString(8),
+                        storyFrom = reader.IsDBNull(9) ? null : reader.GetString(9)
                     });
                 }
             }
 
-            return Ok(new { proposals, total = await CountProposalsAsync(movieId, ct) });
+            var total = fromSeconds.HasValue || toSeconds.HasValue
+                ? await KeyImageProposalStore.CountAsync(
+                    _connection, movieId, fromSeconds, toSeconds, ct)
+                : await CountProposalsAsync(movieId, ct);
+
+            return Ok(new { proposals, total });
         }
 
         /// <summary>
@@ -1008,8 +1029,16 @@ WHERE id = ANY(@ids);";
             KeyImageProposalStore.CountAsync(_connection, movieId, ct);
 
         private Task<int> StoreProposalsAsync(
-            int movieId, JsonElement proposals, CancellationToken ct) =>
-            KeyImageProposalStore.StoreAsync(_connection, movieId, proposals, ct);
+            int movieId, JsonElement proposals, string? storyFrom, CancellationToken ct) =>
+            KeyImageProposalStore.StoreAsync(
+                _connection, movieId, proposals, storyFrom, ct);
+
+        /// <summary>
+        /// How the run judged the story half: reading the movie's walkthrough,
+        /// or matching frames against its plot summary.
+        /// </summary>
+        private static string? StoryFrom(JsonElement job) =>
+            job.TryGetProperty("storyFrom", out var from) ? from.GetString() : null;
 
         private Task<string[]> DescriptionColumnsAsync(CancellationToken ct) =>
             MovieDescriptions.ColumnsAsync(_connection, ct);
@@ -1127,6 +1156,7 @@ ALTER TABLE frl.frl_movie_key_images
     ADD COLUMN IF NOT EXISTS score        NUMERIC(6,3),
     ADD COLUMN IF NOT EXISTS look_score   NUMERIC(6,3),
     ADD COLUMN IF NOT EXISTS story_score  NUMERIC(6,3),
+    ADD COLUMN IF NOT EXISTS story_from   VARCHAR(16),
     ADD COLUMN IF NOT EXISTS image_key    TEXT,
     ADD COLUMN IF NOT EXISTS decided_by   VARCHAR(120),
     ADD COLUMN IF NOT EXISTS decided_at   TIMESTAMPTZ;

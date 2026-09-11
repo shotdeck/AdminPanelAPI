@@ -371,7 +371,8 @@ namespace AdminPanelAPI.Services
                 job.TryGetProperty("proposals", out var proposals) &&
                 proposals.ValueKind == JsonValueKind.Array)
             {
-                proposed = await KeyImageProposalStore.StoreAsync(connection, movieId, proposals, ct);
+                proposed = await KeyImageProposalStore.StoreAsync(
+                    connection, movieId, proposals, Text(job, "storyFrom"), ct);
                 _logger.LogInformation(
                     "Stored {Count} proposals for movie {MovieId} from its automatic analysis.",
                     proposed, movieId);
