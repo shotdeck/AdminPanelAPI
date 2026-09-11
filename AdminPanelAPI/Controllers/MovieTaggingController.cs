@@ -662,42 +662,54 @@ WHERE id = @id;";
         [HttpGet("preparation")]
         [ProducesResponseType(StatusCodes.Status200OK)]
         public async Task<IActionResult> GetPreparation(
-            [FromQuery] int movieId, CancellationToken ct = default)
+            [FromQuery] int movieId = 0,
+            [FromQuery] string? movieIds = null,
+            CancellationToken ct = default)
         {
             await EnsureReadyAsync(ct);
 
-            var row = await MoviePreparationStore.GetAsync(_connection, movieId, ct);
-            if (row == null)
-                return Ok(new { movieId, prepared = false });
-
-            return Ok(new
+            if (!string.IsNullOrWhiteSpace(movieIds))
             {
-                movieId,
-                prepared = true,
-                sourceKey = row.SourceKey,
-                running = row.Running,
-                startedAt = row.StartedAt,
-                updatedAt = row.UpdatedAt,
-                walkthrough = new
-                {
-                    jobId = row.WalkthroughJobId,
-                    status = row.WalkthroughStatus,
-                    stage = row.WalkthroughStage,
-                    progress = row.WalkthroughProgress,
-                    shots = row.WalkthroughShots,
-                    error = row.WalkthroughError
-                },
-                analysis = new
-                {
-                    jobId = row.AnalysisJobId,
-                    status = row.AnalysisStatus,
-                    stage = row.AnalysisStage,
-                    progress = row.AnalysisProgress,
-                    proposals = row.AnalysisProposals,
-                    error = row.AnalysisError
-                }
-            });
+                var ids = movieIds.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(part => int.TryParse(part.Trim(), out var id) ? id : 0)
+                    .Where(id => id > 0);
+                var rows = await MoviePreparationStore.ListAsync(_connection, ids, ct);
+                return Ok(new { movies = rows.Select(Preparation) });
+            }
+
+            var row = await MoviePreparationStore.GetAsync(_connection, movieId, ct);
+            return row == null
+                ? Ok(new { movieId, prepared = false })
+                : Ok(Preparation(row));
         }
+
+        private static object Preparation(MoviePreparationRow row) => new
+        {
+            movieId = row.MovieId,
+            prepared = true,
+            sourceKey = row.SourceKey,
+            running = row.Running,
+            startedAt = row.StartedAt,
+            updatedAt = row.UpdatedAt,
+            walkthrough = new
+            {
+                jobId = row.WalkthroughJobId,
+                status = row.WalkthroughStatus,
+                stage = row.WalkthroughStage,
+                progress = row.WalkthroughProgress,
+                shots = row.WalkthroughShots,
+                error = row.WalkthroughError
+            },
+            analysis = new
+            {
+                jobId = row.AnalysisJobId,
+                status = row.AnalysisStatus,
+                stage = row.AnalysisStage,
+                progress = row.AnalysisProgress,
+                proposals = row.AnalysisProposals,
+                error = row.AnalysisError
+            }
+        };
 
         /// <summary>
         /// The film described shot by shot: a timestamped account of what is on

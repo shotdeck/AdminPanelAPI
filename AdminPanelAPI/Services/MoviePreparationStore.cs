@@ -109,6 +109,29 @@ ORDER BY started_at;";
         }
 
         /// <summary>
+        /// The preparation rows for a set of movies, for the tagging list's
+        /// status column: one query rather than one request per row.
+        /// </summary>
+        public static async Task<List<MoviePreparationRow>> ListAsync(
+            NpgsqlConnection connection, IEnumerable<int> movieIds, CancellationToken ct)
+        {
+            var ids = movieIds.Distinct().ToArray();
+            var rows = new List<MoviePreparationRow>();
+            if (ids.Length == 0) return rows;
+
+            var sql = $@"
+SELECT {Columns} FROM frl.frl_movie_preparation
+WHERE movie_id = ANY(@ids) ORDER BY movie_id;";
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@ids", ids);
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                rows.Add(Read(reader));
+            return rows;
+        }
+
+        /// <summary>
         /// Claim a movie for preparation, returning false when another worker (or
         /// an earlier pass) already has this SF in hand. Claiming and starting are
         /// separate steps, so the insert is what stops two runs of the same film:
