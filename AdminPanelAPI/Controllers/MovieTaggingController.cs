@@ -116,6 +116,15 @@ namespace ShotDeckSearch.Controllers
             /// rather than the film's synopsis.
             /// </summary>
             public bool Force { get; set; }
+
+            /// <summary>
+            /// How the story half is to be judged: "walkthrough" from the
+            /// ratings read out of the movie's walkthrough, "description" by
+            /// matching frames against its plot, or unset for the walkthrough
+            /// if there is one. Naming it is what lets both ways be run over
+            /// one movie and their frames compared.
+            /// </summary>
+            public string? StoryFrom { get; set; }
         }
 
         public sealed class WalkthroughRequest
@@ -647,8 +656,16 @@ WHERE id = @id;";
             if (description.Length == 0)
                 description = (await MovieDescriptionAsync(request.MovieId, ct)).Description ?? "";
 
+            var storyFrom = (request.StoryFrom ?? "").Trim().ToLowerInvariant();
+            if (storyFrom is not ("" or "walkthrough" or "description"))
+                return BadRequest(new
+                {
+                    error = "storyFrom must be walkthrough or description."
+                });
+
             var result = await _analysis.StartAsync(
-                sourceKey, request.MovieId, description, ct);
+                sourceKey, request.MovieId, description,
+                storyFrom.Length == 0 ? null : storyFrom, ct);
             return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
         }
 
@@ -886,6 +903,11 @@ WHERE id = @id;";
         /// fromSeconds/toSeconds narrow the page to one stretch of the film, so
         /// a shot found in the walkthrough can show the frames proposed out of
         /// it; total then counts that stretch rather than the whole movie.
+        ///
+        /// storyFrom narrows the page to the run that judged the story half
+        /// that way, which is how the walkthrough's frames and the plot's are
+        /// compared; runs always reports what each way of judging has waiting,
+        /// so the page knows which comparisons it can offer.
         /// </summary>
         [HttpGet("key-image-proposals")]
         [ProducesResponseType(StatusCodes.Status200OK)]
@@ -897,16 +919,25 @@ WHERE id = @id;";
             [FromQuery] bool byScore = false,
             [FromQuery] double? fromSeconds = null,
             [FromQuery] double? toSeconds = null,
+            [FromQuery] string? storyFrom = null,
             CancellationToken ct = default)
         {
             await EnsureReadyAsync(ct);
+
+            var run = (storyFrom ?? "").Trim().ToLowerInvariant();
+            if (run is not ("" or "walkthrough" or "description"))
+                return BadRequest(new
+                {
+                    error = "storyFrom must be walkthrough or description."
+                });
 
             const string columns = @"id, position_seconds, frame_number, score, image_key,
        created_at, look_score, story_score, source, story_from";
 
             var window =
                 (fromSeconds.HasValue ? " AND position_seconds >= @fromSeconds" : "") +
-                (toSeconds.HasValue ? " AND position_seconds <= @toSeconds" : "");
+                (toSeconds.HasValue ? " AND position_seconds <= @toSeconds" : "") +
+                (run.Length == 0 ? "" : " AND story_from = @storyFrom");
 
             var page = @"
 SELECT " + columns + @"
@@ -932,6 +963,8 @@ LIMIT @limit OFFSET @offset";
                 cmd.Parameters.AddWithValue("@fromSeconds", (decimal)fromSeconds.Value);
             if (toSeconds.HasValue)
                 cmd.Parameters.AddWithValue("@toSeconds", (decimal)toSeconds.Value);
+            if (run.Length > 0)
+                cmd.Parameters.AddWithValue("@storyFrom", run);
             cmd.Parameters.AddWithValue("@limit", Math.Clamp(limit, 1, MaxProposalPageSize));
             cmd.Parameters.AddWithValue("@offset", Math.Max(0, offset));
 
@@ -959,12 +992,39 @@ LIMIT @limit OFFSET @offset";
                 }
             }
 
-            var total = fromSeconds.HasValue || toSeconds.HasValue
-                ? await KeyImageProposalStore.CountAsync(
-                    _connection, movieId, fromSeconds, toSeconds, ct)
-                : await CountProposalsAsync(movieId, ct);
+            var runs = await RunsAsync(movieId, ct);
+            var total = run.Length > 0
+                ? runs.TryGetValue(run, out var counted) ? counted : 0
+                : fromSeconds.HasValue || toSeconds.HasValue
+                    ? await KeyImageProposalStore.CountAsync(
+                        _connection, movieId, fromSeconds, toSeconds, ct)
+                    : await CountProposalsAsync(movieId, ct);
 
-            return Ok(new { proposals, total });
+            return Ok(new { proposals, total, storyFrom = run.Length == 0 ? null : run, runs });
+        }
+
+        /// <summary>
+        /// What each way of judging the story half has waiting on this movie,
+        /// so the page can offer one run against the other. Frames from before
+        /// a run recorded how it judged are counted as "unknown".
+        /// </summary>
+        private async Task<Dictionary<string, int>> RunsAsync(
+            int movieId, CancellationToken ct)
+        {
+            const string sql = @"
+SELECT COALESCE(story_from, 'unknown'), count(*)
+FROM frl.frl_movie_key_images
+WHERE movie_id = @movieId AND decision = 'proposed' AND source = 'ai'
+GROUP BY 1;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+
+            var runs = new Dictionary<string, int>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                runs[reader.GetString(0)] = (int)reader.GetInt64(1);
+            return runs;
         }
 
         /// <summary>
@@ -1147,8 +1207,9 @@ CREATE TABLE IF NOT EXISTS frl.frl_movie_key_images (
     captured_by      VARCHAR(120),
     created_at       TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ux_fmki_movie_position
-    ON frl.frl_movie_key_images (movie_id, position_seconds);
+-- Superseded by ux_fmki_movie_position_story below, which allows a second of
+-- film to be proposed by both ways of judging the story.
+DROP INDEX IF EXISTS frl.ux_fmki_movie_position;
 ALTER TABLE frl.frl_movie_key_images
     ADD COLUMN IF NOT EXISTS frame_number INTEGER,
     ADD COLUMN IF NOT EXISTS source       VARCHAR(16)  NOT NULL DEFAULT 'tagger',
@@ -1160,6 +1221,10 @@ ALTER TABLE frl.frl_movie_key_images
     ADD COLUMN IF NOT EXISTS image_key    TEXT,
     ADD COLUMN IF NOT EXISTS decided_by   VARCHAR(120),
     ADD COLUMN IF NOT EXISTS decided_at   TIMESTAMPTZ;
+-- One row per second of film per way of judging it, so a movie can hold the
+-- walkthrough's run and the plot's at once and the two be compared.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_fmki_movie_position_story
+    ON frl.frl_movie_key_images (movie_id, position_seconds, COALESCE(story_from, ''));
 CREATE INDEX IF NOT EXISTS idx_fmki_movie_decision
     ON frl.frl_movie_key_images (movie_id, decision);"
                 + MoviePreparationStore.Schema;

@@ -43,11 +43,15 @@ WHERE movie_id = @movieId AND decision = 'proposed'" +
 
         /// <summary>
         /// Put a finished job's proposals in the key image table as undecided
-        /// frames, so the movie holds this run and only this run: a frame the
-        /// run still proposes keeps whatever was decided about it and takes the
-        /// new scores, and every other frame the analysis produced goes, so
-        /// re-analysing does not pile run on run. Frames picked by hand while
-        /// watching are not the analysis's to remove and survive untouched.
+        /// frames, so the movie holds this run and only this run of its kind: a
+        /// frame the run still proposes keeps whatever was decided about it and
+        /// takes the new scores, and every other frame judged the same way
+        /// goes, so re-analysing does not pile run on run. A run judged the
+        /// other way is left alone, which is what lets the walkthrough's
+        /// frames and the plot's sit side by side for comparison; frames of
+        /// unknown provenance, from before a run said, belong to neither and
+        /// are cleared. Frames picked by hand while watching are not the
+        /// analysis's to remove and survive untouched.
         /// </summary>
         public static async Task<int> StoreAsync(
             NpgsqlConnection connection,
@@ -88,11 +92,10 @@ SELECT @movieId, position, frame, score, look, story, @storyFrom, image_key,
        'ai', 'proposed'
 FROM unnest(@positions, @frames, @scores, @looks, @stories, @keys)
     AS proposal(position, frame, score, look, story, image_key)
-ON CONFLICT (movie_id, position_seconds) DO UPDATE
+ON CONFLICT (movie_id, position_seconds, COALESCE(story_from, '')) DO UPDATE
     SET score       = EXCLUDED.score,
         look_score  = EXCLUDED.look_score,
         story_score = EXCLUDED.story_score,
-        story_from  = EXCLUDED.story_from,
         image_key   = EXCLUDED.image_key
     WHERE frl.frl_movie_key_images.decision = 'proposed'
       AND frl.frl_movie_key_images.source = 'ai';
@@ -100,7 +103,9 @@ ON CONFLICT (movie_id, position_seconds) DO UPDATE
 DELETE FROM frl.frl_movie_key_images
 WHERE movie_id = @movieId
   AND source = 'ai'
-  AND position_seconds <> ALL(@positions);";
+  AND (story_from IS NULL OR story_from IS NOT DISTINCT FROM @storyFrom)
+  AND (story_from IS DISTINCT FROM @storyFrom
+       OR position_seconds <> ALL(@positions));";
 
             await using var cmd = new NpgsqlCommand(sql, connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);

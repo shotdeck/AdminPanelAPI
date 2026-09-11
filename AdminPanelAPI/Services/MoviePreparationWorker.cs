@@ -239,7 +239,10 @@ namespace AdminPanelAPI.Services
             var synopsis = services.GetRequiredService<IFilmSynopsisService>();
 
             var (description, _) = await MovieDescriptions.ForAsync(connection, synopsis, movieId, ct);
-            var result = await analysis.StartAsync(sourceKey, movieId, description, ct);
+            // Left to itself a movie is judged whichever way it can be: the
+            // walkthrough it has just had read, or its plot if that failed.
+            var result = await analysis.StartAsync(
+                sourceKey, movieId, description, null, ct);
 
             var (jobId, error) = JobFrom(result);
             await MoviePreparationStore.SetJobAsync(

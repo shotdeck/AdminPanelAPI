@@ -12,8 +12,14 @@ namespace AdminPanelAPI.Services
     /// </summary>
     public interface IKeyImageAnalysisService
     {
+        /// <summary>
+        /// storyFrom names how the story half is to be judged, "walkthrough"
+        /// or "description"; left unset the run takes the walkthrough if the
+        /// movie has one.
+        /// </summary>
         Task<TranscodeResult> StartAsync(
-            string sourceKey, int movieId, string? description, CancellationToken ct);
+            string sourceKey, int movieId, string? description, string? storyFrom,
+            CancellationToken ct);
 
         Task<TranscodeResult> GetJobAsync(string jobId, bool includeProposals, CancellationToken ct);
 
@@ -47,11 +53,14 @@ namespace AdminPanelAPI.Services
         }
 
         public Task<TranscodeResult> StartAsync(
-            string sourceKey, int movieId, string? description, CancellationToken ct)
+            string sourceKey, int movieId, string? description, string? storyFrom,
+            CancellationToken ct)
         {
             var query = $"?key={Uri.EscapeDataString(sourceKey)}&movie_id={movieId}";
             if (!string.IsNullOrWhiteSpace(description))
                 query += $"&description={Uri.EscapeDataString(description)}";
+            if (!string.IsNullOrWhiteSpace(storyFrom))
+                query += $"&story_from={Uri.EscapeDataString(storyFrom)}";
             if (!string.IsNullOrWhiteSpace(_bucketName))
                 query += $"&bucket={Uri.EscapeDataString(_bucketName)}";
 
