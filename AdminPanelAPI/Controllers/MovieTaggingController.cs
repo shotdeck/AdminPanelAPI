@@ -654,8 +654,9 @@ WHERE id = @id;";
 
         /// <summary>
         /// What has been done to this movie without anybody asking: the
-        /// walkthrough and the key image analysis that start off the back of its
-        /// SF proxy appearing. This is what the tagging page shows as the
+        /// walkthrough, the reading of it that rates which moments are worth a
+        /// still, and the key image analysis, all off the back of its SF proxy
+        /// appearing. This is what the tagging page shows as the
         /// movie's preparation status, and what tells the Analyse button a run
         /// is already going.
         /// </summary>
@@ -699,6 +700,15 @@ WHERE id = @id;";
                 progress = row.WalkthroughProgress,
                 shots = row.WalkthroughShots,
                 error = row.WalkthroughError
+            },
+            story = new
+            {
+                jobId = row.StoryJobId,
+                status = row.StoryStatus,
+                stage = row.StoryStage,
+                progress = row.StoryProgress,
+                shotsRated = row.StoryRated,
+                error = row.StoryError
             },
             analysis = new
             {

@@ -5,9 +5,16 @@ namespace AdminPanelAPI.Services
 {
     /// <summary>
     /// Prepares a movie the moment its SF proxy shows up in R2: describes the
-    /// film shot by shot and analyses it for key images, both on the proxy and
-    /// both without anybody asking, so a tagger who finishes watching finds the
-    /// proposals and the walkthrough already there.
+    /// film shot by shot, reads those descriptions to rate which moments are
+    /// worth a still, then analyses the proxy for key images against those
+    /// ratings — all without anybody asking, so a tagger who finishes watching
+    /// finds the proposals and the walkthrough already there.
+    ///
+    /// The three run in that order because each reads the one before: the
+    /// analysis ranks frames on what the film is doing at that moment, which
+    /// only the walkthrough knows. A film whose walkthrough or ratings failed is
+    /// still analysed, against its plot instead, so a failure costs quality
+    /// rather than the proposals.
     ///
     /// The jobs run on Modal for a quarter of an hour or more, which is why this
     /// lives in the API rather than in the tagging page: nothing has to stay
@@ -32,9 +39,10 @@ namespace AdminPanelAPI.Services
         private static readonly TimeSpan StartupDelay = TimeSpan.FromSeconds(45);
 
         /// <summary>
-        /// How many movies may be in hand at once. Each one is a quarter of an
-        /// hour of GPU twice over, so a bucket full of proxies that predate this
-        /// is drained a couple of films at a time rather than all at once.
+        /// How many movies may be in hand at once. Each one is the best part of
+        /// an hour of GPU across its three jobs, so a bucket full of proxies
+        /// that predate this is drained a couple of films at a time rather than
+        /// all at once.
         /// </summary>
         private const int MoviesAtOnce = 2;
 
@@ -143,7 +151,6 @@ namespace AdminPanelAPI.Services
                 inFlight += 1;
 
                 await StartWalkthroughAsync(services, connection, movie.MovieId, sourceKey, ct);
-                await StartAnalysisAsync(services, connection, movie.MovieId, sourceKey, ct);
             }
         }
 
@@ -184,6 +191,41 @@ namespace AdminPanelAPI.Services
                 connection, movieId, "walkthrough", jobId,
                 jobId is null ? MoviePreparationStore.Error : MoviePreparationStore.Running,
                 error, ct);
+
+            // A walkthrough that never started leaves nothing to read, so the
+            // analysis goes ahead on the film's plot instead of waiting.
+            if (jobId is null)
+                await StartAnalysisAsync(services, connection, movieId, sourceKey, ct);
+        }
+
+        /// <summary>
+        /// Read the walkthrough and rate its shots. The film's plot is handed
+        /// over as context when there is one, so the model judges a moment
+        /// against the story rather than against its neighbours alone.
+        /// </summary>
+        private async Task StartStoryAsync(
+            IServiceProvider services,
+            NpgsqlConnection connection,
+            int movieId,
+            string sourceKey,
+            CancellationToken ct)
+        {
+            var story = services.GetRequiredService<IStoryRatingService>();
+            var synopsis = services.GetRequiredService<IFilmSynopsisService>();
+
+            var (description, _) = await MovieDescriptions.ForAsync(connection, synopsis, movieId, ct);
+            var result = await story.StartAsync(sourceKey, movieId, description, ct);
+
+            var (jobId, error) = JobFrom(result);
+            await MoviePreparationStore.SetJobAsync(
+                connection, movieId, "story", jobId,
+                jobId is null ? MoviePreparationStore.Error : MoviePreparationStore.Running,
+                error, ct);
+
+            // Without ratings there is nothing to wait for, so the analysis goes
+            // ahead on the plot rather than stalling the movie here.
+            if (jobId is null)
+                await StartAnalysisAsync(services, connection, movieId, sourceKey, ct);
         }
 
         private async Task StartAnalysisAsync(
@@ -226,7 +268,11 @@ namespace AdminPanelAPI.Services
 
                 if (row.WalkthroughStatus == MoviePreparationStore.Running &&
                     row.WalkthroughJobId is { Length: > 0 } walkthroughJob)
-                    await PollWalkthroughAsync(services, connection, row.MovieId, walkthroughJob, ct);
+                    await PollWalkthroughAsync(services, connection, row, walkthroughJob, ct);
+
+                if (row.StoryStatus == MoviePreparationStore.Running &&
+                    row.StoryJobId is { Length: > 0 } storyJob)
+                    await PollStoryAsync(services, connection, row, storyJob, ct);
 
                 if (row.AnalysisStatus == MoviePreparationStore.Running &&
                     row.AnalysisJobId is { Length: > 0 } analysisJob)
@@ -237,7 +283,7 @@ namespace AdminPanelAPI.Services
         private async Task PollWalkthroughAsync(
             IServiceProvider services,
             NpgsqlConnection connection,
-            int movieId,
+            MoviePreparationRow row,
             string jobId,
             CancellationToken ct)
         {
@@ -248,18 +294,60 @@ namespace AdminPanelAPI.Services
 
             using var document = JsonDocument.Parse(result.Body);
             var job = document.RootElement;
-            var status = Text(job, "status") ?? MoviePreparationStore.Running;
+            var status = Status(job);
 
             await MoviePreparationStore.SetProgressAsync(
-                connection, movieId, "walkthrough", status,
+                connection, row.MovieId, "walkthrough", status,
                 Text(job, "stage"), Number(job, "progress"),
                 job.TryGetProperty("shots", out var shots) && shots.ValueKind == JsonValueKind.Number
                     ? shots.GetInt32() : null,
                 Text(job, "error"), ct);
 
+            if (status == MoviePreparationStore.Completed)
+            {
+                _logger.LogInformation("Walkthrough for movie {MovieId} completed.", row.MovieId);
+                await StartStoryAsync(services, connection, row.MovieId, row.SourceKey, ct);
+            }
+            else if (status == MoviePreparationStore.Error)
+            {
+                _logger.LogWarning(
+                    "Walkthrough for movie {MovieId} failed; analysing on its plot instead.",
+                    row.MovieId);
+                await StartAnalysisAsync(services, connection, row.MovieId, row.SourceKey, ct);
+            }
+        }
+
+        private async Task PollStoryAsync(
+            IServiceProvider services,
+            NpgsqlConnection connection,
+            MoviePreparationRow row,
+            string jobId,
+            CancellationToken ct)
+        {
+            var story = services.GetRequiredService<IStoryRatingService>();
+            var result = await story.GetJobAsync(jobId, ct);
+            if (!result.IsSuccess)
+                return;
+
+            using var document = JsonDocument.Parse(result.Body);
+            var job = document.RootElement;
+            var status = Status(job);
+
+            await MoviePreparationStore.SetProgressAsync(
+                connection, row.MovieId, "story", status,
+                Text(job, "stage"), Number(job, "progress"),
+                job.TryGetProperty("rated", out var rated) &&
+                rated.ValueKind == JsonValueKind.Number ? rated.GetInt32() : null,
+                Text(job, "error"), ct);
+
+            // Either way the analysis is next: with ratings it ranks on the
+            // story, without them on the plot.
             if (status is MoviePreparationStore.Completed or MoviePreparationStore.Error)
+            {
                 _logger.LogInformation(
-                    "Walkthrough for movie {MovieId} {Status}.", movieId, status);
+                    "Story rating for movie {MovieId} {Status}.", row.MovieId, status);
+                await StartAnalysisAsync(services, connection, row.MovieId, row.SourceKey, ct);
+            }
         }
 
         private async Task PollAnalysisAsync(
@@ -276,7 +364,7 @@ namespace AdminPanelAPI.Services
 
             using var document = JsonDocument.Parse(result.Body);
             var job = document.RootElement;
-            var status = Text(job, "status") ?? MoviePreparationStore.Running;
+            var status = Status(job);
 
             int? proposed = null;
             if (status == MoviePreparationStore.Completed &&
@@ -294,6 +382,18 @@ namespace AdminPanelAPI.Services
                 Text(job, "stage"), Number(job, "progress"), proposed,
                 Text(job, "error"), ct);
         }
+
+        /// <summary>
+        /// Where a job has got to, in the three words this stores. A job waiting
+        /// for a GPU calls itself queued, which counts as running here: anything
+        /// but running stops it being polled, and a queued job has not finished.
+        /// </summary>
+        private static string Status(JsonElement job) => Text(job, "status") switch
+        {
+            MoviePreparationStore.Completed => MoviePreparationStore.Completed,
+            MoviePreparationStore.Error => MoviePreparationStore.Error,
+            _ => MoviePreparationStore.Running
+        };
 
         /// <summary>A started job's id, or why it could not be started.</summary>
         private static (string? JobId, string? Error) JobFrom(TranscodeResult result)
