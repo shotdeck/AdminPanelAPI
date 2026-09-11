@@ -160,6 +160,8 @@ ON CONFLICT (movie_id) DO UPDATE
         started_at           = now(),
         updated_at           = now()
     WHERE frl.frl_movie_preparation.source_key <> EXCLUDED.source_key
+      AND frl.frl_movie_preparation.walkthrough_status <> 'running'
+      AND frl.frl_movie_preparation.analysis_status <> 'running'
 RETURNING movie_id;";
 
             await using var cmd = new NpgsqlCommand(sql, connection);

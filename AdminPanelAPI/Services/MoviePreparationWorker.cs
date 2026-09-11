@@ -31,6 +31,13 @@ namespace AdminPanelAPI.Services
         /// </summary>
         private static readonly TimeSpan StartupDelay = TimeSpan.FromSeconds(45);
 
+        /// <summary>
+        /// How many movies may be in hand at once. Each one is a quarter of an
+        /// hour of GPU twice over, so a bucket full of proxies that predate this
+        /// is drained a couple of films at a time rather than all at once.
+        /// </summary>
+        private const int MoviesAtOnce = 2;
+
         public MoviePreparationWorker(
             IServiceScopeFactory scopeFactory,
             IConfiguration configuration,
@@ -107,6 +114,10 @@ namespace AdminPanelAPI.Services
             await connection.OpenAsync(ct);
             await MoviePreparationStore.EnsureTableAsync(connection, ct);
 
+            var inFlight = (await MoviePreparationStore.ListRunningAsync(connection, ct)).Count;
+            if (inFlight >= MoviesAtOnce)
+                return;
+
             var known = await MoviePreparationStore.KnownSourcesAsync(connection, ct);
             var movieIds = await MovieFoldersAsync(storage, ct);
             if (movieIds.Count == 0)
@@ -116,6 +127,8 @@ namespace AdminPanelAPI.Services
             foreach (var movie in variants)
             {
                 ct.ThrowIfCancellationRequested();
+                if (inFlight >= MoviesAtOnce)
+                    return;
 
                 if (movie.SlimKey is not { Length: > 0 } sourceKey)
                     continue;
@@ -127,6 +140,7 @@ namespace AdminPanelAPI.Services
 
                 _logger.LogInformation(
                     "Preparing movie {MovieId} from its SF proxy.", movie.MovieId);
+                inFlight += 1;
 
                 await StartWalkthroughAsync(services, connection, movie.MovieId, sourceKey, ct);
                 await StartAnalysisAsync(services, connection, movie.MovieId, sourceKey, ct);
