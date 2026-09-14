@@ -183,8 +183,57 @@ namespace ShotDeckSearch.Controllers
         public async Task<IActionResult> MoveFolder(
             [FromBody] MovePrefixRequest request, CancellationToken ct = default)
         {
-            return await GuardAsync(() => _storage.MovePrefixAsync(
-                request.SourcePrefix, request.TargetPrefix, request.DeleteSource, ct));
+            return await GuardAsync(async () =>
+            {
+                var moved = await _storage.MovePrefixAsync(
+                    request.SourcePrefix, request.TargetPrefix, request.DeleteSource, ct);
+
+                if (request.DeleteSource)
+                    await FollowIdentificationsAsync(moved, ct);
+
+                return moved;
+            });
+        }
+
+        /// <summary>
+        /// Carry the identification of every file in a promoted folder over to
+        /// its new key, and note the movie id the folder is named after: a file
+        /// that was identified in staging stays identified afterwards.
+        /// </summary>
+        private async Task FollowIdentificationsAsync(
+            MovePrefixResponse moved, CancellationToken ct)
+        {
+            var movieId = int.TryParse(moved.TargetPrefix.TrimEnd('/'), out var parsed)
+                ? parsed : (int?)null;
+
+            try
+            {
+                var connection = _connection.Value;
+                var mustClose = false;
+                if (connection.State != ConnectionState.Open)
+                {
+                    await connection.OpenAsync(ct);
+                    mustClose = true;
+                }
+
+                try
+                {
+                    await MovieIdentificationStore.EnsureTableAsync(connection, ct);
+                    await MovieIdentificationStore.RekeyAsync(
+                        connection, moved.SourcePrefix, moved.TargetPrefix, movieId, ct);
+                }
+                finally
+                {
+                    if (mustClose) await connection.CloseAsync();
+                }
+            }
+            catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException)
+            {
+                // The files have already moved; losing the note of what they
+                // are is worth a warning, not a failed promote.
+                _logger.LogWarning(ex, "Could not follow identifications to {Target}.",
+                    moved.TargetPrefix);
+            }
         }
 
         /// <summary>

@@ -99,6 +99,9 @@ builder.Services.AddSingleton<IFilmSynopsisService, FilmSynopsisService>();
 builder.Services.AddSingleton<IWalkthroughService, WalkthroughService>();
 builder.Services.AddSingleton<IStoryRatingService, StoryRatingService>();
 
+// TMDB lookups for saying which film an uploaded master is
+builder.Services.AddSingleton<ITmdbService, TmdbService>();
+
 // Describes and analyses a movie as soon as its SF proxy exists, so a tagger
 // who finishes watching finds the walkthrough and the proposals waiting.
 builder.Services.AddHostedService<MoviePreparationWorker>();
