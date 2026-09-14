@@ -4,17 +4,15 @@ using System.Text.Json;
 namespace AdminPanelAPI.Services
 {
     /// <summary>
-    /// Prepares a movie the moment its SF proxy shows up in R2: describes the
-    /// film shot by shot, reads those descriptions to rate which moments are
-    /// worth a still, then analyses the proxy for key images against those
-    /// ratings — all without anybody asking, so a tagger who finishes watching
-    /// finds the proposals and the walkthrough already there.
+    /// Prepares a movie the moment its SF proxy shows up in R2: analyses the
+    /// proxy for key images against the film's plot, without anybody asking, so
+    /// a tagger who finishes watching finds the proposals already there.
     ///
-    /// The three run in that order because each reads the one before: the
-    /// analysis ranks frames on what the film is doing at that moment, which
-    /// only the walkthrough knows. A film whose walkthrough or ratings failed is
-    /// still analysed, against its plot instead, so a failure costs quality
-    /// rather than the proposals.
+    /// Under `MovieFiles:PrepareWalkthrough` the movie is instead described shot
+    /// by shot first and those descriptions rated for the moments worth a still,
+    /// with the analysis judging the story half on the ratings; the three run in
+    /// that order because each reads the one before, and a film whose
+    /// walkthrough or ratings failed is still analysed against its plot.
     ///
     /// The jobs run on Modal for a quarter of an hour or more, which is why this
     /// lives in the API rather than in the tagging page: nothing has to stay
@@ -25,6 +23,7 @@ namespace AdminPanelAPI.Services
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly ILogger<MoviePreparationWorker> _logger;
         private readonly bool _enabled;
+        private readonly bool _walkthrough;
 
         /// <summary>How often R2 is swept for movies with a new SF proxy.</summary>
         private static readonly TimeSpan ScanEvery = TimeSpan.FromMinutes(5);
@@ -54,6 +53,7 @@ namespace AdminPanelAPI.Services
             _scopeFactory = scopeFactory;
             _logger = logger;
             _enabled = configuration.GetValue("MovieFiles:AutoPrepare", true);
+            _walkthrough = configuration.GetValue("MovieFiles:PrepareWalkthrough", false);
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -150,7 +150,10 @@ namespace AdminPanelAPI.Services
                     "Preparing movie {MovieId} from its SF proxy.", movie.MovieId);
                 inFlight += 1;
 
-                await StartWalkthroughAsync(services, connection, movie.MovieId, sourceKey, ct);
+                if (_walkthrough)
+                    await StartWalkthroughAsync(services, connection, movie.MovieId, sourceKey, ct);
+                else
+                    await StartAnalysisAsync(services, connection, movie.MovieId, sourceKey, ct);
             }
         }
 
@@ -239,10 +242,13 @@ namespace AdminPanelAPI.Services
             var synopsis = services.GetRequiredService<IFilmSynopsisService>();
 
             var (description, _) = await MovieDescriptions.ForAsync(connection, synopsis, movieId, ct);
-            // Left to itself a movie is judged whichever way it can be: the
-            // walkthrough it has just had read, or its plot if that failed.
+            // The story half is judged against the film's plot. Where the
+            // walkthrough is being prepared the way is left open instead, so the
+            // run reads the ratings taken from it and falls back to the plot if
+            // they never arrived.
             var result = await analysis.StartAsync(
-                sourceKey, movieId, description, null, ct);
+                sourceKey, movieId, description,
+                _walkthrough ? null : "description", ct);
 
             var (jobId, error) = JobFrom(result);
             await MoviePreparationStore.SetJobAsync(
