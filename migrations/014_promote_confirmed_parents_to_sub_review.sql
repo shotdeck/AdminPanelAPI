@@ -14,7 +14,7 @@
 --
 -- Existing rows (subs already reviewed either way) are left untouched.
 
-INSERT INTO frl.frl_join_images_camera_movements (imageid, movement, confidence, status)
+INSERT INTO frl.frl_join_images_camera_movements (imageid, camera_movements, confidence, status)
 SELECT p.imageid, sub.movement, 0, 'not_checked'
 FROM frl.frl_join_images_camera_movements p
 JOIN (VALUES
@@ -28,6 +28,6 @@ JOIN (VALUES
     ('dolly_out', 'leading'),
     ('pan_left',  'whip_pan_left'),
     ('pan_right', 'whip_pan_right')
-) AS sub(parent, movement) ON sub.parent = p.movement
+) AS sub(parent, movement) ON sub.parent = p.camera_movements
 WHERE p.status = 'ok'
-ON CONFLICT (imageid, movement) DO NOTHING;
+ON CONFLICT (imageid, camera_movements) DO NOTHING;

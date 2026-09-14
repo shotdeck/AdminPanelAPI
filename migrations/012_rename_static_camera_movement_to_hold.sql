@@ -8,15 +8,15 @@
 --    so drop any "static" row that would collide with an existing "hold" row
 --    for the same image before renaming the rest.
 DELETE FROM frl.frl_join_images_camera_movements s
-WHERE s.movement = 'static'
+WHERE s.camera_movements = 'static'
   AND EXISTS (
       SELECT 1 FROM frl.frl_join_images_camera_movements h
-      WHERE h.imageid = s.imageid AND h.movement = 'hold'
+      WHERE h.imageid = s.imageid AND h.camera_movements = 'hold'
   );
 
 UPDATE frl.frl_join_images_camera_movements
-SET movement = 'hold'
-WHERE movement = 'static';
+SET camera_movements = 'hold'
+WHERE camera_movements = 'static';
 
 -- 2. Per-segment analysis JSON stores the raw model labels. Rename the label
 --    value inside the stored JSON. Only the label string values can equal
