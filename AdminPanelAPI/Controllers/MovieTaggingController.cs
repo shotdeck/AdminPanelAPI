@@ -663,9 +663,11 @@ WHERE id = @id;";
                     error = "storyFrom must be walkthrough or description."
                 });
 
+            // The plot is what a run is judged against unless it is asked for
+            // the walkthrough by name.
             var result = await _analysis.StartAsync(
                 sourceKey, request.MovieId, description,
-                storyFrom.Length == 0 ? null : storyFrom, ct);
+                storyFrom.Length == 0 ? "description" : storyFrom, ct);
             return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
         }
 
