@@ -7,14 +7,14 @@
 -- 1. Movement tag rows. The table has a unique (imageid, movement) constraint,
 --    so drop any "static" row that would collide with an existing "hold" row
 --    for the same image before renaming the rest.
-DELETE FROM frl.frl_join_image_camera_movements s
+DELETE FROM frl.frl_join_images_camera_movements s
 WHERE s.movement = 'static'
   AND EXISTS (
-      SELECT 1 FROM frl.frl_join_image_camera_movements h
+      SELECT 1 FROM frl.frl_join_images_camera_movements h
       WHERE h.imageid = s.imageid AND h.movement = 'hold'
   );
 
-UPDATE frl.frl_join_image_camera_movements
+UPDATE frl.frl_join_images_camera_movements
 SET movement = 'hold'
 WHERE movement = 'static';
 

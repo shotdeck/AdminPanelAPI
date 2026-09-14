@@ -75,7 +75,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid
 WHERE i.status = 'live'
   AND NOT EXISTS (
-      SELECT 1 FROM frl.frl_join_image_camera_movements cm
+      SELECT 1 FROM frl.frl_join_images_camera_movements cm
       WHERE cm.imageid = i.idnum
   )
 ORDER BY i.weighted_score DESC
@@ -741,7 +741,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
 WHERE i.status = 'live'
   AND i.movieid = @movieId
   AND NOT EXISTS (
-      SELECT 1 FROM frl.frl_join_image_camera_movements cm
+      SELECT 1 FROM frl.frl_join_images_camera_movements cm
       WHERE cm.imageid = i.idnum
   )
 ORDER BY i.idnum
@@ -933,7 +933,7 @@ SELECT cm.movement,
        COUNT(*) FILTER (WHERE cm.status = 'bad') AS rejected,
        COUNT(*) FILTER (WHERE cm.status = 'not_checked') AS remaining,
        COUNT(*) FILTER (WHERE cm.status = 'flagged') AS flagged
-FROM frl.frl_join_image_camera_movements cm
+FROM frl.frl_join_images_camera_movements cm
 {ownerFilter}
 GROUP BY cm.movement
 ORDER BY total DESC;";
@@ -970,7 +970,7 @@ ORDER BY total DESC;";
 
             const string sql = @"
 SELECT COUNT(DISTINCT imageid)
-FROM frl.frl_join_image_camera_movements;";
+FROM frl.frl_join_images_camera_movements;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             var count = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
@@ -995,7 +995,7 @@ FROM frl.frl_join_image_camera_movements;";
 
             var sql = $@"
 SELECT DISTINCT i.movieid, COALESCE(m.title, '') AS title, m.year AS year
-FROM frl.frl_join_image_camera_movements cm
+FROM frl.frl_join_images_camera_movements cm
 INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
 LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
 WHERE TRUE{ownerFilter}
@@ -1087,20 +1087,20 @@ ORDER BY is_admin DESC, lower(name);";
 SELECT u.name,
   (SELECT COUNT(*) FROM frl.frl_camera_movement_image_owner o
      WHERE lower(o.owner) = lower(u.name){ownerRange}) AS pulled,
-  (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
+  (SELECT COUNT(*) FROM frl.frl_join_images_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name){addedRange}) AS tags_added,
   (SELECT COUNT(*) FROM frl.frl_camera_movement_image_owner o
      WHERE lower(o.owner) = lower(u.name)
-       AND EXISTS (SELECT 1 FROM frl.frl_join_image_camera_movements e
+       AND EXISTS (SELECT 1 FROM frl.frl_join_images_camera_movements e
                    WHERE e.imageid = o.imageid{completedRange})
-       AND NOT EXISTS (SELECT 1 FROM frl.frl_join_image_camera_movements n
+       AND NOT EXISTS (SELECT 1 FROM frl.frl_join_images_camera_movements n
                    WHERE n.imageid = o.imageid AND n.status NOT IN ('ok','bad')
                      AND n.movement NOT IN ({NonQcMovementsSql}))) AS completed,
-  (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
+  (SELECT COUNT(*) FROM frl.frl_join_images_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name) AND cm.status = 'ok'{doneRange}) AS confirmed_tags,
-  (SELECT COUNT(*) FROM frl.frl_join_image_camera_movements cm
+  (SELECT COUNT(*) FROM frl.frl_join_images_camera_movements cm
      JOIN frl.frl_camera_movement_image_owner o ON o.imageid = cm.imageid
      WHERE lower(o.owner) = lower(u.name) AND cm.status IN ('ok','bad'){doneRange}) AS reviewed_tags
 FROM frl.frl_camera_movement_users u{nameFilter}
@@ -1368,7 +1368,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
 
             var countSql = $@"
 SELECT COUNT(*)
-FROM frl.frl_join_image_camera_movements cm{countJoins}
+FROM frl.frl_join_images_camera_movements cm{countJoins}
 WHERE {whereStr};";
 
             await using var countCmd = new NpgsqlCommand(countSql, _connection);
@@ -1396,7 +1396,7 @@ SELECT cm.imageid,
        sb.target_frame,
        m.title AS movie_title,
        m.media_type AS media_type
-FROM frl.frl_join_image_camera_movements cm
+FROM frl.frl_join_images_camera_movements cm
 INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
 INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid{dataLateral}
@@ -1479,7 +1479,7 @@ LIMIT @limit OFFSET @offset;";
                     var idParams = string.Join(",", imageIds.Select((_, idx) => $"@id{idx}"));
                     var movSql = $@"
 SELECT imageid, movement, confidence, status
-FROM frl.frl_join_image_camera_movements
+FROM frl.frl_join_images_camera_movements
 WHERE imageid IN ({idParams});";
 
                     await using var movCmd = new NpgsqlCommand(movSql, _connection);
@@ -1592,7 +1592,7 @@ WHERE imageid IN ({idParams});";
             // Subquery: images that have ALL included movements
             var imageSubquery = $@"
 SELECT imageid
-FROM frl.frl_join_image_camera_movements
+FROM frl.frl_join_images_camera_movements
 WHERE movement IN ({string.Join(",", includeParams)})
 GROUP BY imageid
 HAVING COUNT(DISTINCT movement) = @includeCount";
@@ -1600,7 +1600,7 @@ HAVING COUNT(DISTINCT movement) = @includeCount";
             // If there are excludes, filter them out
             var excludeClause = exclude.Count > 0
                 ? $@" AND imageid NOT IN (
-    SELECT DISTINCT imageid FROM frl.frl_join_image_camera_movements
+    SELECT DISTINCT imageid FROM frl.frl_join_images_camera_movements
     WHERE movement IN ({string.Join(",", excludeParams)})
 )"
                 : "";
@@ -1622,7 +1622,7 @@ INNER JOIN frl.frl_image_scene_boundaries sb
             // Count query
             var countSql = $@"
 SELECT COUNT(*)
-FROM frl.frl_join_image_camera_movements cm{countJoins}
+FROM frl.frl_join_images_camera_movements cm{countJoins}
 WHERE cm.movement = @firstMovement
   AND cm.imageid IN ({imageSubquery}{excludeClause}){statusClause}{cutWhere}{ownerWhere}{movieWhere};";
 
@@ -1657,7 +1657,7 @@ SELECT cm.imageid,
        sb.target_frame,
        m.title AS movie_title,
        m.media_type AS media_type
-FROM frl.frl_join_image_camera_movements cm
+FROM frl.frl_join_images_camera_movements cm
 INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
 INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid{dataLateral}
@@ -1745,7 +1745,7 @@ LIMIT @limit OFFSET @offset;";
                     var idParams = string.Join(",", imageIds.Select((_, idx) => $"@id{idx}"));
                     var movSql = $@"
 SELECT imageid, movement, confidence, status
-FROM frl.frl_join_image_camera_movements
+FROM frl.frl_join_images_camera_movements
 WHERE imageid IN ({idParams});";
 
                     await using var movCmd = new NpgsqlCommand(movSql, _connection);
@@ -1847,7 +1847,7 @@ WHERE imageid IN ({idParams});";
                     continue;
 
                 const string sql = @"
-UPDATE frl.frl_join_image_camera_movements
+UPDATE frl.frl_join_images_camera_movements
 SET status = @status, updated_at = now()
 WHERE imageid = @imageid AND movement = @movement;";
 
@@ -1897,7 +1897,7 @@ WHERE imageid = @imageid AND movement = @movement;";
 
             const string sql = @"
 SELECT movement, confidence, status
-FROM frl.frl_join_image_camera_movements
+FROM frl.frl_join_images_camera_movements
 WHERE imageid = @imageid
 ORDER BY confidence DESC;";
 
@@ -1929,7 +1929,7 @@ ORDER BY confidence DESC;";
 
             const string sql = @"
 SELECT DISTINCT movement
-FROM frl.frl_join_image_camera_movements
+FROM frl.frl_join_images_camera_movements
 ORDER BY movement;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -1965,7 +1965,7 @@ ORDER BY movement;";
             float? confidence = null;
             {
                 const string lookupSql = @"
-SELECT confidence FROM frl.frl_join_image_camera_movements
+SELECT confidence FROM frl.frl_join_images_camera_movements
 WHERE imageid = @imageid AND movement = @movement LIMIT 1;";
                 await using var lookupCmd = new NpgsqlCommand(lookupSql, _connection);
                 lookupCmd.Parameters.AddWithValue("@imageid", request.ImageId);
@@ -1978,11 +1978,11 @@ WHERE imageid = @imageid AND movement = @movement LIMIT 1;";
             // Delete old row + insert new one (movement is part of the PK)
             const string sql = @"
 WITH deleted AS (
-    DELETE FROM frl.frl_join_image_camera_movements
+    DELETE FROM frl.frl_join_images_camera_movements
     WHERE imageid = @imageid AND movement = @oldMovement
     RETURNING imageid, confidence
 )
-INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
+INSERT INTO frl.frl_join_images_camera_movements (imageid, movement, confidence, status)
 SELECT imageid, @newMovement, confidence, 'ok'
 FROM deleted
 ON CONFLICT (imageid, movement) DO UPDATE SET status = 'ok', updated_at = now();";
@@ -2029,7 +2029,7 @@ ON CONFLICT (imageid, movement) DO UPDATE SET status = 'ok', updated_at = now();
             float? confidence = null;
             {
                 const string lookupSql = @"
-SELECT confidence FROM frl.frl_join_image_camera_movements
+SELECT confidence FROM frl.frl_join_images_camera_movements
 WHERE imageid = @imageid AND movement = @movement LIMIT 1;";
                 await using var lookupCmd = new NpgsqlCommand(lookupSql, _connection);
                 lookupCmd.Parameters.AddWithValue("@imageid", request.ImageId);
@@ -2040,7 +2040,7 @@ WHERE imageid = @imageid AND movement = @movement LIMIT 1;";
             }
 
             const string sql = @"
-DELETE FROM frl.frl_join_image_camera_movements
+DELETE FROM frl.frl_join_images_camera_movements
 WHERE imageid = @imageid AND movement = @movement;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -2077,7 +2077,7 @@ WHERE imageid = @imageid AND movement = @movement;";
             if (denied != null) return denied;
 
             const string sql = @"
-INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
+INSERT INTO frl.frl_join_images_camera_movements (imageid, movement, confidence, status)
 VALUES (@imageid, @movement, 0, 'ok')
 ON CONFLICT (imageid, movement) DO NOTHING;";
 
@@ -2243,7 +2243,7 @@ WHERE NOT EXISTS (SELECT 1 FROM frl.frl_camera_movement_users);
 
 INSERT INTO frl.frl_camera_movement_image_owner (imageid, owner)
 SELECT DISTINCT cm.imageid, 'MacK'
-FROM frl.frl_join_image_camera_movements cm
+FROM frl.frl_join_images_camera_movements cm
 WHERE NOT EXISTS (SELECT 1 FROM frl.frl_camera_movement_image_owner)
 ON CONFLICT (imageid) DO NOTHING;";
             await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -2292,7 +2292,7 @@ WITH candidates AS (
     {mediaJoin}
     WHERE i.status = 'live'
       AND NOT EXISTS (
-          SELECT 1 FROM frl.frl_join_image_camera_movements cm
+          SELECT 1 FROM frl.frl_join_images_camera_movements cm
           WHERE cm.imageid = i.idnum)
       AND NOT EXISTS (
           SELECT 1 FROM frl.frl_camera_movement_claims c
@@ -2449,7 +2449,7 @@ WHERE job_id = @jobId;";
             int imageId, string movement, double confidence, CancellationToken ct)
         {
             const string sql = @"
-INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence)
+INSERT INTO frl.frl_join_images_camera_movements (imageid, movement, confidence)
 VALUES (@imageid, @movement, @confidence)
 ON CONFLICT (imageid, movement) DO NOTHING;";
 
@@ -2467,14 +2467,14 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
         private async Task MaybeTagNoMovementAsync(int imageId, CancellationToken ct)
         {
             const string sql = @"
-INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
+INSERT INTO frl.frl_join_images_camera_movements (imageid, movement, confidence, status)
 SELECT @imageid, 'no_movement', 0, 'not_checked'
 WHERE EXISTS (
-    SELECT 1 FROM frl.frl_join_image_camera_movements
+    SELECT 1 FROM frl.frl_join_images_camera_movements
     WHERE imageid = @imageid AND movement = 'hold'
 )
 AND NOT EXISTS (
-    SELECT 1 FROM frl.frl_join_image_camera_movements
+    SELECT 1 FROM frl.frl_join_images_camera_movements
     WHERE imageid = @imageid AND movement NOT IN ('hold', 'no_movement')
 )
 ON CONFLICT (imageid, movement) DO NOTHING;";
@@ -2507,7 +2507,7 @@ ON CONFLICT (imageid, movement) DO NOTHING;";
                 return;
 
             const string sql = @"
-INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
+INSERT INTO frl.frl_join_images_camera_movements (imageid, movement, confidence, status)
 VALUES (@imageid, @movement, 0, 'not_checked')
 ON CONFLICT (imageid, movement) DO NOTHING;";
 
@@ -2649,10 +2649,11 @@ LEFT JOIN LATERAL (
         {
             if (_timestampColumnsReady) return;
             const string sql = @"
-ALTER TABLE frl.frl_join_image_camera_movements ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
-ALTER TABLE frl.frl_join_image_camera_movements ALTER COLUMN created_at SET DEFAULT now();
-ALTER TABLE frl.frl_join_image_camera_movements ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
-ALTER TABLE frl.frl_join_image_camera_movements ALTER COLUMN updated_at SET DEFAULT now();";
+ALTER TABLE IF EXISTS frl.frl_join_image_camera_movements RENAME TO frl_join_images_camera_movements;
+ALTER TABLE frl.frl_join_images_camera_movements ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+ALTER TABLE frl.frl_join_images_camera_movements ALTER COLUMN created_at SET DEFAULT now();
+ALTER TABLE frl.frl_join_images_camera_movements ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+ALTER TABLE frl.frl_join_images_camera_movements ALTER COLUMN updated_at SET DEFAULT now();";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
             _timestampColumnsReady = true;

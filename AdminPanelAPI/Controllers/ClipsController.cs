@@ -930,7 +930,7 @@ SELECT COUNT(*) AS qc_total,
 FROM (
     SELECT cm.imageid,
            bool_and(cm.status IN ('ok', 'bad', 'flagged')) AS all_checked
-    FROM frl.frl_join_image_camera_movements cm
+    FROM frl.frl_join_images_camera_movements cm
     INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
     WHERE i.movieid = @movieId AND i.status = 'live'
     GROUP BY cm.imageid
@@ -967,7 +967,7 @@ LEFT JOIN (
                WHEN bool_or(cm.status IN ('ok', 'bad', 'flagged')) THEN 'partial'
                ELSE 'not_checked'
            END AS qc_status
-    FROM frl.frl_join_image_camera_movements cm
+    FROM frl.frl_join_images_camera_movements cm
     GROUP BY cm.imageid
 ) qc ON qc.imageid = i.idnum
 WHERE i.movieid = @movieId

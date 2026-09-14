@@ -14,9 +14,9 @@
 --
 -- Existing rows (subs already reviewed either way) are left untouched.
 
-INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
+INSERT INTO frl.frl_join_images_camera_movements (imageid, movement, confidence, status)
 SELECT p.imageid, sub.movement, 0, 'not_checked'
-FROM frl.frl_join_image_camera_movements p
+FROM frl.frl_join_images_camera_movements p
 JOIN (VALUES
     ('zoom_in',   'crash_zoom_in'),
     ('zoom_in',   'dolly_zoom_in'),
