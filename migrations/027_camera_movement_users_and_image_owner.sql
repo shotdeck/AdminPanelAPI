@@ -39,6 +39,6 @@ WHERE NOT EXISTS (SELECT 1 FROM frl.frl_camera_movement_users);
 -- no ownership records yet.
 INSERT INTO frl.frl_camera_movement_image_owner (imageid, owner)
 SELECT DISTINCT cm.imageid, 'MacK'
-FROM frl.frl_join_image_camera_movements cm
+FROM frl.frl_join_images_camera_movements cm
 WHERE NOT EXISTS (SELECT 1 FROM frl.frl_camera_movement_image_owner)
 ON CONFLICT (imageid) DO NOTHING;
