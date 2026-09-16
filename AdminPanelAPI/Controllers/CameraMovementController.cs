@@ -1193,12 +1193,29 @@ RETURNING id, name, is_admin;";
             var setPassword = !string.IsNullOrWhiteSpace(request.Password);
             var passwordClause = setPassword ? ", password_hash = @passwordHash" : "";
 
-            // Re-point owned images if the name changes, so their work follows.
+            // Re-point owned images, movie allocations and the frames they
+            // picked if the name changes, so their work follows. Everything
+            // here refers to a reviewer by name rather than by id.
             var sql = $@"
 UPDATE frl.frl_camera_movement_image_owner o
 SET owner = @name
 FROM frl.frl_camera_movement_users u
 WHERE u.id = @id AND o.owner = u.name AND u.name <> @name;
+
+UPDATE frl.frl_movie_tagger_assignments a
+SET tagger = @name
+FROM frl.frl_camera_movement_users u
+WHERE u.id = @id AND lower(a.tagger) = lower(u.name) AND u.name <> @name;
+
+UPDATE frl.frl_movie_tagger_assignments a
+SET assigned_by = @name
+FROM frl.frl_camera_movement_users u
+WHERE u.id = @id AND lower(a.assigned_by) = lower(u.name) AND u.name <> @name;
+
+UPDATE frl.frl_movie_key_images k
+SET captured_by = @name
+FROM frl.frl_camera_movement_users u
+WHERE u.id = @id AND lower(k.captured_by) = lower(u.name) AND u.name <> @name;
 
 UPDATE frl.frl_camera_movement_users
 SET name = @name, is_admin = @isAdmin{passwordClause}
@@ -1248,15 +1265,32 @@ WHERE id = @id;";
             if (isAdmin)
                 return BadRequest(new { error = "Admins cannot be removed." });
 
-            // Reassign the removed reviewer's owned images to the chosen target.
+            // A tagger's allocated movies are held by name, so removing them
+            // without a target would leave those movies allocated to someone
+            // who no longer exists.
+            if (string.IsNullOrWhiteSpace(reassignTo) && await HasMovieAllocationsAsync(removedName, ct))
+                return BadRequest(new
+                {
+                    error = "That reviewer has movies allocated to them. " +
+                            "Name a reviewer to take them on in reassignTo."
+                });
+
+            // Reassign the removed reviewer's owned images, allocated movies
+            // and picked frames to the chosen target.
             if (!string.IsNullOrWhiteSpace(reassignTo))
             {
                 if (!await UserExistsAsync(reassignTo, ct))
                     return BadRequest(new { error = "Reassign target is not a valid reviewer." });
 
-                const string moveSql =
-                    "UPDATE frl.frl_camera_movement_image_owner " +
-                    "SET owner = @to, assigned_at = now() WHERE lower(owner) = lower(@from);";
+                const string moveSql = @"
+UPDATE frl.frl_camera_movement_image_owner
+SET owner = @to, assigned_at = now() WHERE lower(owner) = lower(@from);
+
+UPDATE frl.frl_movie_tagger_assignments
+SET tagger = @to, updated_at = now() WHERE lower(tagger) = lower(@from);
+
+UPDATE frl.frl_movie_key_images
+SET captured_by = @to WHERE lower(captured_by) = lower(@from);";
                 await using var moveCmd = new NpgsqlCommand(moveSql, _connection);
                 moveCmd.Parameters.AddWithValue("@to", reassignTo.Trim());
                 moveCmd.Parameters.AddWithValue("@from", removedName);
@@ -1270,6 +1304,16 @@ WHERE id = @id;";
             if (affected == 0)
                 return BadRequest(new { error = "User not found, or admins cannot be removed." });
             return NoContent();
+        }
+
+        private async Task<bool> HasMovieAllocationsAsync(string name, CancellationToken ct)
+        {
+            const string sql =
+                "SELECT 1 FROM frl.frl_movie_tagger_assignments " +
+                "WHERE lower(tagger) = lower(@name) LIMIT 1;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@name", name);
+            return await cmd.ExecuteScalarAsync(ct) != null;
         }
 
         private async Task<bool> UserExistsAsync(string? name, CancellationToken ct)
