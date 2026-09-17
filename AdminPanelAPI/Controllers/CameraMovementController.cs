@@ -1,9 +1,9 @@
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
+using AdminPanelAPI.Services;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
-using System.Collections.Concurrent;
 using System.Data;
 using System.Security.Cryptography;
 using System.Text;
@@ -17,6 +17,7 @@ namespace ShotDeckSearch.Controllers
     public sealed class CameraMovementController : ControllerBase
     {
         private const int PresignedUrlExpiryMinutes = 60;
+        private const int MaxLivePerCall = 10;
 
         // Movements reviewers are not expected to action: "pov" is hidden from
         // the QC UI entirely, and "track" is visible but deliberately skipped.
@@ -28,25 +29,21 @@ namespace ShotDeckSearch.Controllers
 
         private readonly NpgsqlConnection _connection;
         private readonly IConfiguration _configuration;
-        private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<CameraMovementController> _logger;
+        private readonly CameraMovementAnalysisService _analysis;
 
-        private static readonly JsonSerializerOptions JsonOpts = new()
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        };
+        private static readonly JsonSerializerOptions JsonOpts = CameraMovementAnalysisService.JsonOpts;
 
         public CameraMovementController(
             NpgsqlConnection connection,
             IConfiguration configuration,
-            IHttpClientFactory httpClientFactory,
-            ILogger<CameraMovementController> logger)
+            ILogger<CameraMovementController> logger,
+            CameraMovementAnalysisService analysis)
         {
             _connection = connection;
             _configuration = configuration;
-            _httpClientFactory = httpClientFactory;
             _logger = logger;
+            _analysis = analysis;
         }
 
         // ── GET /api/admin/camera-movements/queue ──────────────────────
@@ -152,154 +149,61 @@ ORDER BY media_type::text;";
             if (limit < 1) limit = 1;
             if (limit > 500) limit = 500;
 
-            var cameraMotionApiUrl = _configuration["CameraMotion:ApiUrl"]
-                ?? "https://semanticsearch--camera-motion-api-fastapi-app.modal.run";
-
             await EnsureOpenAsync(ct);
             await EnsureJobTablesAsync(ct);
             await EnsureUsersTablesAsync(ct);
+            await _analysis.EnsureTablesAsync(ct);
 
-            // 1. Atomically claim the next N unanalyzed images so simultaneous
-            //    fetches (from other sessions) grab disjoint sets. Claims tie to
-            //    a job id; a random one is used when no job is supplied.
-            var claimJobId = jobId ?? Guid.NewGuid();
-            var images = await ClaimImagesAsync(claimJobId, limit, mediaType, ct);
+            // 1. Instant path: hand over images the bank worker has already
+            //    analysed. Ownership (and the reviewer's Pulled stat) starts
+            //    here, not when the image was analysed.
+            var fromBank = 0;
+            if (!string.IsNullOrWhiteSpace(owner))
+                fromBank = await _analysis.AssignFromBankAsync(limit, mediaType, owner, ct);
 
-            if (images.Count == 0)
-                return Ok(new AnalyzeBatchResponse { Processed = 0, Failed = 0, Message = "No images in queue." });
+            int processed = fromBank, failed = 0, total = fromBank;
 
-            // 2. Generate presigned R2 URLs
-            var accountId = _configuration["R2:AccountId"] ?? "";
-            var accessKey = _configuration["R2:AccessKey"] ?? "";
-            var secretKey = _configuration["R2:SecretKey"] ?? "";
-            var bucketName = _configuration["R2:BucketName"] ?? "";
-
-            if (string.IsNullOrWhiteSpace(accountId) || string.IsNullOrWhiteSpace(accessKey) ||
-                string.IsNullOrWhiteSpace(secretKey) || string.IsNullOrWhiteSpace(bucketName))
+            // 2. Fallback: analyse live for whatever the bank could not cover.
+            //    Claims tie to a job id so simultaneous fetches (and the bank
+            //    worker) grab disjoint sets; a random id is used when no job
+            //    is supplied. Live work is capped per call so a large
+            //    bank-sized request does not turn into a multi-minute GPU
+            //    run; the caller loops on Total until it has enough.
+            var remaining = Math.Min(limit - fromBank, MaxLivePerCall);
+            if (remaining > 0)
             {
-                return StatusCode(500, new { error = "R2 settings are missing." });
-            }
+                var claimJobId = jobId ?? Guid.NewGuid();
+                var images = await _analysis.ClaimImagesAsync(claimJobId, remaining, mediaType, ct);
 
-            var creds = new BasicAWSCredentials(accessKey.Trim(), secretKey.Trim());
-            var s3Config = new AmazonS3Config
-            {
-                ServiceURL = $"https://{accountId.Trim()}.r2.cloudflarestorage.com",
-                ForcePathStyle = true,
-                UseAccelerateEndpoint = false,
-                UseDualstackEndpoint = false,
-                EndpointDiscoveryEnabled = false
-            };
-
-            using var s3Client = new AmazonS3Client(creds, s3Config);
-            var httpClient = _httpClientFactory.CreateClient();
-            httpClient.Timeout = TimeSpan.FromMinutes(2);
-
-            int processed = 0, failed = 0;
-
-            // Ensure segments table exists
-            await EnsureSegmentsTableAsync(ct);
-
-            // 3. Process images in parallel (up to 5 concurrent VideoMAE calls)
-            const int maxConcurrency = 5;
-            var throttle = new SemaphoreSlim(maxConcurrency);
-            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, List<VideoMaeSegment>? Segments, bool Success, string? Reason)>();
-
-            var tasks = images.Select(async img =>
-            {
-                await throttle.WaitAsync(ct);
-                try
+                if (images.Count > 0)
                 {
-                    var key = $"clips_9s/{img.MovieId}/{img.RandId}.mp4";
-                    var clipUrl = s3Client.GetPreSignedURL(new GetPreSignedUrlRequest
+                    if (!_analysis.HasR2Settings())
                     {
-                        BucketName = bucketName,
-                        Key = key,
-                        Expires = DateTime.UtcNow.AddMinutes(PresignedUrlExpiryMinutes),
-                        Verb = HttpVerb.GET
-                    });
-
-                    var payload = new
-                    {
-                        url = clipUrl,
-                        start_time = img.StartTime,
-                        end_time = img.EndTime,
-                        include_camerabench = false,
-                    };
-
-                    var jsonContent = new StringContent(
-                        JsonSerializer.Serialize(payload, JsonOpts),
-                        Encoding.UTF8,
-                        "application/json");
-
-                    var response = await httpClient.PostAsync(
-                        $"{cameraMotionApiUrl.TrimEnd('/')}/analyze",
-                        jsonContent,
-                        ct);
-
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        var reason = await ReadFailureReasonAsync(response, ct);
-                        _logger.LogWarning(
-                            "VideoMAE API failed for image {ImageId}: HTTP {Status} {Reason}",
-                            img.ImageId, (int)response.StatusCode, reason);
-                        results.Add((img.ImageId, null, null, false, reason));
-                        return;
+                        await _analysis.ReleaseClaimsAsync(images.Select(i => i.ImageId).ToList(), ct);
+                        return StatusCode(500, new { error = "R2 settings are missing." });
                     }
 
-                    var responseBody = await response.Content.ReadAsStringAsync(ct);
-                    var result = JsonSerializer.Deserialize<VideoMaeResponse>(responseBody, JsonOpts);
-                    results.Add((img.ImageId, result?.OverallMovements, result?.Segments, true, null));
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to analyze image {ImageId}", img.ImageId);
-                    results.Add((img.ImageId, null, null, false, DescribeException(ex)));
-                }
-                finally
-                {
-                    throttle.Release();
-                }
-            });
+                    CameraMovementAnalysisService.AnalysisOutcome outcome;
+                    try
+                    {
+                        outcome = await _analysis.AnalyzeAsync(images, owner, bank: false, ct);
+                    }
+                    finally
+                    {
+                        // Analyzed rows are excluded by the queue anyway; failed
+                        // ones become eligible for a later retry.
+                        await _analysis.ReleaseClaimsAsync(
+                            images.Select(i => i.ImageId).ToList(), CancellationToken.None);
+                    }
 
-            await Task.WhenAll(tasks);
-
-            // 4. Write results to DB sequentially (NpgsqlConnection is not thread-safe)
-            foreach (var r in results)
-            {
-                if (!r.Success)
-                {
-                    await RecordFailureAsync(r.ImageId, r.Reason, ct);
-                    failed++;
-                    continue;
+                    processed += outcome.Processed;
+                    failed += outcome.Failed;
+                    total += images.Count;
                 }
-
-                await ClearFailureAsync(r.ImageId, ct);
-
-                if (r.Movements == null || r.Movements.Count == 0)
-                {
-                    await InsertMovementAsync(r.ImageId, "hold", 0, ct);
-                    await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
-                    await MaybeTagNoMovementAsync(r.ImageId, ct);
-                    await AssignImageOwnerAsync(r.ImageId, owner, ct);
-                    processed++;
-                    continue;
-                }
-
-                foreach (var movement in r.Movements)
-                {
-                    if (movement.Label == "too_short") continue;
-                    await InsertMovementAsync(r.ImageId, movement.Label, movement.Confidence, ct);
-                }
-
-                await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
-                await MaybeTagNoMovementAsync(r.ImageId, ct);
-                await AssignImageOwnerAsync(r.ImageId, owner, ct);
-                processed++;
             }
 
-            // Release the claims we took (analyzed rows are excluded by the
-            // queue anyway; failed ones become eligible for a later retry).
-            await ReleaseClaimsAsync(images.Select(i => i.ImageId).ToList(), ct);
+            if (total == 0)
+                return Ok(new AnalyzeBatchResponse { Processed = 0, Failed = 0, Message = "No images in queue." });
 
             // Record progress on the job so other sessions see it live.
             if (jobId.HasValue)
@@ -309,8 +213,11 @@ ORDER BY media_type::text;";
             {
                 Processed = processed,
                 Failed = failed,
-                Total = images.Count,
-                Message = $"Analyzed {processed} images, {failed} failed."
+                Total = total,
+                FromBank = fromBank,
+                Message = fromBank > 0
+                    ? $"Assigned {fromBank} pre-analyzed images, analyzed {processed - fromBank} live, {failed} failed."
+                    : $"Analyzed {processed} images, {failed} failed."
             });
         }
 
@@ -752,10 +659,10 @@ LIMIT @limit;";
             queueCmd.Parameters.AddWithValue("@limit", limit);
             await using var queueReader = await queueCmd.ExecuteReaderAsync(ct);
 
-            var images = new List<AnalyzeItem>();
+            var images = new List<CameraMovementAnalysisService.AnalyzeItem>();
             while (await queueReader.ReadAsync(ct))
             {
-                images.Add(new AnalyzeItem
+                images.Add(new CameraMovementAnalysisService.AnalyzeItem
                 {
                     ImageId = queueReader.GetInt32(queueReader.GetOrdinal("idnum")),
                     MovieId = queueReader.GetInt32(queueReader.GetOrdinal("movieid")),
@@ -771,139 +678,17 @@ LIMIT @limit;";
             if (images.Count == 0)
                 return Ok(new AnalyzeBatchResponse { Processed = 0, Failed = 0, Message = "No un-analyzed clips for this movie." });
 
-            // 2. Generate presigned R2 URLs
-            var accountId = _configuration["R2:AccountId"] ?? "";
-            var accessKey = _configuration["R2:AccessKey"] ?? "";
-            var secretKey = _configuration["R2:SecretKey"] ?? "";
-            var bucketName = _configuration["R2:BucketName"] ?? "";
-
-            if (string.IsNullOrWhiteSpace(accountId) || string.IsNullOrWhiteSpace(accessKey) ||
-                string.IsNullOrWhiteSpace(secretKey) || string.IsNullOrWhiteSpace(bucketName))
-            {
+            if (!_analysis.HasR2Settings())
                 return StatusCode(500, new { error = "R2 settings are missing." });
-            }
 
-            var creds = new BasicAWSCredentials(accessKey.Trim(), secretKey.Trim());
-            var s3Config = new AmazonS3Config
-            {
-                ServiceURL = $"https://{accountId.Trim()}.r2.cloudflarestorage.com",
-                ForcePathStyle = true,
-                UseAccelerateEndpoint = false,
-                UseDualstackEndpoint = false,
-                EndpointDiscoveryEnabled = false
-            };
-
-            using var s3Client = new AmazonS3Client(creds, s3Config);
-            var httpClient = _httpClientFactory.CreateClient();
-            httpClient.Timeout = TimeSpan.FromMinutes(2);
-
-            int processed = 0, failed = 0;
-
-            // Ensure segments table exists
-            await EnsureSegmentsTableAsync(ct);
-
-            // 3. Process images in parallel (up to 5 concurrent VideoMAE calls)
-            const int maxConcurrency = 5;
-            var throttle = new SemaphoreSlim(maxConcurrency);
-            var results = new ConcurrentBag<(int ImageId, List<VideoMaeMovement>? Movements, List<VideoMaeSegment>? Segments, bool Success, string? Reason)>();
-
-            var tasks = images.Select(async img =>
-            {
-                await throttle.WaitAsync(ct);
-                try
-                {
-                    var key = $"clips_9s/{img.MovieId}/{img.RandId}.mp4";
-                    var clipUrl = s3Client.GetPreSignedURL(new GetPreSignedUrlRequest
-                    {
-                        BucketName = bucketName,
-                        Key = key,
-                        Expires = DateTime.UtcNow.AddMinutes(PresignedUrlExpiryMinutes),
-                        Verb = HttpVerb.GET
-                    });
-
-                    var payload = new
-                    {
-                        url = clipUrl,
-                        start_time = img.StartTime,
-                        end_time = img.EndTime,
-                        include_camerabench = false,
-                    };
-
-                    var jsonContent = new StringContent(
-                        JsonSerializer.Serialize(payload, JsonOpts),
-                        Encoding.UTF8,
-                        "application/json");
-
-                    var response = await httpClient.PostAsync(
-                        $"{cameraMotionApiUrl.TrimEnd('/')}/analyze",
-                        jsonContent,
-                        ct);
-
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        var reason = await ReadFailureReasonAsync(response, ct);
-                        _logger.LogWarning(
-                            "VideoMAE API failed for image {ImageId}: HTTP {Status} {Reason}",
-                            img.ImageId, (int)response.StatusCode, reason);
-                        results.Add((img.ImageId, null, null, false, reason));
-                        return;
-                    }
-
-                    var responseBody = await response.Content.ReadAsStringAsync(ct);
-                    var result = JsonSerializer.Deserialize<VideoMaeResponse>(responseBody, JsonOpts);
-                    results.Add((img.ImageId, result?.OverallMovements, result?.Segments, true, null));
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to analyze image {ImageId}", img.ImageId);
-                    results.Add((img.ImageId, null, null, false, DescribeException(ex)));
-                }
-                finally
-                {
-                    throttle.Release();
-                }
-            });
-
-            await Task.WhenAll(tasks);
-
-            // 4. Write results to DB sequentially
-            foreach (var r in results)
-            {
-                if (!r.Success)
-                {
-                    await RecordFailureAsync(r.ImageId, r.Reason, ct);
-                    failed++;
-                    continue;
-                }
-
-                await ClearFailureAsync(r.ImageId, ct);
-
-                if (r.Movements == null || r.Movements.Count == 0)
-                {
-                    await InsertMovementAsync(r.ImageId, "hold", 0, ct);
-                    await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
-                    await MaybeTagNoMovementAsync(r.ImageId, ct);
-                    processed++;
-                    continue;
-                }
-
-                foreach (var movement in r.Movements)
-                {
-                    if (movement.Label == "too_short") continue;
-                    await InsertMovementAsync(r.ImageId, movement.Label, movement.Confidence, ct);
-                }
-
-                await StoreSegmentsAsync(r.ImageId, r.Segments, ct);
-                await MaybeTagNoMovementAsync(r.ImageId, ct);
-                processed++;
-            }
+            var outcome = await _analysis.AnalyzeAsync(images, owner: null, bank: false, ct);
 
             return Ok(new AnalyzeBatchResponse
             {
-                Processed = processed,
-                Failed = failed,
+                Processed = outcome.Processed,
+                Failed = outcome.Failed,
                 Total = images.Count,
-                Message = $"Analyzed {processed} clips for movie {movieId}, {failed} failed."
+                Message = $"Analyzed {outcome.Processed} clips for movie {movieId}, {outcome.Failed} failed."
             });
         }
 
@@ -958,6 +743,27 @@ ORDER BY total DESC;";
             }
 
             return Ok(new TagSummaryResponse { Tags = tags });
+        }
+
+        // ── GET /api/admin/camera-movements/bank ───────────────────────
+        // How many pre-analysed images are waiting to be fetched, per media type.
+        [HttpGet("bank")]
+        [ProducesResponseType(typeof(BankStatusResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<BankStatusResponse>> GetBankStatus(CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await _analysis.EnsureTablesAsync(ct);
+
+            var counts = await _analysis.GetBankCountsAsync(ct);
+            return Ok(new BankStatusResponse
+            {
+                Target = _configuration.GetValue("CameraMotion:Bank:TargetPerMediaType", 1000),
+                Enabled = _configuration.GetValue("CameraMotion:Bank:Enabled", true),
+                Total = counts.Values.Sum(),
+                ByMediaType = counts.OrderBy(kv => kv.Key)
+                    .Select(kv => new BankMediaTypeCount { MediaType = kv.Key, Count = kv.Value })
+                    .ToList(),
+            });
         }
 
         // ── GET /api/admin/camera-movements/analyzed-count ─────────────
@@ -2217,13 +2023,7 @@ ORDER BY created_at DESC;";
                 await _connection.OpenAsync(ct);
         }
 
-        // How long a claim is honoured before it's treated as abandoned (a
-        // crashed/closed session), so the image can be picked up again.
-        private const int ClaimTtlMinutes = 15;
-
-        // After this many failed attempts an image is parked: kept on the
-        // failures list for inspection but no longer offered to fetches.
-        private const int MaxFailedAttempts = 3;
+        private const int MaxFailedAttempts = CameraMovementAnalysisService.MaxFailedAttempts;
 
         private async Task EnsureJobTablesAsync(CancellationToken ct)
         {
@@ -2294,184 +2094,6 @@ ON CONFLICT (imageid) DO NOTHING;";
             await cmd.ExecuteNonQueryAsync(ct);
         }
 
-        // Stamp an image with the reviewer who fetched it (no-op when no owner
-        // supplied). Ownership is per image and does not change on re-fetch.
-        private async Task AssignImageOwnerAsync(int imageId, string? owner, CancellationToken ct)
-        {
-            if (string.IsNullOrWhiteSpace(owner)) return;
-            const string sql = @"
-INSERT INTO frl.frl_camera_movement_image_owner (imageid, owner)
-VALUES (@imageid, @owner)
-ON CONFLICT (imageid) DO UPDATE SET owner = EXCLUDED.owner, assigned_at = now();";
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@imageid", imageId);
-            cmd.Parameters.AddWithValue("@owner", owner.Trim());
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
-
-        // Atomically select and claim the next N unanalyzed images. FOR UPDATE
-        // SKIP LOCKED plus a claims table means two concurrent fetches never
-        // grab the same images.
-        private async Task<List<AnalyzeItem>> ClaimImagesAsync(
-            Guid jobId, int limit, string? mediaType, CancellationToken ct)
-        {
-            // Media-type filter. A specific type selects only that type; "all"
-            // (or null/empty) selects every type except trailers, which are
-            // never fetched. Values come straight from frl_movies.media_type
-            // (see the media-types endpoint), so match them case-insensitively.
-            var isAll = string.IsNullOrWhiteSpace(mediaType)
-                || string.Equals(mediaType, "all", StringComparison.OrdinalIgnoreCase);
-
-            var mediaJoin = "LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid";
-            var mediaClause = isAll
-                ? " AND (m.media_type IS NULL OR lower(m.media_type::text) <> 'trailer')"
-                : " AND lower(m.media_type::text) = lower(@mediaType)";
-
-            var sql = $@"
-WITH candidates AS (
-    SELECT i.idnum, i.movieid, i.randid, sb.start_time, sb.end_time
-    FROM frl.frl_images i
-    INNER JOIN frl.frl_image_scene_boundaries sb
-        ON sb.movieid = i.movieid AND sb.filename = i.randid
-    {mediaJoin}
-    WHERE i.status = 'live'
-      AND NOT EXISTS (
-          SELECT 1 FROM frl.frl_join_images_camera_movements cm
-          WHERE cm.imageid = i.idnum)
-      AND NOT EXISTS (
-          SELECT 1 FROM frl.frl_camera_movement_claims c
-          WHERE c.imageid = i.idnum
-            AND c.claimed_at > now() - INTERVAL '{ClaimTtlMinutes} minutes')
-      -- Park clips that keep failing. Without this they sit at the head of the
-      -- popularity-ordered queue and are retried on every single fetch.
-      AND NOT EXISTS (
-          SELECT 1 FROM frl.frl_camera_movement_failures f
-          WHERE f.imageid = i.idnum
-            AND f.attempts >= {MaxFailedAttempts})
-      {mediaClause}
-    ORDER BY i.weighted_score DESC
-    LIMIT @limit
-    FOR UPDATE OF i SKIP LOCKED
-),
-claimed AS (
-    INSERT INTO frl.frl_camera_movement_claims (imageid, job_id, claimed_at)
-    SELECT idnum, @jobId, now() FROM candidates
-    ON CONFLICT (imageid) DO UPDATE SET job_id = EXCLUDED.job_id, claimed_at = now()
-    RETURNING imageid
-)
-SELECT idnum, movieid, randid, start_time, end_time
-FROM candidates
-WHERE idnum IN (SELECT imageid FROM claimed);";
-
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@limit", limit);
-            cmd.Parameters.AddWithValue("@jobId", jobId);
-            if (!isAll)
-                cmd.Parameters.AddWithValue("@mediaType", mediaType!);
-
-            var images = new List<AnalyzeItem>();
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
-            {
-                images.Add(new AnalyzeItem
-                {
-                    ImageId = reader.GetInt32(0),
-                    MovieId = reader.GetInt32(1),
-                    RandId = reader.GetString(2),
-                    StartTime = reader.IsDBNull(3) ? null : reader.GetDouble(3),
-                    EndTime = reader.IsDBNull(4) ? null : reader.GetDouble(4),
-                });
-            }
-            return images;
-        }
-
-        // The analysis API reports the real cause in the response body (e.g.
-        // "Failed to download clip: HTTP 404" for a clip missing from R2), so
-        // prefer it over the bare status code. FastAPI wraps it in "detail".
-        private static async Task<string> ReadFailureReasonAsync(
-            HttpResponseMessage response, CancellationToken ct)
-        {
-            var status = $"HTTP {(int)response.StatusCode}";
-            string body;
-            try
-            {
-                body = await response.Content.ReadAsStringAsync(ct);
-            }
-            catch
-            {
-                return status;
-            }
-
-            if (string.IsNullOrWhiteSpace(body)) return status;
-
-            try
-            {
-                using var doc = JsonDocument.Parse(body);
-                if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                    doc.RootElement.TryGetProperty("detail", out var detail))
-                {
-                    var text = detail.ValueKind == JsonValueKind.String
-                        ? detail.GetString() : detail.ToString();
-                    if (!string.IsNullOrWhiteSpace(text)) return $"{status}: {text}";
-                }
-            }
-            catch (JsonException)
-            {
-                // not JSON; fall through to the raw body
-            }
-
-            return $"{status}: {Truncate(body, 400)}";
-        }
-
-        private static string DescribeException(Exception ex) =>
-            ex is TaskCanceledException or OperationCanceledException
-                ? "Timed out waiting for the analysis API"
-                : $"{ex.GetType().Name}: {Truncate(ex.Message, 400)}";
-
-        private static string Truncate(string value, int max)
-        {
-            value = value.Trim();
-            return value.Length <= max ? value : value[..max] + "…";
-        }
-
-        private async Task RecordFailureAsync(
-            int imageId, string? reason, CancellationToken ct)
-        {
-            const string sql = @"
-INSERT INTO frl.frl_camera_movement_failures (imageid, reason)
-VALUES (@imageid, @reason)
-ON CONFLICT (imageid) DO UPDATE
-SET reason      = EXCLUDED.reason,
-    attempts    = frl.frl_camera_movement_failures.attempts + 1,
-    last_failed = now();";
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@imageid", imageId);
-            cmd.Parameters.AddWithValue("@reason", reason ?? "Unknown error");
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
-
-        // An image that eventually analyses fine shouldn't stay on the list.
-        private async Task ClearFailureAsync(int imageId, CancellationToken ct)
-        {
-            const string sql =
-                "DELETE FROM frl.frl_camera_movement_failures WHERE imageid = @imageid;";
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@imageid", imageId);
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
-
-        private async Task ReleaseClaimsAsync(List<int> imageIds, CancellationToken ct)
-        {
-            if (imageIds.Count == 0) return;
-
-            const string sql = @"
-DELETE FROM frl.frl_camera_movement_claims WHERE imageid = ANY(@ids);";
-
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@ids", imageIds.ToArray());
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
-
         private async Task UpdateJobProgressAsync(
             Guid jobId, int processed, int failed, CancellationToken ct)
         {
@@ -2486,46 +2108,6 @@ WHERE job_id = @jobId;";
             cmd.Parameters.AddWithValue("@jobId", jobId);
             cmd.Parameters.AddWithValue("@processed", processed);
             cmd.Parameters.AddWithValue("@failed", failed);
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
-
-        private async Task InsertMovementAsync(
-            int imageId, string movement, double confidence, CancellationToken ct)
-        {
-            const string sql = @"
-INSERT INTO frl.frl_join_images_camera_movements (imageid, camera_movements, confidence)
-VALUES (@imageid, @movement, @confidence)
-ON CONFLICT (imageid, camera_movements) DO NOTHING;";
-
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@imageid", imageId);
-            cmd.Parameters.AddWithValue("@movement", movement);
-            cmd.Parameters.AddWithValue("@confidence", (float)confidence);
-
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
-
-        // Auto-tag "no_movement" when an image's only movement is "hold"
-        // (has a hold row and no other movement besides no_movement itself).
-        // Inserted as 'not_checked' so it surfaces for QC review.
-        private async Task MaybeTagNoMovementAsync(int imageId, CancellationToken ct)
-        {
-            const string sql = @"
-INSERT INTO frl.frl_join_images_camera_movements (imageid, camera_movements, confidence, status)
-SELECT @imageid, 'no_movement', 0, 'not_checked'
-WHERE EXISTS (
-    SELECT 1 FROM frl.frl_join_images_camera_movements
-    WHERE imageid = @imageid AND camera_movements = 'hold'
-)
-AND NOT EXISTS (
-    SELECT 1 FROM frl.frl_join_images_camera_movements
-    WHERE imageid = @imageid AND camera_movements NOT IN ('hold', 'no_movement')
-)
-ON CONFLICT (imageid, camera_movements) DO NOTHING;";
-
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@imageid", imageId);
-
             await cmd.ExecuteNonQueryAsync(ct);
         }
 
@@ -2587,7 +2169,7 @@ WHERE imageid IN ({idParams});";
                 {
                     var imgId = reader.GetInt32(0);
                     var json = reader.GetString(1);
-                    var segments = JsonSerializer.Deserialize<List<VideoMaeSegment>>(json, JsonOpts);
+                    var segments = JsonSerializer.Deserialize<List<CameraMovementAnalysisService.VideoMaeSegment>>(json, JsonOpts);
                     if (segments != null)
                     {
                         result[imgId] = segments.Select(s => new SegmentDto
@@ -2703,37 +2285,6 @@ ALTER TABLE frl.frl_join_images_camera_movements ALTER COLUMN updated_at SET DEF
             _timestampColumnsReady = true;
         }
 
-        private async Task EnsureSegmentsTableAsync(CancellationToken ct)
-        {
-            const string sql = @"
-CREATE TABLE IF NOT EXISTS frl.frl_image_analysis_segments (
-    imageid INTEGER PRIMARY KEY,
-    segments_json JSONB NOT NULL,
-    created_at TIMESTAMP DEFAULT NOW()
-);";
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
-
-        private async Task StoreSegmentsAsync(
-            int imageId, List<VideoMaeSegment>? segments, CancellationToken ct)
-        {
-            if (segments == null || segments.Count == 0) return;
-
-            var json = JsonSerializer.Serialize(segments, JsonOpts);
-
-            const string sql = @"
-INSERT INTO frl.frl_image_analysis_segments (imageid, segments_json)
-VALUES (@imageid, @segments::jsonb)
-ON CONFLICT (imageid) DO UPDATE SET segments_json = @segments::jsonb, created_at = NOW();";
-
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@imageid", imageId);
-            cmd.Parameters.AddWithValue("@segments", json);
-
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
-
         private async Task EnsureAuditLogTableAsync(CancellationToken ct)
         {
             const string sql = @"
@@ -2817,21 +2368,27 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public int Count { get; set; }
         }
 
-        private sealed class AnalyzeItem
-        {
-            public int ImageId { get; set; }
-            public int MovieId { get; set; }
-            public string RandId { get; set; } = "";
-            public double? StartTime { get; set; }
-            public double? EndTime { get; set; }
-        }
-
         public sealed class AnalyzeBatchResponse
         {
             public int Processed { get; set; }
             public int Failed { get; set; }
             public int Total { get; set; }
+            public int FromBank { get; set; }
             public string Message { get; set; } = "";
+        }
+
+        public sealed class BankStatusResponse
+        {
+            public bool Enabled { get; set; }
+            public int Target { get; set; }
+            public int Total { get; set; }
+            public List<BankMediaTypeCount> ByMediaType { get; set; } = new();
+        }
+
+        public sealed class BankMediaTypeCount
+        {
+            public string MediaType { get; set; } = "";
+            public int Count { get; set; }
         }
 
         public sealed class MediaTypesResponse
@@ -3081,35 +2638,6 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
         }
 
         // VideoMAE API response DTOs
-        private sealed class VideoMaeResponse
-        {
-            [JsonPropertyName("overall_movements")]
-            public List<VideoMaeMovement>? OverallMovements { get; set; }
-
-            [JsonPropertyName("segments")]
-            public List<VideoMaeSegment>? Segments { get; set; }
-        }
-
-        private sealed class VideoMaeMovement
-        {
-            [JsonPropertyName("label")]
-            public string Label { get; set; } = "";
-
-            [JsonPropertyName("confidence")]
-            public double Confidence { get; set; }
-        }
-
-        private sealed class VideoMaeSegment
-        {
-            [JsonPropertyName("start")]
-            public double Start { get; set; }
-
-            [JsonPropertyName("end")]
-            public double End { get; set; }
-
-            [JsonPropertyName("movements")]
-            public List<VideoMaeMovement>? Movements { get; set; }
-        }
 
         public sealed class SegmentDto
         {
