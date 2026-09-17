@@ -133,23 +133,37 @@ namespace AdminPanelAPI.Services
                 var want = Math.Min(_batchSize, _targetPerMediaType - have);
                 if (want <= 0) continue;
 
-                using var scope = _scopeFactory.CreateScope();
-                var svc = scope.ServiceProvider.GetRequiredService<CameraMovementAnalysisService>();
-                await svc.EnsureOpenAsync(ct);
-
-                var images = await svc.ClaimImagesAsync(Guid.NewGuid(), want, mediaType, ct);
-                if (images.Count == 0) continue;
-
-                anyWork = true;
-                var ids = images.Select(i => i.ImageId).ToList();
                 CameraMovementAnalysisService.AnalysisOutcome outcome;
                 try
                 {
-                    outcome = await svc.AnalyzeAsync(images, owner: null, bank: true, ct);
+                    using var scope = _scopeFactory.CreateScope();
+                    var svc = scope.ServiceProvider.GetRequiredService<CameraMovementAnalysisService>();
+                    await svc.EnsureOpenAsync(ct);
+
+                    var images = await svc.ClaimImagesAsync(Guid.NewGuid(), want, mediaType, ct);
+                    if (images.Count == 0) continue;
+
+                    anyWork = true;
+                    var ids = images.Select(i => i.ImageId).ToList();
+                    try
+                    {
+                        outcome = await svc.AnalyzeAsync(images, owner: null, bank: true, ct);
+                    }
+                    finally
+                    {
+                        await svc.ReleaseClaimsAsync(ids, CancellationToken.None);
+                    }
                 }
-                finally
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
-                    await svc.ReleaseClaimsAsync(ids, CancellationToken.None);
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // One media type's problem (e.g. a slow claim query) must not
+                    // stop the others from being topped up.
+                    _logger.LogError(ex, "Camera-movement bank [{MediaType}]: batch failed.", mediaType);
+                    continue;
                 }
 
                 _logger.LogInformation(

@@ -32,6 +32,7 @@ namespace AdminPanelAPI.Services
         /// crashed/closed session), so the image can be picked up again.
         /// </summary>
         public const int ClaimTtlMinutes = 15;
+        private const int ClaimTimeoutSeconds = 120;
 
         /// <summary>
         /// After this many failed attempts an image is parked: kept on the
@@ -250,7 +251,9 @@ SELECT idnum, movieid, randid, start_time, end_time, media_type
 FROM candidates
 WHERE idnum IN (SELECT imageid FROM claimed);";
 
-            await using var cmd = new NpgsqlCommand(sql, _connection);
+            // Scanning the popularity-ordered queue past tens of thousands of
+            // already-analyzed images can exceed Npgsql's 30s default.
+            await using var cmd = new NpgsqlCommand(sql, _connection) { CommandTimeout = ClaimTimeoutSeconds };
             cmd.Parameters.AddWithValue("@limit", limit);
             cmd.Parameters.AddWithValue("@jobId", jobId);
             if (!isAll)
