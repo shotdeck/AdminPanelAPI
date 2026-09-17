@@ -106,6 +106,11 @@ builder.Services.AddSingleton<ITmdbService, TmdbService>();
 // who finishes watching finds the walkthrough and the proposals waiting.
 builder.Services.AddHostedService<MoviePreparationWorker>();
 
+// Camera-movement QC: shared analysis pipeline plus a worker that keeps a bank
+// of pre-analysed images so a reviewer's fetch is an instant assignment.
+builder.Services.AddScoped<CameraMovementAnalysisService>();
+builder.Services.AddHostedService<CameraMovementBankWorker>();
+
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
 
