@@ -2025,8 +2025,11 @@ ORDER BY created_at DESC;";
 
         private const int MaxFailedAttempts = CameraMovementAnalysisService.MaxFailedAttempts;
 
+        private static bool _jobTablesReady;
+
         private async Task EnsureJobTablesAsync(CancellationToken ct)
         {
+            if (_jobTablesReady) return;
             const string sql = @"
 CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_jobs (
     job_id      UUID PRIMARY KEY,
@@ -2057,12 +2060,16 @@ CREATE INDEX IF NOT EXISTS idx_cmf_attempts    ON frl.frl_camera_movement_failur
 CREATE INDEX IF NOT EXISTS idx_cmf_last_failed ON frl.frl_camera_movement_failures (last_failed DESC);";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
+            _jobTablesReady = true;
         }
 
         // Multi-user QC: the reviewer roster + per-image ownership. Seeds the
         // initial team and backfills existing images to MacK once.
+        private static bool _usersTablesReady;
+
         private async Task EnsureUsersTablesAsync(CancellationToken ct)
         {
+            if (_usersTablesReady) return;
             const string sql = @"
 CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_users (
     id          SERIAL       PRIMARY KEY,
@@ -2092,6 +2099,7 @@ WHERE NOT EXISTS (SELECT 1 FROM frl.frl_camera_movement_image_owner)
 ON CONFLICT (imageid) DO NOTHING;";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
+            _usersTablesReady = true;
         }
 
         private async Task UpdateJobProgressAsync(
@@ -2285,8 +2293,11 @@ ALTER TABLE frl.frl_join_images_camera_movements ALTER COLUMN updated_at SET DEF
             _timestampColumnsReady = true;
         }
 
+        private static bool _auditLogTableReady;
+
         private async Task EnsureAuditLogTableAsync(CancellationToken ct)
         {
+            if (_auditLogTableReady) return;
             const string sql = @"
 CREATE TABLE IF NOT EXISTS frl.frl_qc_training_log (
     id SERIAL PRIMARY KEY,
@@ -2299,6 +2310,7 @@ CREATE TABLE IF NOT EXISTS frl.frl_qc_training_log (
 );";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
+            _auditLogTableReady = true;
         }
 
         private async Task LogQcActionAsync(

@@ -71,8 +71,11 @@ namespace AdminPanelAPI.Services
                 await _connection.OpenAsync(ct);
         }
 
+        private static bool _tablesReady;
+
         public async Task EnsureTablesAsync(CancellationToken ct)
         {
+            if (_tablesReady) return;
             const string sql = @"
 CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_claims (
     imageid     INTEGER      PRIMARY KEY,
@@ -103,6 +106,7 @@ CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_bank (
 CREATE INDEX IF NOT EXISTS idx_cmb_media_type ON frl.frl_camera_movement_bank (media_type);";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
+            _tablesReady = true;
         }
 
         /// <summary>Media types that are fetched for QC (everything but trailers).</summary>
