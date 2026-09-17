@@ -37,6 +37,13 @@ namespace AdminPanelAPI.Services
         /// </summary>
         private static readonly TimeSpan OutageDelay = TimeSpan.FromMinutes(5);
 
+        /// <summary>
+        /// A media type whose batch threw (e.g. its claim query timed out) is
+        /// left alone for this long so it can't slow the other queues down.
+        /// </summary>
+        private static readonly TimeSpan MediaTypeBackoff = TimeSpan.FromMinutes(30);
+        private readonly Dictionary<string, DateTimeOffset> _skipUntil = new(StringComparer.OrdinalIgnoreCase);
+
         public CameraMovementBankWorker(
             IServiceScopeFactory scopeFactory,
             IHttpClientFactory httpClientFactory,
@@ -133,6 +140,9 @@ namespace AdminPanelAPI.Services
                 var want = Math.Min(_batchSize, _targetPerMediaType - have);
                 if (want <= 0) continue;
 
+                if (_skipUntil.TryGetValue(mediaType, out var until) && until > DateTimeOffset.UtcNow)
+                    continue;
+
                 CameraMovementAnalysisService.AnalysisOutcome outcome;
                 try
                 {
@@ -162,7 +172,8 @@ namespace AdminPanelAPI.Services
                 {
                     // One media type's problem (e.g. a slow claim query) must not
                     // stop the others from being topped up.
-                    _logger.LogError(ex, "Camera-movement bank [{MediaType}]: batch failed.", mediaType);
+                    _logger.LogError(ex, "Camera-movement bank [{MediaType}]: batch failed; backing off {Backoff}.", mediaType, MediaTypeBackoff);
+                    _skipUntil[mediaType] = DateTimeOffset.UtcNow + MediaTypeBackoff;
                     continue;
                 }
 
