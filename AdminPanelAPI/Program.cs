@@ -117,9 +117,6 @@ builder.Services.AddHostedService<KeywordWarmupService>();
 // Background geocoding service
 builder.Services.AddHostedService<GeocodeBackgroundService>();
 
-// Builds the camera-movement claim-query indexes (migrations/041) if missing
-builder.Services.AddHostedService<CameraMovementIndexService>();
-
 // Background movie location populate service
 builder.Services.AddHostedService<MovieLocationBackgroundService>();
 
