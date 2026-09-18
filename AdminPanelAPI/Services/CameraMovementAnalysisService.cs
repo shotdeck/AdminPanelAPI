@@ -336,6 +336,31 @@ DELETE FROM frl.frl_camera_movement_claims WHERE imageid = ANY(@ids);";
             && !string.IsNullOrWhiteSpace(_configuration["R2:SecretKey"])
             && !string.IsNullOrWhiteSpace(_configuration["R2:BucketName"]);
 
+        /// <summary>Presigned R2 URL for an image's 9s clip, or null without R2 settings.</summary>
+        public Func<int, string, string>? CreateClipUrlSigner()
+        {
+            if (!HasR2Settings()) return null;
+            var accountId = _configuration["R2:AccountId"]!.Trim();
+            var bucketName = _configuration["R2:BucketName"]!.Trim();
+            var creds = new BasicAWSCredentials(
+                _configuration["R2:AccessKey"]!.Trim(), _configuration["R2:SecretKey"]!.Trim());
+            var s3Client = new AmazonS3Client(creds, new AmazonS3Config
+            {
+                ServiceURL = $"https://{accountId}.r2.cloudflarestorage.com",
+                ForcePathStyle = true,
+                UseAccelerateEndpoint = false,
+                UseDualstackEndpoint = false,
+                EndpointDiscoveryEnabled = false
+            });
+            return (movieId, randId) => s3Client.GetPreSignedURL(new GetPreSignedUrlRequest
+            {
+                BucketName = bucketName,
+                Key = $"clips_9s/{movieId}/{randId}.mp4",
+                Expires = DateTime.UtcNow.AddMinutes(PresignedUrlExpiryMinutes),
+                Verb = HttpVerb.GET
+            });
+        }
+
         /// <summary>
         /// Run the given clips through the analysis API and persist the result.
         /// With an <paramref name="owner"/> each analysed image is stamped as
