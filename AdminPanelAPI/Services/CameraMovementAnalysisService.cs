@@ -129,6 +129,38 @@ ORDER BY media_type::text;";
             return types;
         }
 
+        private static string? _mediaTypeSqlType;
+
+        /// <summary>
+        /// SQL type of frl_movies.media_type (an enum in production). Comparing
+        /// the column directly against a value cast to this type lets the planner
+        /// use the column's statistics; wrapping it in lower(...::text) hides
+        /// them and makes it guess a tiny match count and pick a scan-and-sort plan.
+        /// </summary>
+        private async Task<string> GetMediaTypeSqlTypeAsync(CancellationToken ct)
+        {
+            if (_mediaTypeSqlType != null) return _mediaTypeSqlType;
+            const string sql = @"
+SELECT format_type(atttypid, atttypmod)
+FROM pg_attribute
+WHERE attrelid = 'frl.frl_movies'::regclass AND attname = 'media_type';";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            var result = await cmd.ExecuteScalarAsync(ct) as string;
+            _mediaTypeSqlType = string.IsNullOrWhiteSpace(result) ? "text" : result;
+            return _mediaTypeSqlType;
+        }
+
+        /// <summary>
+        /// Resolve a caller-supplied media type (any casing) to the exact stored
+        /// label, so it can be cast to the enum. Returns null if unknown.
+        /// </summary>
+        public async Task<string?> ResolveMediaTypeAsync(string mediaType, CancellationToken ct)
+        {
+            var types = await GetMediaTypesAsync(ct);
+            return types.FirstOrDefault(t =>
+                string.Equals(t.Trim(), mediaType.Trim(), StringComparison.OrdinalIgnoreCase));
+        }
+
         private static bool IsAllMediaTypes(string? mediaType) =>
             string.IsNullOrWhiteSpace(mediaType)
             || string.Equals(mediaType, "all", StringComparison.OrdinalIgnoreCase);
@@ -214,9 +246,15 @@ ON CONFLICT (imageid) DO NOTHING;";
             // never fetched. Values come straight from frl_movies.media_type
             // (see the media-types endpoint), so match them case-insensitively.
             var isAll = IsAllMediaTypes(mediaType);
+            string? exactMediaType = null;
+            if (!isAll)
+            {
+                exactMediaType = await ResolveMediaTypeAsync(mediaType!, ct);
+                if (exactMediaType == null) return new List<AnalyzeItem>();
+            }
             var mediaClause = isAll
                 ? " AND (m.media_type IS NULL OR lower(m.media_type::text) <> 'trailer')"
-                : " AND lower(m.media_type::text) = lower(@mediaType)";
+                : $" AND m.media_type = CAST(@mediaType AS {await GetMediaTypeSqlTypeAsync(ct)})";
 
             var sql = $@"
 WITH candidates AS (
@@ -261,7 +299,7 @@ WHERE idnum IN (SELECT imageid FROM claimed);";
             cmd.Parameters.AddWithValue("@limit", limit);
             cmd.Parameters.AddWithValue("@jobId", jobId);
             if (!isAll)
-                cmd.Parameters.AddWithValue("@mediaType", mediaType!);
+                cmd.Parameters.AddWithValue("@mediaType", exactMediaType!);
 
             var images = new List<AnalyzeItem>();
             await using var reader = await cmd.ExecuteReaderAsync(ct);
