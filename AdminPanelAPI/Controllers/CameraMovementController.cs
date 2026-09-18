@@ -75,7 +75,7 @@ WHERE i.status = 'live'
       SELECT 1 FROM frl.frl_join_images_camera_movements cm
       WHERE cm.imageid = i.idnum
   )
-ORDER BY i.weighted_score DESC
+ORDER BY i.weighted_score DESC NULLS LAST, i.idnum DESC NULLS LAST
 LIMIT @limit;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);

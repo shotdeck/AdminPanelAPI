@@ -151,7 +151,7 @@ WITH picked AS (
     FROM frl.frl_camera_movement_bank b
     INNER JOIN frl.frl_images i ON i.idnum = b.imageid
     {mediaClause}
-    ORDER BY i.weighted_score DESC
+    ORDER BY i.weighted_score DESC NULLS LAST, i.idnum DESC NULLS LAST
     LIMIT @limit
     FOR UPDATE OF b SKIP LOCKED
 ),
@@ -241,7 +241,7 @@ WITH candidates AS (
           WHERE f.imageid = i.idnum
             AND f.attempts >= {MaxFailedAttempts})
       {mediaClause}
-    ORDER BY i.weighted_score DESC
+    ORDER BY i.weighted_score DESC NULLS LAST, i.idnum DESC NULLS LAST
     LIMIT @limit
     FOR UPDATE OF i SKIP LOCKED
 ),
