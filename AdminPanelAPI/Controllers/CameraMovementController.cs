@@ -766,6 +766,75 @@ ORDER BY total DESC;";
             });
         }
 
+        // ── GET /api/admin/camera-movements/bank/items ─────────────────
+        // Preview of banked images in the order a fetch would hand them out.
+        [HttpGet("bank/items")]
+        [ProducesResponseType(typeof(BankItemsResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<BankItemsResponse>> GetBankItems(
+            [FromQuery] string? mediaType = null,
+            [FromQuery] int limit = 100,
+            CancellationToken ct = default)
+        {
+            if (limit < 1) limit = 1;
+            if (limit > 500) limit = 500;
+            var typeFilter = string.IsNullOrWhiteSpace(mediaType) || mediaType.Trim().ToLowerInvariant() == "all"
+                ? null : mediaType.Trim();
+
+            await EnsureOpenAsync(ct);
+            await _analysis.EnsureTablesAsync(ct);
+
+            var typeWhere = typeFilter != null ? "WHERE lower(b.media_type) = lower(@mediaType)" : "";
+
+            var countSql = $"SELECT COUNT(*) FROM frl.frl_camera_movement_bank b {typeWhere};";
+            await using var countCmd = new NpgsqlCommand(countSql, _connection);
+            if (typeFilter != null) countCmd.Parameters.AddWithValue("@mediaType", typeFilter);
+            var total = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
+
+            var sql = $@"
+SELECT b.imageid, b.media_type, b.analyzed_at,
+       i.movieid, i.randid, i.filename, i.weighted_score,
+       m.title, m.year,
+       COALESCE((SELECT string_agg(cm.camera_movements, ',' ORDER BY cm.confidence DESC)
+                 FROM frl.frl_join_images_camera_movements cm WHERE cm.imageid = b.imageid), '') AS movements
+FROM frl.frl_camera_movement_bank b
+INNER JOIN frl.frl_images i ON i.idnum = b.imageid
+LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
+{typeWhere}
+ORDER BY i.weighted_score DESC NULLS LAST, i.idnum DESC NULLS LAST
+LIMIT @limit;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            if (typeFilter != null) cmd.Parameters.AddWithValue("@mediaType", typeFilter);
+            cmd.Parameters.AddWithValue("@limit", limit);
+
+            var sign = _analysis.CreateClipUrlSigner();
+            var items = new List<BankItem>();
+            await using (var reader = await cmd.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                {
+                    var movieId = reader.GetInt32(3);
+                    var randId = reader.IsDBNull(4) ? null : reader.GetString(4);
+                    var movements = reader.GetString(9);
+                    items.Add(new BankItem
+                    {
+                        ImageId = reader.GetInt32(0),
+                        MediaType = reader.GetString(1),
+                        AnalyzedAt = reader.GetDateTime(2),
+                        MovieId = movieId,
+                        Filename = reader.IsDBNull(5) ? null : reader.GetString(5),
+                        WeightedScore = reader.IsDBNull(6) ? null : Convert.ToDouble(reader.GetValue(6)),
+                        MovieTitle = reader.IsDBNull(7) ? null : reader.GetString(7),
+                        MovieYear = reader.IsDBNull(8) ? null : reader.GetInt32(8),
+                        Movements = movements.Length == 0 ? new List<string>() : movements.Split(',').ToList(),
+                        ClipUrl = sign != null && randId != null ? sign(movieId, randId) : null,
+                    });
+                }
+            }
+
+            return Ok(new BankItemsResponse { Items = items, Total = total, MediaType = typeFilter });
+        }
+
         // ── GET /api/admin/camera-movements/analyzed-count ─────────────
         // Total distinct images that have been through camera-movement analysis.
         [HttpGet("analyzed-count")]
@@ -2401,6 +2470,27 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
         {
             public string MediaType { get; set; } = "";
             public int Count { get; set; }
+        }
+
+        public sealed class BankItem
+        {
+            public int ImageId { get; set; }
+            public int MovieId { get; set; }
+            public string? Filename { get; set; }
+            public string? MovieTitle { get; set; }
+            public int? MovieYear { get; set; }
+            public string MediaType { get; set; } = "";
+            public double? WeightedScore { get; set; }
+            public DateTime AnalyzedAt { get; set; }
+            public List<string> Movements { get; set; } = new();
+            public string? ClipUrl { get; set; }
+        }
+
+        public sealed class BankItemsResponse
+        {
+            public List<BankItem> Items { get; set; } = new();
+            public int Total { get; set; }
+            public string? MediaType { get; set; }
         }
 
         public sealed class MediaTypesResponse
