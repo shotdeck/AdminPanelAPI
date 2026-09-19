@@ -69,6 +69,7 @@ namespace ShotDeckSearch.Controllers
         private readonly IFilmSynopsisService _synopsis;
         private readonly IWalkthroughService _walkthrough;
         private readonly IImageTechnicalTagService _imageTags;
+        private readonly ILogger<MovieTaggingController> _logger;
 
         public MovieTaggingController(
             NpgsqlConnection connection,
@@ -76,7 +77,8 @@ namespace ShotDeckSearch.Controllers
             IKeyImageAnalysisService analysis,
             IFilmSynopsisService synopsis,
             IWalkthroughService walkthrough,
-            IImageTechnicalTagService imageTags)
+            IImageTechnicalTagService imageTags,
+            ILogger<MovieTaggingController> logger)
         {
             _connection = connection;
             _storage = storage;
@@ -84,6 +86,7 @@ namespace ShotDeckSearch.Controllers
             _synopsis = synopsis;
             _walkthrough = walkthrough;
             _imageTags = imageTags;
+            _logger = logger;
         }
 
         public sealed class AssignRequest
@@ -159,6 +162,13 @@ namespace ShotDeckSearch.Controllers
 
             /// <summary>Read a frame again even though it has been read.</summary>
             public bool Force { get; set; }
+
+            /// <summary>
+            /// Batches to read in one go, for a run the page waits on. More
+            /// batches spread over more of the image tagger at once; too many
+            /// and the request outlives the page's patience.
+            /// </summary>
+            public int? Batches { get; set; }
 
             public string? ActingUser { get; set; }
         }
@@ -532,16 +542,25 @@ RETURNING id, created_at;";
             cmd.Parameters.AddWithValue("@thumbnail", (object?)request.Thumbnail ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@actingUser", actingUser);
 
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            await reader.ReadAsync(ct);
+            long capturedId;
+            DateTime capturedAt;
+            await using (var reader = await cmd.ExecuteReaderAsync(ct))
+            {
+                await reader.ReadAsync(ct);
+                capturedId = reader.GetInt64(0);
+                capturedAt = reader.GetDateTime(1);
+            }
+
+            await MarkKeyImagesExtractedAsync(request.MovieId, ct);
+
             return Ok(new
             {
-                id = reader.GetInt64(0),
+                id = capturedId,
                 movieId = request.MovieId,
                 positionSeconds = request.PositionSeconds,
                 frameNumber = request.FrameNumber,
                 capturedBy = actingUser,
-                createdAt = reader.GetDateTime(1)
+                createdAt = capturedAt
             });
         }
 
@@ -1135,7 +1154,10 @@ WHERE id = ANY(@ids);";
             // the tagger opens it.
             if (decision == "kept")
                 foreach (var movieId in movieIds)
+                {
                     await KeyImageTagStore.QueueAsync(_connection, movieId, ids, false, ct);
+                    await MarkKeyImagesExtractedAsync(movieId, ct);
+                }
 
             var remaining = new Dictionary<int, int>();
             foreach (var movieId in movieIds)
@@ -1339,6 +1361,93 @@ WHERE movie_id = @movieId
                 _connection, request.MovieId, request.Ids, request.Force, ct);
 
             return Ok(new { movieId = request.MovieId, queued });
+        }
+
+        /// <summary>
+        /// Read a helping of the movie's kept frames now, and say what came of
+        /// it. The background worker does this by itself, but a tagger who has
+        /// just kept their frames wants them read while they watch, and wants to
+        /// be told when the image tagger refuses rather than seeing a count that
+        /// never moves. Frames the last run claimed and never finished are put
+        /// back first.
+        /// </summary>
+        [HttpPost("key-image-tags/run")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        public async Task<IActionResult> RunKeyImageTags(
+            [FromBody] TagRunRequest request, CancellationToken ct = default)
+        {
+            var actingUser = (request.ActingUser ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(actingUser))
+                return BadRequest(new { error = "actingUser is required." });
+            if (request.MovieId <= 0)
+                return BadRequest(new { error = "movieId is required." });
+
+            await EnsureReadyAsync(ct);
+            if (!await CanCaptureAsync(request.MovieId, actingUser, ct))
+                return StatusCode(403, new { error = "That movie is not allocated to you." });
+
+            await KeyImageTagStore.RequeueStaleAsync(
+                _connection, request.MovieId, StaleReadAfter, ct);
+            var queued = await KeyImageTagStore.QueueAsync(
+                _connection, request.MovieId, request.Ids, request.Force, ct);
+
+            // One helping per request: a batch is a minute or two of the image
+            // tagger's time, and a request that outlived the page's patience
+            // would leave its frames claimed.
+            var batches = Math.Clamp(request.Batches ?? 2, 1, 8);
+            var claims = await KeyImageTagStore.ClaimAsync(
+                _connection, _imageTags.BatchLimit * batches, ct, request.MovieId);
+
+            var tagged = 0;
+            if (claims.Count > 0)
+                tagged = await KeyImageTagWorker.TagBatchesAsync(
+                    _connection, _storage, _imageTags, claims, _logger, ct);
+
+            await KeyImageTagStore.AdvanceReadMoviesAsync(_connection, ct);
+
+            var progress = (await KeyImageTagStore.ProgressAsync(
+                _connection, new[] { request.MovieId }, ct)).FirstOrDefault();
+
+            return Ok(new
+            {
+                movieId = request.MovieId,
+                queued,
+                sent = claims.Count,
+                tagged,
+                kept = progress?.Kept ?? 0,
+                waiting = progress?.Waiting ?? 0,
+                read = progress?.Tagged ?? 0,
+                failed = progress?.Failed ?? 0
+            });
+        }
+
+        /// <summary>
+        /// A frame claimed this long ago and still unread belongs to a pass that
+        /// stopped, so it is put back rather than left as being read.
+        /// </summary>
+        private static readonly TimeSpan StaleReadAfter = TimeSpan.FromMinutes(15);
+
+        /// <summary>
+        /// Move a watched movie on to the key images stage, now that it has key
+        /// images. A movie further along is left where it is.
+        /// </summary>
+        private async Task MarkKeyImagesExtractedAsync(int movieId, CancellationToken ct)
+        {
+            const string sql = @"
+UPDATE frl.frl_movie_tagger_assignments
+SET status = 'key_images_extracted',
+    key_images_at = COALESCE(key_images_at, now()),
+    updated_at = now()
+WHERE movie_id = @movieId
+  AND status = 'movie_watched'
+  AND EXISTS (
+      SELECT 1 FROM frl.frl_movie_key_images
+      WHERE movie_id = @movieId AND decision = 'kept');";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            await cmd.ExecuteNonQueryAsync(ct);
         }
 
         /// <summary>
