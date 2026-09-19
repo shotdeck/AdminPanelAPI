@@ -24,6 +24,8 @@ namespace AdminPanelAPI.Services
         string? ModelVersion,
         string? Error,
         DateTime? TaggedAt,
+        string? ConfirmedBy,
+        DateTime? ConfirmedAt,
         List<KeyImageTagRow> Tags);
 
     /// <summary>A frame waiting to be read by the image tagger.</summary>
@@ -31,7 +33,26 @@ namespace AdminPanelAPI.Services
 
     /// <summary>How far a movie's kept frames have got with the image tagger.</summary>
     public sealed record KeyImageTagProgress(
-        int MovieId, int Kept, int Waiting, int Tagged, int Failed);
+        int MovieId, int Kept, int Waiting, int Tagged, int Failed, int Confirmed);
+
+    /// <summary>
+    /// A term a tagger read differently from the model: one training example,
+    /// kept whole so a later batch can be assembled without the live tables.
+    /// </summary>
+    public sealed record KeyImageTagChange(
+        long Id,
+        long KeyImageId,
+        int MovieId,
+        string? ImageKey,
+        string Category,
+        string? AiValue,
+        double? AiConfidence,
+        string? ModelVersion,
+        string? PreviousValue,
+        string? Value,
+        string? ChangedBy,
+        DateTime ChangedAt,
+        DateTime? ExportedAt);
 
     /// <summary>
     /// The technical terms of a movie's kept key images: what the image tagger
@@ -84,7 +105,30 @@ ALTER TABLE frl.frl_movie_key_images
     ADD COLUMN IF NOT EXISTS tagged_at         TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_fmki_tag_status
     ON frl.frl_movie_key_images (tag_status)
-    WHERE tag_status IN ('pending', 'running');";
+    WHERE tag_status IN ('pending', 'running');
+ALTER TABLE frl.frl_movie_key_images
+    ADD COLUMN IF NOT EXISTS tags_confirmed_by VARCHAR(120),
+    ADD COLUMN IF NOT EXISTS tags_confirmed_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS frl.frl_movie_key_image_tag_changes (
+    id             BIGSERIAL    PRIMARY KEY,
+    key_image_id   BIGINT       NOT NULL
+        REFERENCES frl.frl_movie_key_images (id) ON DELETE CASCADE,
+    movie_id       INTEGER      NOT NULL,
+    category       VARCHAR(40)  NOT NULL,
+    ai_value       TEXT,
+    ai_confidence  NUMERIC(6,4),
+    model_version  VARCHAR(32),
+    previous_value TEXT,
+    value          TEXT,
+    changed_by     VARCHAR(120),
+    changed_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    exported_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_fmkitc_movie
+    ON frl.frl_movie_key_image_tag_changes (movie_id, changed_at);
+CREATE INDEX IF NOT EXISTS idx_fmkitc_unexported
+    ON frl.frl_movie_key_image_tag_changes (changed_at)
+    WHERE exported_at IS NULL;";
 
         /// <summary>
         /// Queue kept frames of a movie to be read. Only frames with a picture
@@ -256,6 +300,7 @@ WHERE id = @id;";
             const string sql = @"
 SELECT k.id, k.movie_id, k.position_seconds, k.image_key, k.tag_status,
        k.tag_model_version, k.tag_error, k.tagged_at,
+       k.tags_confirmed_by, k.tags_confirmed_at,
        t.category, t.ai_value, t.ai_confidence, t.options, t.value,
        t.decided_by, t.decided_at
 FROM frl.frl_movie_key_images k
@@ -284,21 +329,23 @@ ORDER BY k.position_seconds, t.category;";
                         reader.IsDBNull(5) ? null : reader.GetString(5),
                         reader.IsDBNull(6) ? null : reader.GetString(6),
                         reader.IsDBNull(7) ? null : reader.GetDateTime(7),
+                        reader.IsDBNull(8) ? null : reader.GetString(8),
+                        reader.IsDBNull(9) ? null : reader.GetDateTime(9),
                         new List<KeyImageTagRow>());
                     images.Add(current);
                 }
 
-                if (reader.IsDBNull(8))
+                if (reader.IsDBNull(10))
                     continue;
 
                 current.Tags.Add(new KeyImageTagRow(
-                    reader.GetString(8),
-                    reader.IsDBNull(9) ? null : reader.GetString(9),
-                    reader.IsDBNull(10) ? null : (double)reader.GetDecimal(10),
+                    reader.GetString(10),
                     reader.IsDBNull(11) ? null : reader.GetString(11),
-                    reader.IsDBNull(12) ? null : reader.GetString(12),
+                    reader.IsDBNull(12) ? null : (double)reader.GetDecimal(12),
                     reader.IsDBNull(13) ? null : reader.GetString(13),
-                    reader.IsDBNull(14) ? null : reader.GetDateTime(14)));
+                    reader.IsDBNull(14) ? null : reader.GetString(14),
+                    reader.IsDBNull(15) ? null : reader.GetString(15),
+                    reader.IsDBNull(16) ? null : reader.GetDateTime(16)));
             }
 
             return images;
@@ -319,7 +366,21 @@ ORDER BY k.position_seconds, t.category;";
             if (chosen.Count == 0)
                 return;
 
+            /* Every term the tagger reads differently from the model is written
+             * down before the change lands, with what the model said and how
+             * sure it was: that row is the training example. */
             const string sql = @"
+INSERT INTO frl.frl_movie_key_image_tag_changes
+    (key_image_id, movie_id, category, ai_value, ai_confidence, model_version,
+     previous_value, value, changed_by)
+SELECT k.id, k.movie_id, d.category, t.ai_value, t.ai_confidence,
+       k.tag_model_version, t.value, NULLIF(d.value, ''), @actingUser
+FROM unnest(@categories, @values) AS d(category, value)
+JOIN frl.frl_movie_key_images k ON k.id = @id
+LEFT JOIN frl.frl_movie_key_image_tags t
+       ON t.key_image_id = k.id AND t.category = d.category
+WHERE NULLIF(d.value, '') IS DISTINCT FROM COALESCE(t.value, t.ai_value);
+
 INSERT INTO frl.frl_movie_key_image_tags
     (key_image_id, category, value, decided_by, decided_at)
 SELECT @id, category, value, @actingUser, now()
@@ -355,7 +416,8 @@ SELECT movie_id,
        COUNT(*) FILTER (WHERE tag_status IS NULL
                            OR tag_status IN ('pending', 'running')) AS waiting,
        COUNT(*) FILTER (WHERE tag_status = 'tagged')                AS tagged,
-       COUNT(*) FILTER (WHERE tag_status = 'error')                 AS failed
+       COUNT(*) FILTER (WHERE tag_status = 'error')                 AS failed,
+       COUNT(*) FILTER (WHERE tags_confirmed_at IS NOT NULL)         AS confirmed
 FROM frl.frl_movie_key_images
 WHERE decision = 'kept' AND image_key IS NOT NULL AND movie_id = ANY(@ids)
 GROUP BY movie_id;";
@@ -371,8 +433,105 @@ GROUP BY movie_id;";
                     (int)reader.GetInt64(1),
                     (int)reader.GetInt64(2),
                     (int)reader.GetInt64(3),
-                    (int)reader.GetInt64(4)));
+                    (int)reader.GetInt64(4),
+                    (int)reader.GetInt64(5)));
             return rows;
+        }
+
+        /// <summary>
+        /// Tick an image off as reviewed, or take the tick back. The tick is the
+        /// tagger's word that the terms on that frame are right, which is what
+        /// makes its unchanged terms worth training on as well as its changed
+        /// ones.
+        /// </summary>
+        public static async Task<bool> ConfirmAsync(
+            NpgsqlConnection connection,
+            long id,
+            bool confirmed,
+            string actingUser,
+            CancellationToken ct)
+        {
+            const string sql = @"
+UPDATE frl.frl_movie_key_images
+SET tags_confirmed_by = CASE WHEN @confirmed THEN @actingUser END,
+    tags_confirmed_at = CASE WHEN @confirmed THEN now() END
+WHERE id = @id;";
+
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@id", id);
+            cmd.Parameters.AddWithValue("@confirmed", confirmed);
+            cmd.Parameters.AddWithValue("@actingUser", actingUser);
+            return await cmd.ExecuteNonQueryAsync(ct) > 0;
+        }
+
+        /// <summary>
+        /// The terms taggers have read differently from the model, newest last,
+        /// for the batch that retrains it. Optionally one movie's, and
+        /// optionally only the ones no batch has taken yet.
+        /// </summary>
+        public static async Task<List<KeyImageTagChange>> ChangesAsync(
+            NpgsqlConnection connection,
+            int movieId,
+            bool pendingOnly,
+            int limit,
+            CancellationToken ct)
+        {
+            var sql = @"
+SELECT c.id, c.key_image_id, c.movie_id, k.image_key, c.category, c.ai_value,
+       c.ai_confidence, c.model_version, c.previous_value, c.value,
+       c.changed_by, c.changed_at, c.exported_at
+FROM frl.frl_movie_key_image_tag_changes c
+LEFT JOIN frl.frl_movie_key_images k ON k.id = c.key_image_id
+WHERE TRUE" +
+                (movieId > 0 ? " AND c.movie_id = @movieId" : "") +
+                (pendingOnly ? " AND c.exported_at IS NULL" : "") + @"
+ORDER BY c.id
+LIMIT @limit;";
+
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            if (movieId > 0)
+                cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@limit", limit);
+
+            var rows = new List<KeyImageTagChange>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                rows.Add(new KeyImageTagChange(
+                    reader.GetInt64(0),
+                    reader.GetInt64(1),
+                    reader.GetInt32(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    reader.GetString(4),
+                    reader.IsDBNull(5) ? null : reader.GetString(5),
+                    reader.IsDBNull(6) ? null : (double)reader.GetDecimal(6),
+                    reader.IsDBNull(7) ? null : reader.GetString(7),
+                    reader.IsDBNull(8) ? null : reader.GetString(8),
+                    reader.IsDBNull(9) ? null : reader.GetString(9),
+                    reader.IsDBNull(10) ? null : reader.GetString(10),
+                    reader.GetDateTime(11),
+                    reader.IsDBNull(12) ? null : reader.GetDateTime(12)));
+            return rows;
+        }
+
+        /// <summary>
+        /// Mark changes as taken by a retraining batch, so the next batch picks
+        /// up where this one left off rather than relearning the same
+        /// corrections.
+        /// </summary>
+        public static async Task<int> MarkChangesExportedAsync(
+            NpgsqlConnection connection, long[] ids, CancellationToken ct)
+        {
+            if (ids.Length == 0)
+                return 0;
+
+            const string sql = @"
+UPDATE frl.frl_movie_key_image_tag_changes
+SET exported_at = now()
+WHERE id = ANY(@ids) AND exported_at IS NULL;";
+
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@ids", ids);
+            return await cmd.ExecuteNonQueryAsync(ct);
         }
 
         /// <summary>
