@@ -29,6 +29,10 @@ namespace AdminPanelAPI.Services
     /// <summary>A frame waiting to be read by the image tagger.</summary>
     public sealed record KeyImageTagClaim(long Id, string ImageKey);
 
+    /// <summary>How far a movie's kept frames have got with the image tagger.</summary>
+    public sealed record KeyImageTagProgress(
+        int MovieId, int Kept, int Waiting, int Tagged, int Failed);
+
     /// <summary>
     /// The technical terms of a movie's kept key images: what the image tagger
     /// read off each frame, and what the tagger settled on. Shared by the
@@ -331,6 +335,69 @@ ON CONFLICT (key_image_id, category) DO UPDATE
             cmd.Parameters.AddWithValue("@values", chosen.Values.ToArray());
             cmd.Parameters.AddWithValue("@actingUser", actingUser);
             await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        /// <summary>
+        /// How many of each movie's kept frames have been read, for the AI tags
+        /// stage on the tagging page. Only frames with a picture in R2 count,
+        /// since those are the only ones that can be read.
+        /// </summary>
+        public static async Task<List<KeyImageTagProgress>> ProgressAsync(
+            NpgsqlConnection connection, IEnumerable<int> movieIds, CancellationToken ct)
+        {
+            var ids = movieIds.Distinct().ToArray();
+            if (ids.Length == 0)
+                return new List<KeyImageTagProgress>();
+
+            const string sql = @"
+SELECT movie_id,
+       COUNT(*)                                                    AS kept,
+       COUNT(*) FILTER (WHERE tag_status IS NULL
+                           OR tag_status IN ('pending', 'running')) AS waiting,
+       COUNT(*) FILTER (WHERE tag_status = 'tagged')                AS tagged,
+       COUNT(*) FILTER (WHERE tag_status = 'error')                 AS failed
+FROM frl.frl_movie_key_images
+WHERE decision = 'kept' AND image_key IS NOT NULL AND movie_id = ANY(@ids)
+GROUP BY movie_id;";
+
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@ids", ids);
+
+            var rows = new List<KeyImageTagProgress>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                rows.Add(new KeyImageTagProgress(
+                    reader.GetInt32(0),
+                    (int)reader.GetInt64(1),
+                    (int)reader.GetInt64(2),
+                    (int)reader.GetInt64(3),
+                    (int)reader.GetInt64(4)));
+            return rows;
+        }
+
+        /// <summary>
+        /// Move a movie on to the AI tags stage once every kept frame of it has
+        /// been read. A frame that could not be read does not hold the movie
+        /// back, or a single bad still would strand it for ever.
+        /// </summary>
+        public static async Task<int> AdvanceReadMoviesAsync(
+            NpgsqlConnection connection, CancellationToken ct)
+        {
+            const string sql = @"
+UPDATE frl.frl_movie_tagger_assignments a
+SET status = 'ai_tags_read', ai_tags_at = COALESCE(a.ai_tags_at, now()), updated_at = now()
+WHERE a.status = 'key_images_extracted'
+  AND EXISTS (
+      SELECT 1 FROM frl.frl_movie_key_images k
+      WHERE k.movie_id = a.movie_id AND k.decision = 'kept'
+        AND k.image_key IS NOT NULL AND k.tag_status = 'tagged')
+  AND NOT EXISTS (
+      SELECT 1 FROM frl.frl_movie_key_images k
+      WHERE k.movie_id = a.movie_id AND k.decision = 'kept' AND k.image_key IS NOT NULL
+        AND (k.tag_status IS NULL OR k.tag_status IN ('pending', 'running')));";
+
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            return await cmd.ExecuteNonQueryAsync(ct);
         }
 
         /// <summary>The movie a key image belongs to, for the allocation check.</summary>
