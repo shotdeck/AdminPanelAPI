@@ -55,6 +55,8 @@ namespace AdminPanelAPI.Services
                 return;
             }
 
+            await WarmTaxonomyAsync(stoppingToken);
+
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
@@ -78,6 +80,25 @@ namespace AdminPanelAPI.Services
                 {
                     return;
                 }
+            }
+        }
+
+        /// <summary>
+        /// Read the categories once here, so the first tagger to open a frame is
+        /// not the one who waits on the image tagger's container waking.
+        /// </summary>
+        private async Task WarmTaxonomyAsync(CancellationToken ct)
+        {
+            try
+            {
+                using var scope = _scopeFactory.CreateScope();
+                await scope.ServiceProvider
+                    .GetRequiredService<IImageTechnicalTagService>()
+                    .GetTaxonomyAsync(ct);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogWarning(ex, "Reading the tag categories on startup failed.");
             }
         }
 

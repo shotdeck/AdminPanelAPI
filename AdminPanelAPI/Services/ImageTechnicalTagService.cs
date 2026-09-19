@@ -18,8 +18,9 @@ namespace AdminPanelAPI.Services
 
         /// <summary>
         /// The categories and their legal values, which is what the tagging page
-        /// offers a tagger. Cached: the taxonomy only changes when the model
-        /// does.
+        /// offers a tagger. Kept for as long as the app runs: the taxonomy only
+        /// changes when the model does, and asking the tagger for it wakes a
+        /// container, which a tagger opening a frame should never wait on.
         /// </summary>
         Task<TranscodeResult> GetTaxonomyAsync(CancellationToken ct);
 
@@ -43,6 +44,9 @@ namespace AdminPanelAPI.Services
         private DateTimeOffset _taxonomyAt = DateTimeOffset.MinValue;
         private static readonly TimeSpan TaxonomyFor = TimeSpan.FromHours(6);
 
+        /// <summary>Whether a refresh behind a stale answer is already going.</summary>
+        private int _taxonomyRefreshing;
+
         public ImageTechnicalTagService(
             IConfiguration configuration,
             IHttpClientFactory httpClientFactory,
@@ -57,20 +61,51 @@ namespace AdminPanelAPI.Services
 
         public int BatchLimit => 32;
 
-        public async Task<TranscodeResult> GetTaxonomyAsync(CancellationToken ct)
+        public Task<TranscodeResult> GetTaxonomyAsync(CancellationToken ct)
         {
-            if (_taxonomy is { Length: > 0 } cached &&
-                DateTimeOffset.UtcNow - _taxonomyAt < TaxonomyFor)
-                return new TranscodeResult(HttpStatusCode.OK, cached);
+            if (_taxonomy is not { Length: > 0 } cached)
+                return FetchTaxonomyAsync(ct);
 
+            // A stale copy is still the right answer — the taxonomy changes with
+            // the model, not the hour — so it goes back at once and the refresh
+            // happens behind the caller rather than waiting on a cold container.
+            if (DateTimeOffset.UtcNow - _taxonomyAt >= TaxonomyFor &&
+                Interlocked.CompareExchange(ref _taxonomyRefreshing, 1, 0) == 0)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await FetchTaxonomyAsync(CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Refreshing the taxonomy failed.");
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref _taxonomyRefreshing, 0);
+                    }
+                });
+            }
+
+            return Task.FromResult(new TranscodeResult(HttpStatusCode.OK, cached));
+        }
+
+        private async Task<TranscodeResult> FetchTaxonomyAsync(CancellationToken ct)
+        {
             var result = await SendAsync(HttpMethod.Get, "/taxonomy", null, ct);
             if (result.IsSuccess)
             {
                 _taxonomy = result.Body;
                 _taxonomyAt = DateTimeOffset.UtcNow;
+                return result;
             }
 
-            return result;
+            // The tagger being down does not make the categories unknown.
+            return _taxonomy is { Length: > 0 } stale
+                ? new TranscodeResult(HttpStatusCode.OK, stale)
+                : result;
         }
 
         public Task<TranscodeResult> TagAsync(
