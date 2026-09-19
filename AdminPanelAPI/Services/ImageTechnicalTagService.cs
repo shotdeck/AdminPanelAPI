@@ -25,6 +25,13 @@ namespace AdminPanelAPI.Services
         Task<TranscodeResult> GetTaxonomyAsync(CancellationToken ct);
 
         /// <summary>
+        /// Read the categories again whatever the age of the copy held. Meant for
+        /// just after a batch of frames has been read, when the tagger's
+        /// container is warm and the answer costs nothing.
+        /// </summary>
+        Task RefreshTaxonomyAsync(CancellationToken ct);
+
+        /// <summary>
         /// Read a batch of stills. Each image is named by the caller so the
         /// results can be matched back to the frames, and one image failing does
         /// not fail the rest.
@@ -90,6 +97,21 @@ namespace AdminPanelAPI.Services
             }
 
             return Task.FromResult(new TranscodeResult(HttpStatusCode.OK, cached));
+        }
+
+        public async Task RefreshTaxonomyAsync(CancellationToken ct)
+        {
+            if (Interlocked.CompareExchange(ref _taxonomyRefreshing, 1, 0) != 0)
+                return;
+
+            try
+            {
+                await FetchTaxonomyAsync(ct);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _taxonomyRefreshing, 0);
+            }
         }
 
         private async Task<TranscodeResult> FetchTaxonomyAsync(CancellationToken ct)
