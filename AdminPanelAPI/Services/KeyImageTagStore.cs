@@ -108,7 +108,8 @@ CREATE INDEX IF NOT EXISTS idx_fmki_tag_status
     WHERE tag_status IN ('pending', 'running');
 ALTER TABLE frl.frl_movie_key_images
     ADD COLUMN IF NOT EXISTS tags_confirmed_by VARCHAR(120),
-    ADD COLUMN IF NOT EXISTS tags_confirmed_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS tags_confirmed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS tag_started_at    TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS frl.frl_movie_key_image_tag_changes (
     id             BIGSERIAL    PRIMARY KEY,
     key_image_id   BIGINT       NOT NULL
@@ -176,18 +177,41 @@ WHERE id = @id AND decision = 'kept' AND tag_status IS NULL;";
         }
 
         /// <summary>
+        /// Put back the frames a pass claimed and never finished, so a run that
+        /// was cut short does not leave them being read for ever.
+        /// </summary>
+        public static async Task<int> RequeueStaleAsync(
+            NpgsqlConnection connection, int movieId, TimeSpan olderThan,
+            CancellationToken ct)
+        {
+            const string sql = @"
+UPDATE frl.frl_movie_key_images
+SET tag_status = 'pending'
+WHERE movie_id = @movieId
+  AND tag_status = 'running'
+  AND COALESCE(tag_started_at, now() - interval '1 day') < now() - @olderThan;";
+
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@olderThan", olderThan);
+            return await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        /// <summary>
         /// Take the next frames waiting to be read and mark them as being read,
         /// so two passes cannot send the same frame twice.
         /// </summary>
         public static async Task<List<KeyImageTagClaim>> ClaimAsync(
-            NpgsqlConnection connection, int limit, CancellationToken ct)
+            NpgsqlConnection connection, int limit, CancellationToken ct,
+            int? movieId = null)
         {
-            const string sql = @"
+            var sql = @"
 UPDATE frl.frl_movie_key_images
-SET tag_status = 'running'
+SET tag_status = 'running', tag_started_at = now()
 WHERE id IN (
     SELECT id FROM frl.frl_movie_key_images
-    WHERE tag_status = 'pending' AND decision = 'kept' AND image_key IS NOT NULL
+    WHERE tag_status = 'pending' AND decision = 'kept' AND image_key IS NOT NULL" +
+                (movieId.HasValue ? " AND movie_id = @movieId" : "") + @"
     ORDER BY id
     LIMIT @limit
 )
@@ -195,6 +219,8 @@ RETURNING id, image_key;";
 
             await using var cmd = new NpgsqlCommand(sql, connection);
             cmd.Parameters.AddWithValue("@limit", limit);
+            if (movieId.HasValue)
+                cmd.Parameters.AddWithValue("@movieId", movieId.Value);
 
             var claims = new List<KeyImageTagClaim>();
             await using var reader = await cmd.ExecuteReaderAsync(ct);
