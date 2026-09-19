@@ -15,6 +15,8 @@ namespace AdminPanelAPI.Controllers
     {
         private readonly IDialogueTranscriptionJobRepository _jobRepository;
         private readonly IDialogueJobQueue _jobQueue;
+        private readonly IMusicIdentificationJobRepository _musicJobRepository;
+        private readonly IMusicJobQueue _musicJobQueue;
         private readonly IConfiguration _configuration;
         private readonly ILogger<DialogueSearchController> _logger;
         private readonly string _connectionString;
@@ -32,11 +34,15 @@ namespace AdminPanelAPI.Controllers
         public DialogueSearchController(
             IDialogueTranscriptionJobRepository jobRepository,
             IDialogueJobQueue jobQueue,
+            IMusicIdentificationJobRepository musicJobRepository,
+            IMusicJobQueue musicJobQueue,
             IConfiguration configuration,
             ILogger<DialogueSearchController> logger)
         {
             _jobRepository = jobRepository;
             _jobQueue = jobQueue;
+            _musicJobRepository = musicJobRepository;
+            _musicJobQueue = musicJobQueue;
             _configuration = configuration;
             _logger = logger;
             _connectionString = configuration.GetConnectionString("Default")
@@ -57,9 +63,11 @@ namespace AdminPanelAPI.Controllers
         public async Task<IActionResult> UploadAndTranscribe(
             int movieId,
             IFormFile file,
+            [FromQuery] bool music = false,
             CancellationToken cancellationToken = default)
         {
-            return await UploadToR2AndQueueAsync(movieId, file, true, cancellationToken);
+            return await UploadToR2AndQueueAsync(
+                movieId, file, true, music, cancellationToken);
         }
 
         /// <summary>
@@ -74,6 +82,7 @@ namespace AdminPanelAPI.Controllers
         public async Task<IActionResult> UploadAndTranscribeByFileName(
             IFormFile file,
             [FromQuery] bool transcribe = true,
+            [FromQuery] bool music = false,
             CancellationToken cancellationToken = default)
         {
             if (file == null || file.Length == 0)
@@ -93,13 +102,15 @@ namespace AdminPanelAPI.Controllers
                     error = $"No movie found in frl_movies matching title '{title}' and year {year}."
                 });
 
-            return await UploadToR2AndQueueAsync(movieId.Value, file, transcribe, cancellationToken);
+            return await UploadToR2AndQueueAsync(
+                movieId.Value, file, transcribe, music, cancellationToken);
         }
 
         private async Task<IActionResult> UploadToR2AndQueueAsync(
             int movieId,
             IFormFile file,
             bool queueTranscription,
+            bool music,
             CancellationToken cancellationToken)
         {
             if (file == null || file.Length == 0)
@@ -164,36 +175,35 @@ namespace AdminPanelAPI.Controllers
                     movieId, r2Key);
             }
 
-            if (!queueTranscription)
+            long? jobId = null;
+            if (queueTranscription)
             {
-                // Store the movie in R2 only (e.g. so music identification can
-                // resolve it by movieId) without running dialogue transcription.
-                return Ok(new
-                {
-                    jobId = (int?)null,
-                    movieId,
-                    r2Key,
-                    r2Bucket = _r2BucketName,
-                    fileSizeBytes = file.Length,
-                    skippedUpload = alreadyExists,
-                    status = "Uploaded"
-                });
+                jobId = await _jobRepository.CreateJobAsync(
+                    movieId, r2Key, null, cancellationToken);
+                await _jobQueue.QueueJobAsync(jobId.Value, cancellationToken);
             }
 
-            var jobId = await _jobRepository.CreateJobAsync(
-                movieId, r2Key, null, cancellationToken);
-
-            await _jobQueue.QueueJobAsync(jobId, cancellationToken);
+            // Optionally kick off music identification on the same uploaded file,
+            // so a single upload runs dialogue + music in parallel. The music
+            // pipeline streams the same R2 object, so no re-upload is needed.
+            long? musicJobId = null;
+            if (music)
+            {
+                musicJobId = await _musicJobRepository.CreateJobAsync(
+                    movieId, r2Key, null, cancellationToken);
+                await _musicJobQueue.QueueJobAsync(musicJobId.Value, cancellationToken);
+            }
 
             return Ok(new
             {
                 jobId,
+                musicJobId,
                 movieId,
                 r2Key,
                 r2Bucket = _r2BucketName,
                 fileSizeBytes = file.Length,
                 skippedUpload = alreadyExists,
-                status = "Queued"
+                status = queueTranscription || music ? "Queued" : "Uploaded"
             });
         }
 
