@@ -1235,7 +1235,11 @@ WHERE id = ANY(@ids);";
                 images,
                 waiting = states.Count(image =>
                     image.Status is KeyImageTagStore.Pending or KeyImageTagStore.Running),
+                // Split out so the page can say a frame is being read this
+                // moment rather than only that it is somewhere in the queue.
+                running = states.Count(image => image.Status == KeyImageTagStore.Running),
                 tagged = states.Count(image => image.Status == KeyImageTagStore.Tagged),
+                failed = states.Count(image => image.Status == KeyImageTagStore.Error),
                 confirmed = states.Count(image => image.ConfirmedAt != null)
             });
         }
