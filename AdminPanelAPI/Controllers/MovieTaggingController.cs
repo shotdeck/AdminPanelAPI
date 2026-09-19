@@ -165,6 +165,19 @@ namespace ShotDeckSearch.Controllers
             public string? ActingUser { get; set; }
         }
 
+        public sealed class TagConfirmRequest
+        {
+            /// <summary>True to tick the image off, false to take it back.</summary>
+            public bool Confirmed { get; set; } = true;
+
+            public string? ActingUser { get; set; }
+        }
+
+        public sealed class TagChangeExportRequest
+        {
+            public long[]? Ids { get; set; }
+        }
+
         public sealed class KeyImageRequest
         {
             public int MovieId { get; set; }
@@ -1170,7 +1183,8 @@ WHERE id = ANY(@ids);";
                     kept = row.Kept,
                     waiting = row.Waiting,
                     tagged = row.Tagged,
-                    failed = row.Failed
+                    failed = row.Failed,
+                    confirmed = row.Confirmed
                 })
             });
         }
@@ -1201,6 +1215,8 @@ WHERE id = ANY(@ids);";
                 modelVersion = image.ModelVersion,
                 error = image.Error,
                 taggedAt = image.TaggedAt,
+                confirmedBy = image.ConfirmedBy,
+                confirmedAt = image.ConfirmedAt,
                 tags = image.Tags.Select(tag => new
                 {
                     category = tag.Category,
@@ -1219,7 +1235,8 @@ WHERE id = ANY(@ids);";
                 images,
                 waiting = states.Count(image =>
                     image.Status is KeyImageTagStore.Pending or KeyImageTagStore.Running),
-                tagged = states.Count(image => image.Status == KeyImageTagStore.Tagged)
+                tagged = states.Count(image => image.Status == KeyImageTagStore.Tagged),
+                confirmed = states.Count(image => image.ConfirmedAt != null)
             });
         }
 
@@ -1303,6 +1320,100 @@ WHERE id = ANY(@ids);";
 
             await KeyImageTagStore.SaveDecisionsAsync(_connection, id, chosen, actingUser, ct);
             return Ok(new { id, saved = chosen.Count, decidedBy = actingUser });
+        }
+
+        /// <summary>
+        /// Tick an image off as reviewed, so a tagger can tell the frames they
+        /// have been through from the ones they have not. Sending confirmed as
+        /// false takes the tick back.
+        /// </summary>
+        [HttpPut("key-images/{id:long}/tags/confirm")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<IActionResult> ConfirmKeyImageTags(
+            long id, [FromBody] TagConfirmRequest request, CancellationToken ct = default)
+        {
+            var actingUser = (request.ActingUser ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(actingUser))
+                return BadRequest(new { error = "actingUser is required." });
+
+            await EnsureReadyAsync(ct);
+
+            if (await KeyImageTagStore.MovieOfAsync(_connection, id, ct) is not int movieId)
+                return NotFound(new { error = "No such key image." });
+            if (!await CanCaptureAsync(movieId, actingUser, ct))
+                return StatusCode(403, new { error = "That movie is not allocated to you." });
+
+            await KeyImageTagStore.ConfirmAsync(
+                _connection, id, request.Confirmed, actingUser, ct);
+            return Ok(new
+            {
+                id,
+                confirmed = request.Confirmed,
+                confirmedBy = request.Confirmed ? actingUser : null
+            });
+        }
+
+        /// <summary>
+        /// The terms taggers read differently from the model: one row per term,
+        /// with what the model said and how sure it was beside what the person
+        /// settled on. This is the batch the model is retrained from, so by
+        /// default it returns only the corrections no batch has taken yet.
+        /// </summary>
+        [HttpGet("key-image-tags/changes")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetKeyImageTagChanges(
+            [FromQuery] int movieId = 0,
+            [FromQuery] bool pendingOnly = true,
+            [FromQuery] int limit = 1000,
+            CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            var rows = await KeyImageTagStore.ChangesAsync(
+                _connection, movieId, pendingOnly, Math.Clamp(limit, 1, 10000), ct);
+
+            return Ok(new
+            {
+                changes = rows.Select(row => new
+                {
+                    id = row.Id,
+                    keyImageId = row.KeyImageId,
+                    movieId = row.MovieId,
+                    imageKey = row.ImageKey,
+                    imageUrl = row.ImageKey == null
+                        ? null
+                        : _storage.CreateDownloadUrl(row.ImageKey, false),
+                    category = row.Category,
+                    aiValue = row.AiValue,
+                    aiConfidence = row.AiConfidence,
+                    modelVersion = row.ModelVersion,
+                    previousValue = row.PreviousValue,
+                    value = row.Value,
+                    changedBy = row.ChangedBy,
+                    changedAt = row.ChangedAt,
+                    exportedAt = row.ExportedAt
+                })
+            });
+        }
+
+        /// <summary>
+        /// Mark corrections as taken by a retraining batch, so the next batch
+        /// starts after them.
+        /// </summary>
+        [HttpPost("key-image-tags/changes/exported")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> MarkKeyImageTagChangesExported(
+            [FromBody] TagChangeExportRequest request, CancellationToken ct = default)
+        {
+            if (request.Ids is not { Length: > 0 })
+                return BadRequest(new { error = "ids is required." });
+
+            await EnsureReadyAsync(ct);
+            var marked = await KeyImageTagStore.MarkChangesExportedAsync(
+                _connection, request.Ids, ct);
+            return Ok(new { marked });
         }
 
         /// <summary>
