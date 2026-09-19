@@ -98,6 +98,7 @@ builder.Services.AddSingleton<IKeyImageAnalysisService, KeyImageAnalysisService>
 builder.Services.AddSingleton<IFilmSynopsisService, FilmSynopsisService>();
 builder.Services.AddSingleton<IWalkthroughService, WalkthroughService>();
 builder.Services.AddSingleton<IStoryRatingService, StoryRatingService>();
+builder.Services.AddSingleton<IImageTechnicalTagService, ImageTechnicalTagService>();
 
 // TMDB lookups for saying which film an uploaded master is
 builder.Services.AddSingleton<ITmdbService, TmdbService>();
@@ -105,6 +106,10 @@ builder.Services.AddSingleton<ITmdbService, TmdbService>();
 // Describes and analyses a movie as soon as its SF proxy exists, so a tagger
 // who finishes watching finds the walkthrough and the proposals waiting.
 builder.Services.AddHostedService<MoviePreparationWorker>();
+
+// Reads the technical terms off the frames a tagger has kept, so they are there
+// when the tagger opens an image rather than fetched while they wait.
+builder.Services.AddHostedService<KeyImageTagWorker>();
 
 // Camera-movement QC: shared analysis pipeline plus a worker that keeps a bank
 // of pre-analysed images so a reviewer's fetch is an instant assignment.

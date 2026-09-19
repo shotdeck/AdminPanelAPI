@@ -67,19 +67,22 @@ namespace ShotDeckSearch.Controllers
         private readonly IKeyImageAnalysisService _analysis;
         private readonly IFilmSynopsisService _synopsis;
         private readonly IWalkthroughService _walkthrough;
+        private readonly IImageTechnicalTagService _imageTags;
 
         public MovieTaggingController(
             NpgsqlConnection connection,
             IMovieFileStorageService storage,
             IKeyImageAnalysisService analysis,
             IFilmSynopsisService synopsis,
-            IWalkthroughService walkthrough)
+            IWalkthroughService walkthrough,
+            IImageTechnicalTagService imageTags)
         {
             _connection = connection;
             _storage = storage;
             _analysis = analysis;
             _synopsis = synopsis;
             _walkthrough = walkthrough;
+            _imageTags = imageTags;
         }
 
         public sealed class AssignRequest
@@ -137,6 +140,27 @@ namespace ShotDeckSearch.Controllers
         {
             public long[]? Ids { get; set; }
             public string? Decision { get; set; }
+            public string? ActingUser { get; set; }
+        }
+
+        public sealed class TagRunRequest
+        {
+            public int MovieId { get; set; }
+
+            /// <summary>Particular frames, or all of the movie's kept ones.</summary>
+            public long[]? Ids { get; set; }
+
+            /// <summary>Read a frame again even though it has been read.</summary>
+            public bool Force { get; set; }
+
+            public string? ActingUser { get; set; }
+        }
+
+        public sealed class TagDecisionRequest
+        {
+            /// <summary>Category to chosen value, for the categories touched.</summary>
+            public Dictionary<string, string>? Tags { get; set; }
+
             public string? ActingUser { get; set; }
         }
 
@@ -572,6 +596,10 @@ WHERE id = @id;";
                 save.Parameters.AddWithValue("@id", id);
                 await save.ExecuteNonQueryAsync(ct);
             }
+
+            // A frame picked while watching only gets a picture in R2 here, so
+            // this is the first moment its terms can be read.
+            await KeyImageTagStore.QueueOneAsync(_connection, id, ct);
 
             return Ok(new
             {
@@ -1080,11 +1108,204 @@ WHERE id = ANY(@ids);";
             cmd.Parameters.AddWithValue("@actingUser", actingUser);
             var affected = await cmd.ExecuteNonQueryAsync(ct);
 
+            // A frame that has just become one of the movie's key images is
+            // queued to have its technical terms read, so they are there when
+            // the tagger opens it.
+            if (decision == "kept")
+                foreach (var movieId in movieIds)
+                    await KeyImageTagStore.QueueAsync(_connection, movieId, ids, false, ct);
+
             var remaining = new Dictionary<int, int>();
             foreach (var movieId in movieIds)
                 remaining[movieId] = await CountProposalsAsync(movieId, ct);
 
             return Ok(new { decision, decided = affected, remaining });
+        }
+
+        /// <summary>
+        /// The categories of technical term an image carries and the legal values
+        /// of each, as the image tagger itself defines them. This is what the
+        /// tagging page offers a tagger who disagrees with the model.
+        /// </summary>
+        [HttpGet("key-image-tags/taxonomy")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetImageTagTaxonomy(CancellationToken ct = default)
+        {
+            var result = await _imageTags.GetTaxonomyAsync(ct);
+            return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
+        }
+
+        /// <summary>
+        /// Every kept frame of a movie with its technical terms: what the image
+        /// tagger read off the frame, the alternatives it ranked below, and what
+        /// the tagger settled on where they have looked.
+        /// </summary>
+        [HttpGet("key-image-tags")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetKeyImageTags(
+            [FromQuery] int movieId, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            var states = await KeyImageTagStore.ReadMovieAsync(_connection, movieId, ct);
+            var images = states.Select(image => new
+            {
+                id = image.Id,
+                movieId = image.MovieId,
+                positionSeconds = image.PositionSeconds,
+                imageKey = image.ImageKey,
+                imageUrl = image.ImageKey == null
+                    ? null
+                    : _storage.CreateDownloadUrl(image.ImageKey, false),
+                status = image.Status,
+                modelVersion = image.ModelVersion,
+                error = image.Error,
+                taggedAt = image.TaggedAt,
+                tags = image.Tags.Select(tag => new
+                {
+                    category = tag.Category,
+                    aiValue = tag.AiValue,
+                    aiConfidence = tag.AiConfidence,
+                    options = JsonSerializer.Deserialize<JsonElement>(tag.Options ?? "[]"),
+                    value = tag.Value,
+                    decidedBy = tag.DecidedBy,
+                    decidedAt = tag.DecidedAt
+                })
+            });
+
+            return Ok(new
+            {
+                movieId,
+                images,
+                waiting = states.Count(image =>
+                    image.Status is KeyImageTagStore.Pending or KeyImageTagStore.Running),
+                tagged = states.Count(image => image.Status == KeyImageTagStore.Tagged)
+            });
+        }
+
+        /// <summary>
+        /// Have the movie's kept frames read by the image tagger. Frames are
+        /// queued and read a batch at a time in the background, since a batch is
+        /// minutes of work; the page polls key-image-tags for the terms. A frame
+        /// kept from now on is queued as it is kept, so this is for the frames
+        /// kept before, and for reading one again.
+        /// </summary>
+        [HttpPost("key-image-tags")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        public async Task<IActionResult> QueueKeyImageTags(
+            [FromBody] TagRunRequest request, CancellationToken ct = default)
+        {
+            var actingUser = (request.ActingUser ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(actingUser))
+                return BadRequest(new { error = "actingUser is required." });
+
+            await EnsureReadyAsync(ct);
+            if (!await CanCaptureAsync(request.MovieId, actingUser, ct))
+                return StatusCode(403, new { error = "That movie is not allocated to you." });
+
+            var queued = await KeyImageTagStore.QueueAsync(
+                _connection, request.MovieId, request.Ids, request.Force, ct);
+
+            return Ok(new { movieId = request.MovieId, queued });
+        }
+
+        /// <summary>
+        /// What the tagger settled on for one image's terms. Their choice is kept
+        /// beside the model's own, not over it, so a term a person changed can
+        /// always be told from a term nobody questioned — which is what the model
+        /// is retrained on.
+        /// </summary>
+        [HttpPut("key-images/{id:long}/tags")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<IActionResult> SaveKeyImageTags(
+            long id, [FromBody] TagDecisionRequest request, CancellationToken ct = default)
+        {
+            var actingUser = (request.ActingUser ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(actingUser))
+                return BadRequest(new { error = "actingUser is required." });
+            if (request.Tags is not { Count: > 0 })
+                return BadRequest(new { error = "tags is required." });
+
+            await EnsureReadyAsync(ct);
+
+            if (await KeyImageTagStore.MovieOfAsync(_connection, id, ct) is not int movieId)
+                return NotFound(new { error = "No such key image." });
+            if (!await CanCaptureAsync(movieId, actingUser, ct))
+                return StatusCode(403, new { error = "That movie is not allocated to you." });
+
+            var legal = await LegalTagValuesAsync(ct);
+            var chosen = new Dictionary<string, string>();
+
+            foreach (var (category, value) in request.Tags)
+            {
+                var name = (category ?? "").Trim();
+                if (legal.Count > 0 && !legal.ContainsKey(name))
+                    return BadRequest(new { error = $"{name} is not a category the tagger reads." });
+
+                var chosenValue = (value ?? "").Trim();
+                if (legal.TryGetValue(name, out var values) && chosenValue.Length > 0)
+                {
+                    var illegal = chosenValue
+                        .Split('+', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                        .FirstOrDefault(term => !values.Contains(term));
+                    if (illegal != null)
+                        return BadRequest(new
+                        {
+                            error = $"{illegal} is not a value {name} can take."
+                        });
+                }
+
+                chosen[name] = chosenValue;
+            }
+
+            await KeyImageTagStore.SaveDecisionsAsync(_connection, id, chosen, actingUser, ct);
+            return Ok(new { id, saved = chosen.Count, decidedBy = actingUser });
+        }
+
+        /// <summary>
+        /// The values each category may take, from the image tagger's taxonomy.
+        /// Empty when the tagger cannot be reached, in which case a tagger's
+        /// choice is taken on trust rather than refused.
+        /// </summary>
+        private async Task<Dictionary<string, HashSet<string>>> LegalTagValuesAsync(
+            CancellationToken ct)
+        {
+            var legal = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+            var result = await _imageTags.GetTaxonomyAsync(ct);
+            if (!result.IsSuccess)
+                return legal;
+
+            try
+            {
+                using var document = JsonDocument.Parse(result.Body);
+                if (!document.RootElement.TryGetProperty("categories", out var categories) ||
+                    categories.ValueKind != JsonValueKind.Object)
+                    return legal;
+
+                foreach (var category in categories.EnumerateObject())
+                {
+                    var values = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    if (category.Value.TryGetProperty("values", out var allowed) &&
+                        allowed.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var value in allowed.EnumerateArray())
+                            if (value.GetString() is { Length: > 0 } text)
+                                values.Add(text);
+                    }
+
+                    legal[category.Name] = values;
+                }
+            }
+            catch (JsonException)
+            {
+                return new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            return legal;
         }
 
         private Task<int> CountProposalsAsync(int movieId, CancellationToken ct) =>
@@ -1229,7 +1450,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_fmki_movie_position_story
     ON frl.frl_movie_key_images (movie_id, position_seconds, COALESCE(story_from, ''));
 CREATE INDEX IF NOT EXISTS idx_fmki_movie_decision
     ON frl.frl_movie_key_images (movie_id, decision);"
-                + MoviePreparationStore.Schema;
+                + MoviePreparationStore.Schema + KeyImageTagStore.Schema;
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
         }
