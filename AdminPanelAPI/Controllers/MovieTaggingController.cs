@@ -15,8 +15,9 @@ namespace ShotDeckSearch.Controllers
     /// dashboard already logs in against.
     ///
     /// A movie moves through hd_uploaded -> sf_created -> tagger_allocated ->
-    /// movie_watched -> key_images_extracted -> ai_tags_read. The first two stages are facts
-    /// about the movie's R2 folder and so have no row here; a row starts at
+    /// movie_watched -> key_images_extracted -> ai_tags_read -> tags_confirmed.
+    /// The first two stages are facts about the movie's R2 folder and so have
+    /// no row here; a row starts at
     /// tagger_allocated. Reaching movie_watched needs the tagger to play the
     /// HD movie through, which is why the watched position is held here and
     /// only ever advanced by as much as real playback could have covered.
@@ -30,7 +31,7 @@ namespace ShotDeckSearch.Controllers
         private static readonly string[] Statuses =
         {
             "hd_uploaded", "sf_created", "tagger_allocated", "movie_watched",
-            "key_images_extracted", "ai_tags_read"
+            "key_images_extracted", "ai_tags_read", "tags_confirmed"
         };
 
         /// <summary>
@@ -363,9 +364,12 @@ UPDATE frl.frl_movie_tagger_assignments
 SET status = @status,
     watched_at = CASE WHEN @status = 'movie_watched' THEN COALESCE(watched_at, now()) ELSE NULL END,
     watch_position_seconds = CASE WHEN @status = 'tagger_allocated' THEN 0 ELSE watch_position_seconds END,
-    key_images_at = CASE WHEN @status IN ('key_images_extracted', 'ai_tags_read')
+    key_images_at = CASE WHEN @status IN ('key_images_extracted', 'ai_tags_read', 'tags_confirmed')
         THEN COALESCE(key_images_at, now()) ELSE NULL END,
-    ai_tags_at = CASE WHEN @status = 'ai_tags_read' THEN COALESCE(ai_tags_at, now()) ELSE NULL END,
+    ai_tags_at = CASE WHEN @status IN ('ai_tags_read', 'tags_confirmed')
+        THEN COALESCE(ai_tags_at, now()) ELSE NULL END,
+    tags_confirmed_at = CASE WHEN @status = 'tags_confirmed'
+        THEN COALESCE(tags_confirmed_at, now()) ELSE NULL END,
     updated_at = now()
 WHERE movie_id = @movieId;";
 
@@ -1280,9 +1284,10 @@ UPDATE frl.frl_movie_tagger_assignments
 SET status = 'movie_watched',
     key_images_at = NULL,
     ai_tags_at = NULL,
+    tags_confirmed_at = NULL,
     updated_at = now()
 WHERE movie_id = @movieId
-  AND status IN ('key_images_extracted', 'ai_tags_read');";
+  AND status IN ('key_images_extracted', 'ai_tags_read', 'tags_confirmed');";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", request.MovieId);
@@ -1603,11 +1608,19 @@ WHERE movie_id = @movieId
 
             await KeyImageTagStore.ConfirmAsync(
                 _connection, id, request.Confirmed, actingUser, ct);
+
+            // The tick was the movie's last, or it took back the tick that was:
+            // either way the movie's stage follows it, so a movie nobody has
+            // left anything to do on reads differently in the list.
+            var stage = await KeyImageTagStore.SettleConfirmedStageAsync(
+                _connection, movieId, ct);
+
             return Ok(new
             {
                 id,
                 confirmed = request.Confirmed,
-                confirmedBy = request.Confirmed ? actingUser : null
+                confirmedBy = request.Confirmed ? actingUser : null,
+                stage
             });
         }
 
@@ -1770,7 +1783,8 @@ SELECT u.name,
        COUNT(a.movie_id) FILTER (WHERE a.status = 'tagger_allocated') AS allocated,
        COUNT(a.movie_id) FILTER (WHERE a.status = 'movie_watched') AS watched,
        COUNT(a.movie_id) FILTER (WHERE a.status = 'key_images_extracted') AS key_images,
-       COUNT(a.movie_id) FILTER (WHERE a.status = 'ai_tags_read') AS ai_tags
+       COUNT(a.movie_id) FILTER (WHERE a.status = 'ai_tags_read') AS ai_tags,
+       COUNT(a.movie_id) FILTER (WHERE a.status = 'tags_confirmed') AS confirmed
 FROM frl.frl_camera_movement_users u
 LEFT JOIN frl.frl_movie_tagger_assignments a ON lower(a.tagger) = lower(u.name)
 GROUP BY u.name
@@ -1787,7 +1801,8 @@ ORDER BY lower(u.name);";
                     allocated = (int)reader.GetInt64(1),
                     watched = (int)reader.GetInt64(2),
                     keyImages = (int)reader.GetInt64(3),
-                    aiTags = (int)reader.GetInt64(4)
+                    aiTags = (int)reader.GetInt64(4),
+                    confirmed = (int)reader.GetInt64(5)
                 });
             }
 
@@ -1825,7 +1840,8 @@ ALTER TABLE frl.frl_movie_tagger_assignments
     ADD COLUMN IF NOT EXISTS watch_duration_seconds INTEGER,
     ADD COLUMN IF NOT EXISTS watched_at             TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS key_images_at          TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS ai_tags_at             TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS ai_tags_at             TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS tags_confirmed_at      TIMESTAMPTZ;
 UPDATE frl.frl_movie_tagger_assignments
 SET status = 'movie_watched', watched_at = COALESCE(watched_at, updated_at)
 WHERE status = 'done';
