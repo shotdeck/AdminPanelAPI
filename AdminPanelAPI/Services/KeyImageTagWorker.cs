@@ -125,6 +125,18 @@ namespace AdminPanelAPI.Services
 
                 await TagBatchesAsync(connection, storage, tagger, claims, _logger, ct);
 
+                // The categories come from the same service, so they are read
+                // again here while its container is warm: a model that changed
+                // them is caught without anyone waiting on a cold start.
+                try
+                {
+                    await tagger.RefreshTaxonomyAsync(ct);
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    _logger.LogWarning(ex, "Reading the tag categories again failed.");
+                }
+
                 // A movie whose last kept frame has just been read has finished
                 // the AI tags stage, so move it on.
                 await KeyImageTagStore.AdvanceReadMoviesAsync(connection, ct);
