@@ -91,6 +91,10 @@ namespace AdminPanelAPI.Services
                 return;
 
             await TagBatchAsync(connection, storage, tagger, claims, _logger, ct);
+
+            // A movie whose last kept frame has just been read has finished the
+            // AI tags stage, so move it on.
+            await KeyImageTagStore.AdvanceReadMoviesAsync(connection, ct);
         }
 
         /// <summary>
