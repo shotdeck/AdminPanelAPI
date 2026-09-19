@@ -553,6 +553,25 @@ RETURNING id, created_at;";
 
             await MarkKeyImagesExtractedAsync(request.MovieId, ct);
 
+            // The frame's picture goes into R2 now, while it is being picked,
+            // rather than the first time somebody opens it: the tagger is
+            // already waiting on this click, and the terms cannot be read off a
+            // frame that has no picture there.
+            string? pictureKey = null;
+            try
+            {
+                pictureKey = await CutKeyImagePictureAsync(
+                    capturedId, request.MovieId, request.FrameNumber,
+                    request.PositionSeconds, ct);
+            }
+            catch (Exception ex)
+            {
+                // A picked frame is worth keeping even if the cut fails; the
+                // still endpoint tries again when it is opened.
+                _logger.LogWarning(
+                    ex, "Cutting the picture of key image {Id} failed.", capturedId);
+            }
+
             return Ok(new
             {
                 id = capturedId,
@@ -560,14 +579,20 @@ RETURNING id, created_at;";
                 positionSeconds = request.PositionSeconds,
                 frameNumber = request.FrameNumber,
                 capturedBy = actingUser,
-                createdAt = capturedAt
+                createdAt = capturedAt,
+                imageUrl = pictureKey == null
+                    ? null
+                    : _storage.CreateDownloadUrl(pictureKey, false)
             });
         }
 
         /// <summary>
-        /// The kept frame at the master's own resolution. A frame picked while
-        /// watching only has the browser's preview, so the still is cut off the
-        /// master on first ask and remembered on the row from then on.
+        /// The kept frame's own picture in R2. A proposal already has one, cut
+        /// from the movie's proxy by the analysis; a frame picked while watching
+        /// has only the browser's preview, so its picture is cut here and
+        /// remembered on the row from then on. It comes off the proxy, which is
+        /// what the tagger judges terms on and is all a movie without a master
+        /// has; the master's own frame is for publishing a still, later.
         /// </summary>
         [HttpPost("key-images/{id:long}/still")]
         [ProducesResponseType(StatusCodes.Status200OK)]
@@ -607,23 +632,69 @@ WHERE id = @id;";
                     cut = false
                 });
 
-            var variants = await _storage.GetMovieVariantsAsync(new[] { movieId }, ct);
-            var masterKey = variants.FirstOrDefault()?.HdKey;
-            if (string.IsNullOrWhiteSpace(masterKey))
-                return BadRequest(new { error = "That movie has no HD master to cut from." });
+            string? pictureKey;
+            try
+            {
+                pictureKey = await CutKeyImagePictureAsync(
+                    id, movieId, frameNumber, positionSeconds, ct);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return StatusCode(502, new { error = ex.Message });
+            }
 
+            if (pictureKey == null)
+                return BadRequest(new { error = "That movie has no video to cut from." });
+
+            return Ok(new
+            {
+                imageKey = pictureKey,
+                imageUrl = _storage.CreateDownloadUrl(pictureKey, false),
+                cut = true
+            });
+        }
+
+        /// <summary>
+        /// Cut one frame out of the movie into R2 and hang it on the key image's
+        /// row, so the frame has a picture of its own to be shown and read. Null
+        /// if the movie has no video to cut from; anything the cutting service
+        /// itself refuses is thrown.
+        /// </summary>
+        private async Task<string?> CutKeyImagePictureAsync(
+            long id,
+            int movieId,
+            int? frameNumber,
+            double positionSeconds,
+            CancellationToken ct)
+        {
+            var variants = await _storage.GetMovieVariantsAsync(new[] { movieId }, ct);
+            var variant = variants.FirstOrDefault();
+            var sourceKey = variant?.SlimKey ?? variant?.HdKey;
+            if (string.IsNullOrWhiteSpace(sourceKey))
+                return null;
+
+            // A frame number counts the master's frames, so it only means the
+            // same thing on the file it was read off. Against the proxy it is
+            // the position in seconds that holds.
+            var fromProxy = variant?.SlimKey != null;
+            var askFrame = fromProxy ? null : frameNumber;
             var result = await _analysis.CutStillAsync(
-                masterKey, frameNumber, frameNumber.HasValue ? null : positionSeconds, ct);
+                sourceKey, askFrame, askFrame.HasValue ? null : positionSeconds, ct);
             if (!result.IsSuccess)
-                return StatusCode((int)result.Status, result.Body);
+                throw new InvalidOperationException(result.Body);
 
             using var document = JsonDocument.Parse(result.Body);
             if (!document.RootElement.TryGetProperty("imageKey", out var cutKey) ||
-                cutKey.GetString() is not { Length: > 0 } stillKey)
-                return StatusCode(502, new { error = "The still service returned no image." });
+                cutKey.GetString() is not { Length: > 0 } pictureKey)
+                throw new InvalidOperationException("The still service returned no image.");
 
-            var cutFrame = document.RootElement.TryGetProperty("frame", out var frame) &&
-                frame.TryGetInt32(out var number) ? number : frameNumber;
+            // Only a cut off the master counts the frames the row means, so a
+            // proxy's own frame number is not written over it.
+            var cutFrame = !fromProxy &&
+                document.RootElement.TryGetProperty("frame", out var frame) &&
+                frame.TryGetInt32(out var number)
+                ? number
+                : frameNumber;
 
             const string saveSql = @"
 UPDATE frl.frl_movie_key_images
@@ -632,7 +703,7 @@ SET image_key = @imageKey,
 WHERE id = @id;";
             await using (var save = new NpgsqlCommand(saveSql, _connection))
             {
-                save.Parameters.AddWithValue("@imageKey", stillKey);
+                save.Parameters.AddWithValue("@imageKey", pictureKey);
                 save.Parameters.AddWithValue("@frame", (object?)cutFrame ?? DBNull.Value);
                 save.Parameters.AddWithValue("@id", id);
                 await save.ExecuteNonQueryAsync(ct);
@@ -642,13 +713,7 @@ WHERE id = @id;";
             // this is the first moment its terms can be read.
             await KeyImageTagStore.QueueOneAsync(_connection, id, ct);
 
-            return Ok(new
-            {
-                imageKey = stillKey,
-                imageUrl = _storage.CreateDownloadUrl(stillKey, false),
-                frameNumber = cutFrame,
-                cut = true
-            });
+            return pictureKey;
         }
 
         /// <summary>Drop a frame the tagger picked by mistake.</summary>
