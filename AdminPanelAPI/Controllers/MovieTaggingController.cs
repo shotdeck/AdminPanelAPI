@@ -1404,6 +1404,10 @@ WHERE movie_id = @movieId
                 tagged = await KeyImageTagWorker.TagBatchesAsync(
                     _connection, _storage, _imageTags, claims, _logger, ct);
 
+            // A movie whose frames were kept before the stage existed is still
+            // sitting at watched, and the reading stage only moves a movie on
+            // from key images, so it is caught up here rather than stranded.
+            await MarkKeyImagesExtractedAsync(request.MovieId, ct);
             await KeyImageTagStore.AdvanceReadMoviesAsync(_connection, ct);
 
             var progress = (await KeyImageTagStore.ProgressAsync(
