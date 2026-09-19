@@ -1156,7 +1156,7 @@ WHERE so.id = @id;";
     {
         var sql = @"
 SELECT description, description_source, wikipedia_url, writers, composers, producers,
-       album, release_date, label, preview_url, musicbrainz_url"
+       album, release_date, label, preview_url, musicbrainz_url, publishers"
             + (withComposition ? ", composition_fallback" : "") + @"
 FROM frl.frl_music_track_details
 WHERE song_id = @id;";
@@ -1188,7 +1188,8 @@ WHERE song_id = @id;";
             Label = reader.IsDBNull(8) ? null : reader.GetString(8),
             PreviewUrl = reader.IsDBNull(9) ? null : reader.GetString(9),
             MusicbrainzUrl = reader.IsDBNull(10) ? null : reader.GetString(10),
-            CompositionFallback = withComposition && !reader.IsDBNull(11) && reader.GetBoolean(11)
+            Publishers = ParseCredits(reader.IsDBNull(11) ? null : reader.GetString(11)),
+            CompositionFallback = withComposition && !reader.IsDBNull(12) && reader.GetBoolean(12)
         };
     }
 
@@ -1215,10 +1216,10 @@ WHERE song_id = @id;";
         var sql = @"
 INSERT INTO frl.frl_music_track_details
     (song_id, description, description_source, wikipedia_url, writers, composers,
-     producers, album, release_date, label, preview_url, musicbrainz_url" + cols + @", fetched_at)
+     producers, album, release_date, label, preview_url, musicbrainz_url, publishers" + cols + @", fetched_at)
 VALUES
     (@song_id, @description, @description_source, @wikipedia_url, @writers, @composers,
-     @producers, @album, @release_date, @label, @preview_url, @musicbrainz_url" + vals + @", now())
+     @producers, @album, @release_date, @label, @preview_url, @musicbrainz_url, @publishers" + vals + @", now())
 ON CONFLICT (song_id) DO UPDATE SET
     description        = EXCLUDED.description,
     description_source = EXCLUDED.description_source,
@@ -1230,7 +1231,8 @@ ON CONFLICT (song_id) DO UPDATE SET
     release_date       = EXCLUDED.release_date,
     label              = EXCLUDED.label,
     preview_url        = EXCLUDED.preview_url,
-    musicbrainz_url    = EXCLUDED.musicbrainz_url," + upd + @"
+    musicbrainz_url    = EXCLUDED.musicbrainz_url,
+    publishers         = EXCLUDED.publishers," + upd + @"
     fetched_at         = now();";
 
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -1243,6 +1245,7 @@ ON CONFLICT (song_id) DO UPDATE SET
         cmd.Parameters.Add(new NpgsqlParameter("writers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Writers) });
         cmd.Parameters.Add(new NpgsqlParameter("composers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Composers) });
         cmd.Parameters.Add(new NpgsqlParameter("producers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Producers) });
+        cmd.Parameters.Add(new NpgsqlParameter("publishers", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(details.Publishers) });
         cmd.Parameters.AddWithValue("album", (object?)details.Album ?? DBNull.Value);
         cmd.Parameters.AddWithValue("release_date", (object?)details.ReleaseDate ?? DBNull.Value);
         cmd.Parameters.AddWithValue("label", (object?)details.Label ?? DBNull.Value);
