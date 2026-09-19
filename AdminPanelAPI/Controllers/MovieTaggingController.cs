@@ -144,6 +144,12 @@ namespace ShotDeckSearch.Controllers
             public string? ActingUser { get; set; }
         }
 
+        public sealed class ResetKeyImagesRequest
+        {
+            public int MovieId { get; set; }
+            public string? ActingUser { get; set; }
+        }
+
         public sealed class TagRunRequest
         {
             public int MovieId { get; set; }
@@ -1136,6 +1142,70 @@ WHERE id = ANY(@ids);";
                 remaining[movieId] = await CountProposalsAsync(movieId, ct);
 
             return Ok(new { decision, decided = affected, remaining });
+        }
+
+        /// <summary>
+        /// Put a movie's key images back to how they were before anyone judged
+        /// them: every proposal undecided again, the terms read off them gone,
+        /// and the movie back at the watched stage. The frames picked by hand
+        /// go, being the tagger's own additions rather than proposals. What a
+        /// tagger changed is kept, since that is training material and not a
+        /// decision about this movie.
+        /// </summary>
+        [HttpPost("key-images/reset")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        public async Task<IActionResult> ResetKeyImages(
+            [FromBody] ResetKeyImagesRequest request, CancellationToken ct = default)
+        {
+            var actingUser = (request.ActingUser ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(actingUser))
+                return BadRequest(new { error = "actingUser is required." });
+            if (request.MovieId <= 0)
+                return BadRequest(new { error = "movieId is required." });
+
+            await EnsureReadyAsync(ct);
+
+            if (!await CanCaptureAsync(request.MovieId, actingUser, ct))
+                return StatusCode(403, new { error = "That movie is not allocated to you." });
+
+            const string sql = @"
+DELETE FROM frl.frl_movie_key_image_tags
+WHERE key_image_id IN (
+    SELECT id FROM frl.frl_movie_key_images WHERE movie_id = @movieId);
+
+DELETE FROM frl.frl_movie_key_images
+WHERE movie_id = @movieId AND COALESCE(source, 'tagger') <> 'ai';
+
+UPDATE frl.frl_movie_key_images
+SET decision = 'proposed',
+    decided_by = NULL,
+    decided_at = NULL,
+    tag_status = NULL,
+    tag_model_version = NULL,
+    tag_error = NULL,
+    tagged_at = NULL,
+    tags_confirmed_by = NULL,
+    tags_confirmed_at = NULL
+WHERE movie_id = @movieId;
+
+UPDATE frl.frl_movie_tagger_assignments
+SET status = 'movie_watched',
+    key_images_at = NULL,
+    ai_tags_at = NULL,
+    updated_at = now()
+WHERE movie_id = @movieId
+  AND status IN ('key_images_extracted', 'ai_tags_read');";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", request.MovieId);
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            return Ok(new
+            {
+                movieId = request.MovieId,
+                proposals = await CountProposalsAsync(request.MovieId, ct)
+            });
         }
 
         /// <summary>
