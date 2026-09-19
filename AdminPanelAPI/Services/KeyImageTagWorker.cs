@@ -15,6 +15,7 @@ namespace AdminPanelAPI.Services
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly ILogger<KeyImageTagWorker> _logger;
         private readonly bool _enabled;
+        private readonly int _inFlight;
 
         /// <summary>How often the queue of kept frames is looked at.</summary>
         private static readonly TimeSpan PollEvery = TimeSpan.FromSeconds(20);
@@ -30,6 +31,11 @@ namespace AdminPanelAPI.Services
             _scopeFactory = scopeFactory;
             _logger = logger;
             _enabled = configuration.GetValue("MovieFiles:AutoTagKeyImages", true);
+            // Batches sent at once. The image tagger runs on Modal, which gives
+            // a container per request it cannot already answer, so sending one
+            // batch at a time reads a movie on a single GPU however many are
+            // free. Several in flight is what spreads the frames across them.
+            _inFlight = Math.Clamp(configuration.GetValue("MovieFiles:ImageTagBatchesInFlight", 8), 1, 32);
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -86,23 +92,31 @@ namespace AdminPanelAPI.Services
             await connection.OpenAsync(ct);
             await EnsureSchemaAsync(connection, ct);
 
-            var claims = await KeyImageTagStore.ClaimAsync(connection, tagger.BatchLimit, ct);
-            if (claims.Count == 0)
-                return;
+            // Keep going while there are frames waiting rather than taking one
+            // helping every poll: a movie is thousands of frames, and the wait
+            // between passes would be most of the reading time.
+            while (!ct.IsCancellationRequested)
+            {
+                var claims = await KeyImageTagStore.ClaimAsync(
+                    connection, tagger.BatchLimit * _inFlight, ct);
+                if (claims.Count == 0)
+                    return;
 
-            await TagBatchAsync(connection, storage, tagger, claims, _logger, ct);
+                await TagBatchesAsync(connection, storage, tagger, claims, _logger, ct);
 
-            // A movie whose last kept frame has just been read has finished the
-            // AI tags stage, so move it on.
-            await KeyImageTagStore.AdvanceReadMoviesAsync(connection, ct);
+                // A movie whose last kept frame has just been read has finished
+                // the AI tags stage, so move it on.
+                await KeyImageTagStore.AdvanceReadMoviesAsync(connection, ct);
+            }
         }
 
         /// <summary>
-        /// Send one batch of kept frames to be read and store what comes back.
-        /// Shared with the endpoint that reads a movie's frames on demand so
-        /// both store a reading the same way.
+        /// Read a run of frames, a batch per request and the requests together,
+        /// so the tagger answers them on as many containers as it needs rather
+        /// than queueing them all behind one. What comes back is stored one
+        /// batch at a time, since the frames share a single database link.
         /// </summary>
-        public static async Task<int> TagBatchAsync(
+        public static async Task<int> TagBatchesAsync(
             NpgsqlConnection connection,
             IMovieFileStorageService storage,
             IImageTechnicalTagService tagger,
@@ -110,13 +124,32 @@ namespace AdminPanelAPI.Services
             ILogger logger,
             CancellationToken ct)
         {
-            var images = claims
-                .Select(claim => (
-                    ImageId: claim.Id.ToString(),
-                    ImageUrl: storage.CreateDownloadUrl(claim.ImageKey, false)))
+            var batches = claims.Chunk(tagger.BatchLimit).ToList();
+            var sent = batches
+                .Select(batch => tagger.TagAsync(
+                    batch.Select(claim => (
+                        ImageId: claim.Id.ToString(),
+                        ImageUrl: storage.CreateDownloadUrl(claim.ImageKey, false))),
+                    ct))
                 .ToList();
 
-            var result = await tagger.TagAsync(images, ct);
+            var results = await Task.WhenAll(sent);
+
+            var tagged = 0;
+            for (var index = 0; index < batches.Count; index++)
+                tagged += await StoreBatchAsync(
+                    connection, batches[index], results[index], logger, ct);
+
+            return tagged;
+        }
+
+        private static async Task<int> StoreBatchAsync(
+            NpgsqlConnection connection,
+            IReadOnlyList<KeyImageTagClaim> claims,
+            TranscodeResult result,
+            ILogger logger,
+            CancellationToken ct)
+        {
             if (!result.IsSuccess)
             {
                 foreach (var claim in claims)
