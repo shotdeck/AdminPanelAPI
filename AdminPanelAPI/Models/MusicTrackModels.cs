@@ -22,6 +22,7 @@ namespace AdminPanelAPI.Models
         public int MovieId { get; set; }
         public string? Title { get; set; }
         public int? Year { get; set; }
+        public string? PosterUrl { get; set; }
     }
 
     /// <summary>A distinct identified song in a movie (for reconciliation).</summary>
@@ -57,6 +58,13 @@ namespace AdminPanelAPI.Models
         public string? Mbid { get; set; }
     }
 
+    /// <summary>One playback segment file's index and real start offset (seconds).</summary>
+    public class VideoSegment
+    {
+        public int Index { get; set; }
+        public double Start { get; set; }
+    }
+
     /// <summary>A titled external link (e.g. a web citation for a description).</summary>
     public class LinkRef
     {
@@ -69,6 +77,50 @@ namespace AdminPanelAPI.Models
     {
         public string? Description { get; set; }
         public List<LinkRef> Sources { get; set; } = new();
+
+        /// <summary>
+        /// True when the description was manually edited by an admin. A locked
+        /// (edited) description is never overwritten by AI regeneration.
+        /// </summary>
+        public bool Edited { get; set; }
+    }
+
+    /// <summary>Request body for saving a manual (locked) track description.</summary>
+    public class SaveDescriptionRequest
+    {
+        public int MovieId { get; set; }
+        public string? Description { get; set; }
+    }
+
+    /// <summary>Request body for setting a track's confidence status in a movie.</summary>
+    public class SetStatusRequest
+    {
+        public int MovieId { get; set; }
+        public string? Status { get; set; }
+    }
+
+    /// <summary>Request body for editing a track's title and artist.</summary>
+    public class UpdateTrackRequest
+    {
+        public string? Title { get; set; }
+        public string? Artist { get; set; }
+        /// <summary>
+        /// Optional movie context. When supplied and the edit changes the
+        /// title/artist, the track's streaming links + artwork are re-resolved
+        /// for that movie so they match the corrected song.
+        /// </summary>
+        public int? MovieId { get; set; }
+    }
+
+    /// <summary>Outcome of editing a track's title/artist.</summary>
+    public enum SongTrackUpdate
+    {
+        /// <summary>The song row doesn't exist.</summary>
+        NotFound,
+        /// <summary>Found, but the title and artist were already as requested.</summary>
+        Unchanged,
+        /// <summary>Found and the title and/or artist changed.</summary>
+        Changed
     }
 
     /// <summary>
@@ -83,6 +135,55 @@ namespace AdminPanelAPI.Models
         public string? Description { get; set; }
         public string? DescriptionSource { get; set; }
         public List<LinkRef> DescriptionSources { get; set; } = new();
+        /// <summary>True when the shown description was manually edited/locked.</summary>
+        public bool DescriptionEdited { get; set; }
+        /// <summary>
+        /// The factual Wikipedia blurb about the track, kept separately so the UI
+        /// can show it alongside the (film-specific) AI description in
+        /// <see cref="Description"/>, which otherwise overrides it.
+        /// </summary>
+        public string? WikipediaDescription { get; set; }
+        /// <summary>
+        /// Set when film-specific AI description generation was attempted but
+        /// failed (e.g. OpenAI quota exceeded). Transient — not persisted.
+        /// </summary>
+        public string? AiDescriptionError { get; set; }
+        /// <summary>
+        /// The web-search agent's verdict on whether this track actually
+        /// appears in the film: "in_film", "not_in_film", or "unclear".
+        /// Transient — used to flag likely false-positive matches for review.
+        /// </summary>
+        public string? AiInFilm { get; set; }
+        /// <summary>
+        /// True when the track's original release year is later than the film's
+        /// release year — i.e. the song didn't exist yet, so the match is almost
+        /// certainly a false positive. Transient; only a flagging tie-breaker
+        /// when the AI verdict is not a positive "in_film".
+        /// </summary>
+        public bool ReleasedAfterMovie { get; set; }
+        /// <summary>The film's release year, when a movie is in scope.</summary>
+        public int? MovieYear { get; set; }
+        /// <summary>
+        /// The song's original (debut) release year as determined by the
+        /// web-search agent. More reliable than the matched recording's date,
+        /// which is often a later compilation/remaster. Transient.
+        /// </summary>
+        public int? OriginalReleaseYear { get; set; }
+        /// <summary>
+        /// The canonical (original/primary) recording artist of the song per the
+        /// web-search agent. Used to auto-correct a fingerprint mis-attribution
+        /// where the matched recording is a cover/tribute by a different artist
+        /// than the version actually in the film. Transient.
+        /// </summary>
+        public string? AiCanonicalArtist { get; set; }
+        /// <summary>
+        /// The canonical (official catalogue) title of the recording per the
+        /// web-search agent. Used to auto-correct a nickname/alternate title the
+        /// fingerprint produced (e.g. "The Hey Song – Football Theme" ->
+        /// "Rock and Roll (Part 2)") so MusicBrainz/Spotify enrichment — writers,
+        /// credits, release, artwork, links — can resolve it. Transient.
+        /// </summary>
+        public string? AiCanonicalTitle { get; set; }
         public string? WikipediaUrl { get; set; }
         public List<MusicCredit> Writers { get; set; } = new();
         public List<MusicCredit> Composers { get; set; } = new();
@@ -94,6 +195,21 @@ namespace AdminPanelAPI.Models
         public string? PreviewUrl { get; set; }
         public string? SpotifyUrl { get; set; }
         public string? MusicbrainzUrl { get; set; }
+        /// <summary>
+        /// Album cover art. Normally sourced onto the song row; also filled by
+        /// the composition fallback so the panel can show art for a film-specific
+        /// arrangement that isn't itself in streaming catalogues.
+        /// </summary>
+        public string? ArtworkUrl { get; set; }
+        /// <summary>
+        /// True when the credits/release/links shown were resolved from the
+        /// underlying composition (or its original recording) rather than the
+        /// exact recording heard in the film. Set when the film uses a
+        /// film-specific arrangement/cover that providers don't list, so the UI
+        /// can label the metadata as being about the composition, not the film
+        /// cue. Persisted (migration 023).
+        /// </summary>
+        public bool CompositionFallback { get; set; }
     }
 
     /// <summary>
@@ -107,6 +223,7 @@ namespace AdminPanelAPI.Models
         public int? Year { get; set; }
         public int TrackCount { get; set; }
         public int OccurrenceCount { get; set; }
+        public string? PosterUrl { get; set; }
     }
 
     /// <summary>

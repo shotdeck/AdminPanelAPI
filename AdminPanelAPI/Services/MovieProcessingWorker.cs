@@ -88,6 +88,7 @@ namespace AdminPanelAPI.Services
                         job.MovieId,
                         job.Threshold,
                         job.Overwrite,
+                        job.MissingOnly,
                         stoppingToken);
 
                     await repo.MarkCompletedAsync(jobId, stoppingToken);

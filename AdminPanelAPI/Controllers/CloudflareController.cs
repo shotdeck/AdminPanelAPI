@@ -102,7 +102,9 @@ namespace ShotDeckSearch.Controllers
             return Ok(new { status = "ok", hasToken });
         }
 
-        // ── GET /api/admin/cloudflare/overview ──────────────────────────
+       
+
+        // ── GET /api/admin/cloudflare/overview ─────────────────────────
         [HttpGet("overview")]
         [ProducesResponseType(typeof(OverviewResponse), Microsoft.AspNetCore.Http.StatusCodes.Status200OK)]
         public async Task<ActionResult<OverviewResponse>> Overview(

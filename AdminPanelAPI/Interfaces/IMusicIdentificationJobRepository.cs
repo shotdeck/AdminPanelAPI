@@ -9,18 +9,23 @@ public interface IMusicIdentificationJobRepository
     Task<long> CreateJobAsync(int movieId, string? r2Key, string? r2Url, CancellationToken cancellationToken);
     Task<MusicIdentificationJobStatusResponse?> GetJobAsync(long jobId, CancellationToken cancellationToken);
     Task MarkRunningAsync(long jobId, CancellationToken cancellationToken);
-    Task MarkCompletedAsync(long jobId, int matchedCount, int unmatchedCount, CancellationToken cancellationToken);
+    Task MarkCompletedAsync(long jobId, int matchedCount, int unmatchedCount, string? warning, CancellationToken cancellationToken);
     Task MarkFailedAsync(long jobId, string error, CancellationToken cancellationToken);
     Task UpdateProgressAsync(long jobId, string step, int progressPct, CancellationToken cancellationToken);
     Task StoreSegmentsAsync(int movieId, MusicApiResponse response, CancellationToken cancellationToken);
     Task<List<MusicSegmentResult>> GetSegmentsAsync(int movieId, CancellationToken cancellationToken);
-    Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, CancellationToken cancellationToken);
-    Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, CancellationToken cancellationToken);
+    Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, bool includeRejected, CancellationToken cancellationToken);
+    Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, bool includeRejected, CancellationToken cancellationToken);
     Task<List<MovieMusicSummary>> SearchMoviesByTitleAsync(string query, int limit, CancellationToken cancellationToken);
     Task<MusicSearchOptions> GetSearchOptionsAsync(string query, int limit, CancellationToken cancellationToken);
     Task<MovieInfo?> GetMovieInfoAsync(int movieId, CancellationToken cancellationToken);
     Task<List<MovieSongRow>> GetMovieSongRowsAsync(int movieId, CancellationToken cancellationToken);
     Task SetSongConfidenceAsync(int movieId, IReadOnlyDictionary<long, string> confidenceBySongId, CancellationToken cancellationToken);
+    Task<double?> GetSongMaxScoreAsync(int movieId, long songId, CancellationToken cancellationToken);
+    Task<bool> PromoteUnverifiedToConfirmedAsync(int movieId, long songId, CancellationToken cancellationToken);
+    Task<bool> BaselineNullToUnverifiedAsync(int movieId, long songId, CancellationToken cancellationToken);
+    Task<SongTrackUpdate> UpdateSongTrackAsync(long songId, string title, string? artist, CancellationToken cancellationToken);
+    Task DeleteUnlockedAiDescriptionsForSongAsync(long songId, CancellationToken cancellationToken);
     Task<List<MovieSongRow>> GetMovieSongRowsWithLinksAsync(int movieId, CancellationToken cancellationToken);
     Task SetSongLinksAsync(IReadOnlyDictionary<long, (string? spotifyUrl, string? streamingUrl, string? artworkUrl)> linksBySongId, CancellationToken cancellationToken);
     Task<MovieSoundtrack?> GetMovieSoundtrackAsync(int movieId, CancellationToken cancellationToken);
@@ -31,11 +36,14 @@ public interface IMusicIdentificationJobRepository
     Task UpsertTrackDetailsAsync(TrackDetails details, CancellationToken cancellationToken);
     Task<AiDescription?> GetAiDescriptionAsync(long songId, int movieId, CancellationToken cancellationToken);
     Task UpsertAiDescriptionAsync(long songId, int movieId, AiDescription description, string? model, CancellationToken cancellationToken);
+    Task SaveManualDescriptionAsync(long songId, int movieId, string description, CancellationToken cancellationToken);
+    Task DeleteAiDescriptionAsync(long songId, int movieId, CancellationToken cancellationToken);
 }
 
 public class MusicIdentificationJobRepository : IMusicIdentificationJobRepository
 {
     private readonly string _connectionString;
+    private const string MoviePosterBaseUrl = "https://image.tmdb.org/t/p/w154";
 
     public MusicIdentificationJobRepository(IConfiguration configuration)
     {
@@ -122,7 +130,7 @@ WHERE id = @id;";
         if (!await reader.ReadAsync(cancellationToken))
             return null;
 
-        return new MusicIdentificationJobStatusResponse
+        var response = new MusicIdentificationJobStatusResponse
         {
             JobId = reader.GetInt64(0),
             MovieId = reader.GetInt32(1),
@@ -136,8 +144,17 @@ WHERE id = @id;";
             CreatedAt = reader.GetDateTime(9),
             StartedAt = reader.IsDBNull(10) ? null : reader.GetDateTime(10),
             CompletedAt = reader.IsDBNull(11) ? null : reader.GetDateTime(11),
-            Error = reader.IsDBNull(12) ? null : reader.GetString(12)
         };
+
+        var message = reader.IsDBNull(12) ? null : reader.GetString(12);
+        // A completed job that still carries a message is a non-fatal warning
+        // (e.g. AI descriptions skipped); on any other status it's a real error.
+        if (string.Equals(response.Status, "Completed", StringComparison.OrdinalIgnoreCase))
+            response.Warning = message;
+        else
+            response.Error = message;
+
+        return response;
     }
 
     public async Task MarkRunningAsync(long jobId, CancellationToken cancellationToken)
@@ -152,7 +169,7 @@ WHERE id = @id;";
         await ExecuteNonQueryAsync(sql, jobId, null, cancellationToken);
     }
 
-    public async Task MarkCompletedAsync(long jobId, int matchedCount, int unmatchedCount, CancellationToken cancellationToken)
+    public async Task MarkCompletedAsync(long jobId, int matchedCount, int unmatchedCount, string? warning, CancellationToken cancellationToken)
     {
         const string sql = @"
 UPDATE frl.frl_join_movies_music_identification_jobs
@@ -161,7 +178,7 @@ SET status = 'Completed',
     matched_count = @matched_count,
     unmatched_count = @unmatched_count,
     progress_pct = 100,
-    error = null
+    error = @warning
 WHERE id = @id;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -171,6 +188,7 @@ WHERE id = @id;";
         cmd.Parameters.AddWithValue("id", jobId);
         cmd.Parameters.AddWithValue("matched_count", matchedCount);
         cmd.Parameters.AddWithValue("unmatched_count", unmatchedCount);
+        cmd.Parameters.AddWithValue("warning", (object?)warning ?? DBNull.Value);
 
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
@@ -335,9 +353,12 @@ ORDER BY s.start_time;";
         return results;
     }
 
-    public async Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, CancellationToken cancellationToken)
+    public async Task<List<MusicTrackGroup>> SearchTracksAsync(string query, int limit, bool includeRejected, CancellationToken cancellationToken)
     {
-        const string sql = @"
+        var rejectedFilter = includeRejected
+            ? ""
+            : "  AND s.confidence IS DISTINCT FROM 'rejected'\n";
+        var sql = $@"
 SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
        s.movieid, m.title AS movie_title, m.year AS movie_year,
        s.start_time, s.end_time, s.score, so.spotify_url, s.source, s.confidence, so.streaming_url, so.artwork_url
@@ -346,7 +367,7 @@ JOIN frl.frl_music_songs so ON s.song_id = so.id
 LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
 LEFT JOIN frl.frl_movies m ON m.idnum = s.movieid
 WHERE s.matched = true
-  AND (so.title ILIKE @q OR ar.name ILIKE @q)
+{rejectedFilter}  AND (so.title ILIKE @q OR ar.name ILIKE @q)
 ORDER BY so.title, s.movieid, s.start_time
 LIMIT @limit;";
 
@@ -360,9 +381,12 @@ LIMIT @limit;";
         return await ReadTrackGroupsAsync(cmd, cancellationToken);
     }
 
-    public async Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, CancellationToken cancellationToken)
+    public async Task<List<MusicTrackGroup>> GetMovieTracksAsync(int movieId, bool includeRejected, CancellationToken cancellationToken)
     {
-        const string sql = @"
+        var rejectedFilter = includeRejected
+            ? ""
+            : "  AND s.confidence IS DISTINCT FROM 'rejected'\n";
+        var sql = $@"
 SELECT so.id, so.title, ar.name AS artist, so.isrc, so.acrid,
        s.movieid, m.title AS movie_title, m.year AS movie_year,
        s.start_time, s.end_time, s.score, so.spotify_url, s.source, s.confidence, so.streaming_url, so.artwork_url
@@ -372,7 +396,7 @@ LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
 LEFT JOIN frl.frl_movies m ON m.idnum = s.movieid
 WHERE s.matched = true
   AND s.movieid = @movieid
-ORDER BY so.title, s.start_time;";
+{rejectedFilter}ORDER BY so.title, s.start_time;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);
@@ -387,14 +411,15 @@ ORDER BY so.title, s.start_time;";
     {
         // Movies whose title matches and that have at least one identified song.
         const string sql = @"
-SELECT m.idnum, m.title, m.year,
+SELECT m.idnum, m.title, m.year, m.poster,
        COUNT(DISTINCT s.song_id) AS track_count,
        COUNT(*) AS occurrence_count
 FROM frl.frl_movies m
 JOIN frl.frl_join_movies_music_segments s
      ON s.movieid = m.idnum AND s.matched = true
+     AND s.confidence IS DISTINCT FROM 'rejected'
 WHERE m.title ILIKE @q
-GROUP BY m.idnum, m.title, m.year
+GROUP BY m.idnum, m.title, m.year, m.poster
 ORDER BY m.title
 LIMIT @limit;";
 
@@ -414,8 +439,9 @@ LIMIT @limit;";
                 MovieId = reader.GetInt32(0),
                 Title = reader.IsDBNull(1) ? null : reader.GetString(1),
                 Year = reader.IsDBNull(2) ? null : reader.GetInt32(2),
-                TrackCount = Convert.ToInt32(reader.GetInt64(3)),
-                OccurrenceCount = Convert.ToInt32(reader.GetInt64(4))
+                PosterUrl = reader.IsDBNull(3) ? null : MoviePosterBaseUrl + reader.GetString(3),
+                TrackCount = Convert.ToInt32(reader.GetInt64(4)),
+                OccurrenceCount = Convert.ToInt32(reader.GetInt64(5))
             });
         }
 
@@ -473,7 +499,7 @@ LIMIT @limit;";
 
     public async Task<MovieInfo?> GetMovieInfoAsync(int movieId, CancellationToken cancellationToken)
     {
-        const string sql = @"SELECT idnum, title, year FROM frl.frl_movies WHERE idnum = @movieid;";
+        const string sql = @"SELECT idnum, title, year, poster FROM frl.frl_movies WHERE idnum = @movieid;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);
@@ -489,7 +515,8 @@ LIMIT @limit;";
         {
             MovieId = reader.GetInt32(0),
             Title = reader.IsDBNull(1) ? null : reader.GetString(1),
-            Year = reader.IsDBNull(2) ? null : reader.GetInt32(2)
+            Year = reader.IsDBNull(2) ? null : reader.GetInt32(2),
+            PosterUrl = reader.IsDBNull(3) ? null : MoviePosterBaseUrl + reader.GetString(3)
         };
     }
 
@@ -554,6 +581,206 @@ WHERE movieid = @movieid AND song_id = @song_id;";
         {
             await tx.RollbackAsync(cancellationToken);
             throw;
+        }
+    }
+
+    // Best (highest) fingerprint match score across a song's matched segments
+    // in a movie. Used to gate AI-based auto-confirmation on match strength.
+    public async Task<double?> GetSongMaxScoreAsync(
+        int movieId, long songId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT MAX(score)
+FROM frl.frl_join_movies_music_segments
+WHERE movieid = @movieid AND song_id = @song_id AND matched = true;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        cmd.Parameters.AddWithValue("song_id", songId);
+        var result = await cmd.ExecuteScalarAsync(cancellationToken);
+        return result is null || result is DBNull ? null : Convert.ToDouble(result);
+    }
+
+    // Upgrade a track to "confirmed" for a movie, but only if it hasn't been
+    // reconciled/decided yet — i.e. it is currently "unverified" or has no
+    // confidence (null). Never overrides a review/rejected/confirmed decision.
+    // Returns true if a row was upgraded.
+    public async Task<bool> PromoteUnverifiedToConfirmedAsync(
+        int movieId, long songId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+UPDATE frl.frl_join_movies_music_segments
+SET confidence = 'confirmed'
+WHERE movieid = @movieid AND song_id = @song_id
+  AND (confidence = 'unverified' OR confidence IS NULL);";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        cmd.Parameters.AddWithValue("song_id", songId);
+        var rows = await cmd.ExecuteNonQueryAsync(cancellationToken);
+        return rows > 0;
+    }
+
+    // Give any still-unreconciled (null-confidence) track a baseline
+    // "unverified" status so it always renders with a badge instead of nothing.
+    // Never touches rows that already have a decision.
+    public async Task<bool> BaselineNullToUnverifiedAsync(
+        int movieId, long songId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+UPDATE frl.frl_join_movies_music_segments
+SET confidence = 'unverified'
+WHERE movieid = @movieid AND song_id = @song_id AND confidence IS NULL;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        cmd.Parameters.AddWithValue("song_id", songId);
+        var rows = await cmd.ExecuteNonQueryAsync(cancellationToken);
+        return rows > 0;
+    }
+
+    // Edit a track's title and artist. An empty/blank artist clears it; a
+    // non-blank artist is found-or-created in frl_music_artists so admins can
+    // enter a brand-new name or reuse an existing one.
+    //
+    // When the edit actually changes the title/artist, the song's cached
+    // enrichment is invalidated in the same transaction: the streaming links
+    // and artwork are cleared (they were resolved for the old, wrong song) and
+    // the song-level track_details cache row is dropped, so both are re-fetched
+    // for the corrected song. The per-(song,movie) AI description is handled by
+    // the caller (kept when the AI itself just generated it; cleared on a
+    // manual edit). Returns NotFound / Unchanged / Changed.
+    public async Task<SongTrackUpdate> UpdateSongTrackAsync(
+        long songId, string title, string? artist, CancellationToken cancellationToken)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            // Read the current title/artist so we can tell whether this edit is
+            // a real change (and thus whether cached enrichment is now stale).
+            string? currentTitle = null;
+            string? currentArtist = null;
+            var exists = false;
+            const string readSql = @"
+SELECT so.title, ar.name
+FROM frl.frl_music_songs so
+LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
+WHERE so.id = @song_id;";
+            await using (var readCmd = new NpgsqlCommand(readSql, conn, tx))
+            {
+                readCmd.Parameters.AddWithValue("song_id", songId);
+                await using var reader = await readCmd.ExecuteReaderAsync(cancellationToken);
+                if (await reader.ReadAsync(cancellationToken))
+                {
+                    exists = true;
+                    currentTitle = reader.IsDBNull(0) ? null : reader.GetString(0);
+                    currentArtist = reader.IsDBNull(1) ? null : reader.GetString(1);
+                }
+            }
+
+            if (!exists)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return SongTrackUpdate.NotFound;
+            }
+
+            var newTitle = title.Trim();
+            var trimmedArtist = artist?.Trim();
+
+            long? artistId = null;
+            if (!string.IsNullOrEmpty(trimmedArtist))
+            {
+                const string artistSql = @"
+INSERT INTO frl.frl_music_artists (name)
+VALUES (@name)
+ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+RETURNING id;";
+                await using var artistCmd = new NpgsqlCommand(artistSql, conn, tx);
+                artistCmd.Parameters.AddWithValue("name", trimmedArtist);
+                artistId = Convert.ToInt64(await artistCmd.ExecuteScalarAsync(cancellationToken));
+            }
+
+            const string songSql = @"
+UPDATE frl.frl_music_songs
+SET title = @title, artist_id = @artist_id
+WHERE id = @song_id;";
+            await using (var songCmd = new NpgsqlCommand(songSql, conn, tx))
+            {
+                songCmd.Parameters.AddWithValue("title", newTitle);
+                songCmd.Parameters.AddWithValue("artist_id", (object?)artistId ?? DBNull.Value);
+                songCmd.Parameters.AddWithValue("song_id", songId);
+                await songCmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            static bool SameText(string? a, string? b) =>
+                string.Equals((a ?? "").Trim(), (b ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
+            var changed = !SameText(currentTitle, newTitle) || !SameText(currentArtist, trimmedArtist);
+
+            if (changed)
+            {
+                // The stored links/artwork and song-level details belong to the
+                // previous (wrong) song — drop them so they're re-fetched.
+                const string clearLinksSql = @"
+UPDATE frl.frl_music_songs
+SET spotify_url = NULL, streaming_url = NULL, artwork_url = NULL
+WHERE id = @song_id;";
+                await using (var clearCmd = new NpgsqlCommand(clearLinksSql, conn, tx))
+                {
+                    clearCmd.Parameters.AddWithValue("song_id", songId);
+                    await clearCmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                await using (var delDetails = new NpgsqlCommand(
+                    "DELETE FROM frl.frl_music_track_details WHERE song_id = @song_id;", conn, tx))
+                {
+                    delDetails.Parameters.AddWithValue("song_id", songId);
+                    await delDetails.ExecuteNonQueryAsync(cancellationToken);
+                }
+            }
+
+            await tx.CommitAsync(cancellationToken);
+            return changed ? SongTrackUpdate.Changed : SongTrackUpdate.Unchanged;
+        }
+        catch
+        {
+            await tx.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    // Drop cached AI descriptions for a song (all movies) so they regenerate
+    // against the corrected title/artist. Manually-edited/locked descriptions
+    // (edited = true) are preserved. Used after a manual track edit.
+    public async Task DeleteUnlockedAiDescriptionsForSongAsync(
+        long songId, CancellationToken cancellationToken)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        try
+        {
+            const string sql = @"
+DELETE FROM frl.frl_music_track_ai_description
+WHERE song_id = @song_id AND NOT edited;";
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("song_id", songId);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+        {
+            // migration 022 (the `edited` column) not applied yet: there are no
+            // locked rows to preserve, so drop all cached descriptions.
+            await using var cmd = new NpgsqlCommand(
+                "DELETE FROM frl.frl_music_track_ai_description WHERE song_id = @song_id;", conn);
+            cmd.Parameters.AddWithValue("song_id", songId);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
         }
     }
 
@@ -808,7 +1035,9 @@ ON CONFLICT (movieid) DO UPDATE SET
     }
 
     // A track's group-level confidence is the strongest across its occurrences
-    // (confirmed > review > unverified). Null when the movie isn't reconciled.
+    // (confirmed > review > unverified > rejected). Null when the movie isn't
+    // reconciled. Rejected must be reported (not left null) so the UI can badge
+    // it and the status filter can hide/show it.
     private static string? BestConfidence(IEnumerable<MusicTrackOccurrence> occurrences)
     {
         string? best = null;
@@ -816,7 +1045,8 @@ ON CONFLICT (movieid) DO UPDATE SET
         {
             if (o.Confidence == "confirmed") return "confirmed";
             if (o.Confidence == "review") best = "review";
-            else if (o.Confidence == "unverified" && best == null) best = "unverified";
+            else if (o.Confidence == "unverified" && best is null or "rejected") best = "unverified";
+            else if (o.Confidence == "rejected" && best == null) best = "rejected";
         }
         return best;
     }
@@ -908,9 +1138,26 @@ WHERE so.id = @id;";
 
     public async Task<TrackDetails?> GetTrackDetailsAsync(long songId, CancellationToken cancellationToken)
     {
-        const string sql = @"
+        // The `composition_fallback` column is added by migration 023. If the
+        // code is deployed before the migration runs, selecting it throws
+        // undefined_column (42703); fall back to reading without it so cached
+        // details still show (just never marked as composition-level).
+        try
+        {
+            return await ReadTrackDetailsAsync(songId, withComposition: true, cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+        {
+            return await ReadTrackDetailsAsync(songId, withComposition: false, cancellationToken);
+        }
+    }
+
+    private async Task<TrackDetails?> ReadTrackDetailsAsync(long songId, bool withComposition, CancellationToken cancellationToken)
+    {
+        var sql = @"
 SELECT description, description_source, wikipedia_url, writers, composers, producers,
-       album, release_date, label, preview_url, musicbrainz_url, publishers
+       album, release_date, label, preview_url, musicbrainz_url, publishers"
+            + (withComposition ? ", composition_fallback" : "") + @"
 FROM frl.frl_music_track_details
 WHERE song_id = @id;";
 
@@ -941,19 +1188,38 @@ WHERE song_id = @id;";
             Label = reader.IsDBNull(8) ? null : reader.GetString(8),
             PreviewUrl = reader.IsDBNull(9) ? null : reader.GetString(9),
             MusicbrainzUrl = reader.IsDBNull(10) ? null : reader.GetString(10),
-            Publishers = ParseCredits(reader.IsDBNull(11) ? null : reader.GetString(11))
+            Publishers = ParseCredits(reader.IsDBNull(11) ? null : reader.GetString(11)),
+            CompositionFallback = withComposition && !reader.IsDBNull(12) && reader.GetBoolean(12)
         };
     }
 
     public async Task UpsertTrackDetailsAsync(TrackDetails details, CancellationToken cancellationToken)
     {
-        const string sql = @"
+        // The `composition_fallback` column is added by migration 023. Persist it
+        // when present; if the migration hasn't run yet, retry without it so the
+        // rest of the details still cache (undefined_column = 42703).
+        try
+        {
+            await WriteTrackDetailsAsync(details, withComposition: true, cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+        {
+            await WriteTrackDetailsAsync(details, withComposition: false, cancellationToken);
+        }
+    }
+
+    private async Task WriteTrackDetailsAsync(TrackDetails details, bool withComposition, CancellationToken cancellationToken)
+    {
+        var cols = withComposition ? ", composition_fallback" : "";
+        var vals = withComposition ? ", @composition_fallback" : "";
+        var upd = withComposition ? "\n    composition_fallback = EXCLUDED.composition_fallback," : "";
+        var sql = @"
 INSERT INTO frl.frl_music_track_details
     (song_id, description, description_source, wikipedia_url, writers, composers,
-     producers, album, release_date, label, preview_url, musicbrainz_url, publishers, fetched_at)
+     producers, album, release_date, label, preview_url, musicbrainz_url, publishers" + cols + @", fetched_at)
 VALUES
     (@song_id, @description, @description_source, @wikipedia_url, @writers, @composers,
-     @producers, @album, @release_date, @label, @preview_url, @musicbrainz_url, @publishers, now())
+     @producers, @album, @release_date, @label, @preview_url, @musicbrainz_url, @publishers" + vals + @", now())
 ON CONFLICT (song_id) DO UPDATE SET
     description        = EXCLUDED.description,
     description_source = EXCLUDED.description_source,
@@ -966,7 +1232,7 @@ ON CONFLICT (song_id) DO UPDATE SET
     label              = EXCLUDED.label,
     preview_url        = EXCLUDED.preview_url,
     musicbrainz_url    = EXCLUDED.musicbrainz_url,
-    publishers         = EXCLUDED.publishers,
+    publishers         = EXCLUDED.publishers," + upd + @"
     fetched_at         = now();";
 
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -985,13 +1251,36 @@ ON CONFLICT (song_id) DO UPDATE SET
         cmd.Parameters.AddWithValue("label", (object?)details.Label ?? DBNull.Value);
         cmd.Parameters.AddWithValue("preview_url", (object?)details.PreviewUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("musicbrainz_url", (object?)details.MusicbrainzUrl ?? DBNull.Value);
+        if (withComposition)
+            cmd.Parameters.AddWithValue("composition_fallback", details.CompositionFallback);
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task<AiDescription?> GetAiDescriptionAsync(long songId, int movieId, CancellationToken cancellationToken)
     {
-        const string sql = @"
-SELECT description, sources
+        // The `edited` column is added by migration 022. If the code is deployed
+        // before the migration runs, selecting it throws undefined_column
+        // (42703). Fall back to reading without it so cached AI descriptions
+        // still show (just never treated as locked) instead of vanishing.
+        try
+        {
+            return await ReadAiDescriptionAsync(songId, movieId, withEdited: true, cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+        {
+            // migration 022 not applied yet — read without `edited` so cached
+            // AI descriptions still show instead of vanishing.
+            return await ReadAiDescriptionAsync(songId, movieId, withEdited: false, cancellationToken);
+        }
+    }
+
+    private async Task<AiDescription?> ReadAiDescriptionAsync(long songId, int movieId, bool withEdited, CancellationToken cancellationToken)
+    {
+        var sql = withEdited
+            ? @"SELECT description, sources, edited
+FROM frl.frl_music_track_ai_description
+WHERE song_id = @song_id AND movieid = @movieid;"
+            : @"SELECT description, sources
 FROM frl.frl_music_track_ai_description
 WHERE song_id = @song_id AND movieid = @movieid;";
 
@@ -1010,7 +1299,8 @@ WHERE song_id = @song_id AND movieid = @movieid;";
             Description = reader.IsDBNull(0) ? null : reader.GetString(0),
             Sources = string.IsNullOrWhiteSpace(sourcesJson)
                 ? new List<LinkRef>()
-                : JsonSerializer.Deserialize<List<LinkRef>>(sourcesJson) ?? new List<LinkRef>()
+                : JsonSerializer.Deserialize<List<LinkRef>>(sourcesJson) ?? new List<LinkRef>(),
+            Edited = withEdited && !reader.IsDBNull(2) && reader.GetBoolean(2)
         };
     }
 
@@ -1023,7 +1313,8 @@ ON CONFLICT (song_id, movieid) DO UPDATE SET
     description = EXCLUDED.description,
     sources     = EXCLUDED.sources,
     model       = EXCLUDED.model,
-    fetched_at  = now();";
+    fetched_at  = now()
+WHERE NOT frl.frl_music_track_ai_description.edited;";
 
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);
@@ -1033,6 +1324,46 @@ ON CONFLICT (song_id, movieid) DO UPDATE SET
         cmd.Parameters.AddWithValue("description", (object?)description.Description ?? DBNull.Value);
         cmd.Parameters.Add(new NpgsqlParameter("sources", NpgsqlDbType.Jsonb) { Value = JsonSerializer.Serialize(description.Sources) });
         cmd.Parameters.AddWithValue("model", (object?)model ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task SaveManualDescriptionAsync(long songId, int movieId, string description, CancellationToken cancellationToken)
+    {
+        // Store the human text and lock the row so AI regeneration/backfill
+        // never overwrites it. Any existing web citations (sources) are kept.
+        const string sql = @"
+INSERT INTO frl.frl_music_track_ai_description
+    (song_id, movieid, description, sources, model, edited, edited_at, fetched_at)
+VALUES (@song_id, @movieid, @description, '[]'::jsonb, NULL, true, now(), now())
+ON CONFLICT (song_id, movieid) DO UPDATE SET
+    description = EXCLUDED.description,
+    model       = NULL,
+    edited      = true,
+    edited_at   = now(),
+    fetched_at  = now();";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("song_id", songId);
+        cmd.Parameters.AddWithValue("movieid", movieId);
+        cmd.Parameters.AddWithValue("description", description);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task DeleteAiDescriptionAsync(long songId, int movieId, CancellationToken cancellationToken)
+    {
+        // Drop the cached (or manually-edited) row so the next fetch regenerates
+        // a fresh AI description.
+        const string sql = @"
+DELETE FROM frl.frl_music_track_ai_description
+WHERE song_id = @song_id AND movieid = @movieid;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("song_id", songId);
+        cmd.Parameters.AddWithValue("movieid", movieId);
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 }

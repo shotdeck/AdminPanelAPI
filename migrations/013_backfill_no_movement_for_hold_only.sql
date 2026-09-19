@@ -7,10 +7,10 @@
 -- "no_movement" itself (so re-running is idempotent). Images with 2+ movement
 -- categories (even if one is hold) are left unchanged.
 
-INSERT INTO frl.frl_join_image_camera_movements (imageid, movement, confidence, status)
+INSERT INTO frl.frl_join_images_camera_movements (imageid, camera_movements, confidence, status)
 SELECT imageid, 'no_movement', 0, 'not_checked'
-FROM frl.frl_join_image_camera_movements
+FROM frl.frl_join_images_camera_movements
 GROUP BY imageid
-HAVING bool_or(movement = 'hold')
-   AND count(*) FILTER (WHERE movement NOT IN ('hold', 'no_movement')) = 0
-ON CONFLICT (imageid, movement) DO NOTHING;
+HAVING bool_or(camera_movements = 'hold')
+   AND count(*) FILTER (WHERE camera_movements NOT IN ('hold', 'no_movement')) = 0
+ON CONFLICT (imageid, camera_movements) DO NOTHING;
