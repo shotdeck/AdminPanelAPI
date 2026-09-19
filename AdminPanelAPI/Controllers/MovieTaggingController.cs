@@ -1358,6 +1358,8 @@ WHERE movie_id = @movieId
         {
             await EnsureReadyAsync(ct);
 
+            await KeyImageTagStore.RequeueStaleAsync(
+                _connection, movieId, StaleReadAfter, ct);
             var states = await KeyImageTagStore.ReadMovieAsync(_connection, movieId, ct);
             var images = states.Select(image => new
             {
@@ -1493,9 +1495,11 @@ WHERE movie_id = @movieId
 
         /// <summary>
         /// A frame claimed this long ago and still unread belongs to a pass that
-        /// stopped, so it is put back rather than left as being read.
+        /// stopped, so it is put back rather than left as being read. A run
+        /// holds its claims for the life of one request, which the host cuts off
+        /// well inside this, so nothing live is taken off a pass that is working.
         /// </summary>
-        private static readonly TimeSpan StaleReadAfter = TimeSpan.FromMinutes(15);
+        private static readonly TimeSpan StaleReadAfter = TimeSpan.FromMinutes(5);
 
         /// <summary>
         /// Move a watched movie on to the key images stage, now that it has key
