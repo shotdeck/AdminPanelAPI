@@ -69,12 +69,14 @@ namespace AdminPanelAPI.Services
             int movieId,
             double threshold,
             bool overwrite,
+            bool missingOnly,
             CancellationToken cancellationToken)
         {
             _logger.LogInformation(
-                "Starting movie processing. JobId={JobId}, MovieId={MovieId}",
+                "Starting movie processing. JobId={JobId}, MovieId={MovieId}, MissingOnly={MissingOnly}",
                 jobId,
-                movieId);
+                movieId,
+                missingOnly);
 
             await _repo.UpdateProgressAsync(jobId, "Getting movie metadata", null, null, cancellationToken);
             var videoInfo = await GetVideoInfoAsync(movieId, cancellationToken);
@@ -88,20 +90,34 @@ namespace AdminPanelAPI.Services
                 await DeleteAllFilesFromR2PrefixAsync(movieId, cancellationToken);
             }
 
-            await _repo.UpdateProgressAsync(jobId, "Generating 9-second clips", null, null, cancellationToken);
-            await GenerateClipsAsync(movieId, cancellationToken);
+            var clipFiles = new List<string>();
 
-            await _repo.UpdateProgressAsync(jobId, "Cleaning .txt files from R2", null, null, cancellationToken);
-            await DeleteTxtFilesFromR2Async(movieId, cancellationToken);
+            if (missingOnly)
+            {
+                await _repo.UpdateProgressAsync(jobId, "Listing R2 clip files", null, null, cancellationToken);
+                clipFiles = await ListClipFilesFromR2Async(movieId, cancellationToken);
+            }
+
+            var needsClipGeneration = !missingOnly
+                || await HasImagesWithoutClipAsync(movieId, clipFiles, cancellationToken);
+
+            if (needsClipGeneration)
+            {
+                await _repo.UpdateProgressAsync(jobId, "Generating 9-second clips", null, null, cancellationToken);
+                await GenerateClipsAsync(movieId, cancellationToken);
+
+                await _repo.UpdateProgressAsync(jobId, "Cleaning .txt files from R2", null, null, cancellationToken);
+                await DeleteTxtFilesFromR2Async(movieId, cancellationToken);
+
+                await _repo.UpdateProgressAsync(jobId, "Listing R2 clip files", null, null, cancellationToken);
+                clipFiles = await ListClipFilesFromR2Async(movieId, cancellationToken);
+            }
 
             if (overwrite)
             {
                 await _repo.UpdateProgressAsync(jobId, "Deleting existing scene boundary rows", null, null, cancellationToken);
                 await DeleteSceneBoundariesForMovieAsync(movieId, cancellationToken);
             }
-
-            await _repo.UpdateProgressAsync(jobId, "Listing R2 clip files", null, null, cancellationToken);
-            var clipFiles = await ListClipFilesFromR2Async(movieId, cancellationToken);
 
             if (clipFiles.Count == 0)
             {
@@ -113,6 +129,35 @@ namespace AdminPanelAPI.Services
                     cancellationToken);
 
                 throw new Exception($"No clips found in R2 for movie {movieId}.");
+            }
+
+            if (missingOnly)
+            {
+                await _repo.UpdateProgressAsync(jobId, "Finding clips without a scene boundary", null, null, cancellationToken);
+
+                var existing = await _repo.GetBoundaryFilenamesAsync(movieId, cancellationToken);
+                var existingSet = new HashSet<string>(existing, StringComparer.OrdinalIgnoreCase);
+
+                clipFiles = clipFiles
+                    .Where(f => !existingSet.Contains(f))
+                    .ToList();
+
+                if (clipFiles.Count == 0)
+                {
+                    await _repo.UpdateProgressAsync(
+                        jobId,
+                        "No missing clips",
+                        0,
+                        0,
+                        cancellationToken);
+
+                    _logger.LogInformation(
+                        "No missing clips. JobId={JobId}, MovieId={MovieId}",
+                        jobId,
+                        movieId);
+
+                    return;
+                }
             }
 
             var total = clipFiles.Count;
@@ -187,6 +232,45 @@ namespace AdminPanelAPI.Services
                 "Finished movie processing. JobId={JobId}, MovieId={MovieId}",
                 jobId,
                 movieId);
+        }
+
+        public async Task<MovieMissingClipReport> GetMissingClipReportAsync(
+            int movieId,
+            CancellationToken cancellationToken)
+        {
+            var clipFiles = await ListClipFilesFromR2Async(movieId, cancellationToken);
+            var boundaries = await _repo.GetBoundaryFilenamesAsync(movieId, cancellationToken);
+            var images = await _repo.GetLiveImageFilenamesAsync(movieId, cancellationToken);
+
+            var clipSet = new HashSet<string>(clipFiles, StringComparer.OrdinalIgnoreCase);
+            var boundarySet = new HashSet<string>(boundaries, StringComparer.OrdinalIgnoreCase);
+
+            return new MovieMissingClipReport
+            {
+                MovieId = movieId,
+                LiveImages = images.Count,
+                ClipsInR2 = clipFiles.Count,
+                SceneBoundaries = boundarySet.Count,
+                ClipsWithoutBoundary = clipFiles
+                    .Where(f => !boundarySet.Contains(f))
+                    .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+                    .ToList(),
+                ImagesWithoutClip = images
+                    .Where(f => !clipSet.Contains(f))
+                    .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+                    .ToList()
+            };
+        }
+
+        private async Task<bool> HasImagesWithoutClipAsync(
+            int movieId,
+            List<string> clipFiles,
+            CancellationToken cancellationToken)
+        {
+            var images = await _repo.GetLiveImageFilenamesAsync(movieId, cancellationToken);
+            var clipSet = new HashSet<string>(clipFiles, StringComparer.OrdinalIgnoreCase);
+
+            return images.Any(f => !clipSet.Contains(f));
         }
 
         private async Task<VideoInfoResponse> GetVideoInfoAsync(

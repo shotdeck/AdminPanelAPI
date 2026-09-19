@@ -18,5 +18,13 @@ namespace AdminPanelAPI.Models
         public DateTime? StartedAt { get; set; }
         public DateTime? CompletedAt { get; set; }
         public string? Error { get; set; }
+
+        /// <summary>
+        /// A non-fatal problem during a job that still completed — e.g. music
+        /// was identified but AI descriptions couldn't be generated because the
+        /// OpenAI quota was exceeded. Shown to the user without marking the job
+        /// as failed.
+        /// </summary>
+        public string? Warning { get; set; }
     }
 }

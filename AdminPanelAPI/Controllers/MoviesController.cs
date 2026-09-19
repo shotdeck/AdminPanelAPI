@@ -103,7 +103,7 @@ LEFT JOIN (
     FROM (
         SELECT i.movieid, cm.imageid,
                bool_and(cm.status IN ('ok', 'bad', 'flagged')) AS all_checked
-        FROM frl.frl_join_image_camera_movements cm
+        FROM frl.frl_join_images_camera_movements cm
         INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
         WHERE i.status = 'live'
         GROUP BY i.movieid, cm.imageid

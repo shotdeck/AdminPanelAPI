@@ -1,9 +1,11 @@
 using AdminPanelAPI.Models;
+using AdminPanelAPI.Services;
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
+using System.Text.Json;
 
 namespace AdminPanelAPI.Controllers
 {
@@ -13,6 +15,11 @@ namespace AdminPanelAPI.Controllers
     {
         private readonly IMusicIdentificationJobRepository _jobRepository;
         private readonly IMusicJobQueue _jobQueue;
+        private readonly ISoundtrackReconciliationService _reconciliationService;
+        private readonly IStreamingLinkService _streamingLinkService;
+        private readonly ITrackDetailsService _trackDetailsService;
+        private readonly IAudioIdentifyService _audioIdentifyService;
+        private readonly IServiceScopeFactory _scopeFactory;
         private readonly IConfiguration _configuration;
         private readonly ILogger<MusicIdentificationController> _logger;
         private readonly string _connectionString;
@@ -27,11 +34,21 @@ namespace AdminPanelAPI.Controllers
         public MusicIdentificationController(
             IMusicIdentificationJobRepository jobRepository,
             IMusicJobQueue jobQueue,
+            ISoundtrackReconciliationService reconciliationService,
+            IStreamingLinkService streamingLinkService,
+            ITrackDetailsService trackDetailsService,
+            IAudioIdentifyService audioIdentifyService,
+            IServiceScopeFactory scopeFactory,
             IConfiguration configuration,
             ILogger<MusicIdentificationController> logger)
         {
             _jobRepository = jobRepository;
             _jobQueue = jobQueue;
+            _reconciliationService = reconciliationService;
+            _streamingLinkService = streamingLinkService;
+            _trackDetailsService = trackDetailsService;
+            _audioIdentifyService = audioIdentifyService;
+            _scopeFactory = scopeFactory;
             _configuration = configuration;
             _logger = logger;
             _connectionString = configuration.GetConnectionString("Default")
@@ -44,16 +61,29 @@ namespace AdminPanelAPI.Controllers
         }
 
         /// <summary>
-        /// Queue a single movie for music identification.
+        /// Queue a single movie for music identification. If 'r2Key' is omitted it
+        /// is resolved from the movies bucket by convention (movies/{movieId}/*.mp4).
         /// </summary>
         [HttpPost("identify/{movieId:int}")]
         public async Task<IActionResult> IdentifyMovie(
             int movieId,
-            [FromQuery] string r2Key,
+            [FromQuery] string? r2Key = null,
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(r2Key))
-                return BadRequest(new { error = "Query parameter 'r2Key' is required." });
+            {
+                // Every movie is dialogue-processed before music, so its r2_key is
+                // already recorded on the dialogue job — reuse it (no R2 call). Fall
+                // back to listing the movies bucket by convention if there's none.
+                r2Key = await GetR2KeyFromDialogueJobAsync(movieId, cancellationToken)
+                    ?? await ResolveR2KeyForMovieAsync(movieId, cancellationToken);
+                if (string.IsNullOrWhiteSpace(r2Key))
+                    return NotFound(new
+                    {
+                        error = $"No r2_key found for movie {movieId} (no dialogue job and "
+                            + $"no .mp4 under '{movieId}/'); pass 'r2Key' explicitly."
+                    });
+            }
 
             var jobId = await _jobRepository.CreateJobAsync(
                 movieId, r2Key, null, cancellationToken);
@@ -113,13 +143,14 @@ namespace AdminPanelAPI.Controllers
         public async Task<IActionResult> Search(
             [FromQuery] string q,
             [FromQuery] int limit = 500,
+            [FromQuery] bool includeRejected = false,
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(q))
                 return BadRequest(new { error = "Query parameter 'q' is required." });
 
             limit = Math.Clamp(limit, 1, 2000);
-            var tracks = await _jobRepository.SearchTracksAsync(q.Trim(), limit, cancellationToken);
+            var tracks = await _jobRepository.SearchTracksAsync(q.Trim(), limit, includeRejected, cancellationToken);
 
             return Ok(new
             {
@@ -183,17 +214,429 @@ namespace AdminPanelAPI.Controllers
         [HttpGet("movie/{movieId:int}/tracks")]
         public async Task<IActionResult> GetMovieTracks(
             int movieId,
-            CancellationToken cancellationToken)
+            [FromQuery] bool includeRejected = false,
+            CancellationToken cancellationToken = default)
         {
-            var tracks = await _jobRepository.GetMovieTracksAsync(movieId, cancellationToken);
+            var tracks = await _jobRepository.GetMovieTracksAsync(movieId, includeRejected, cancellationToken);
+            var soundtrack = await _jobRepository.GetMovieSoundtrackAsync(movieId, cancellationToken);
 
             return Ok(new
             {
                 movieId,
                 trackCount = tracks.Count,
                 occurrenceCount = tracks.Sum(t => t.OccurrenceCount),
+                soundtrack,
                 tracks
             });
+        }
+
+        /// <summary>
+        /// Basic movie metadata (title, year, poster) by id. Available as soon
+        /// as the movie exists, so the upload UI can show the poster before
+        /// music identification finishes.
+        /// </summary>
+        [HttpGet("movie/{movieId:int}/info")]
+        public async Task<IActionResult> GetMovieInfo(
+            int movieId,
+            CancellationToken cancellationToken = default)
+        {
+            var info = await _jobRepository.GetMovieInfoAsync(movieId, cancellationToken);
+            if (info == null)
+                return NotFound(new { message = $"Movie {movieId} not found." });
+
+            return Ok(info);
+        }
+
+        /// <summary>
+        /// Rich metadata for a single identified track (description, writers,
+        /// composers, producers, album/release info). Fetched from public
+        /// sources on first request and cached; pass refresh=true to re-fetch.
+        /// </summary>
+        [HttpGet("song/{songId:long}/details")]
+        public async Task<IActionResult> GetTrackDetails(
+            long songId,
+            [FromQuery] int? movieId,
+            [FromQuery] bool refresh,
+            CancellationToken cancellationToken)
+        {
+            var details = await _trackDetailsService.GetOrFetchAsync(songId, movieId, refresh, cancellationToken);
+            if (details == null)
+                return NotFound();
+
+            // If the track looks like a false-positive match (agent says it's not
+            // in the film, or it was released after the film), flag it for review.
+            // Otherwise, if the AI confirms it's in the film and the fingerprint
+            // match is solid, promote it from unverified to confirmed — the
+            // soundtrack cross-check often can't corroborate real needle-drops
+            // and score cues, so the AI verdict is a second way to confirm.
+            if (movieId.HasValue)
+            {
+                if (TrackDetailsService.ShouldFlagForReview(details))
+                {
+                    await _jobRepository.SetSongConfidenceAsync(
+                        movieId.Value,
+                        new Dictionary<long, string> { [songId] = "review" },
+                        cancellationToken);
+                }
+                else if (TrackDetailsService.AiConfirmsInFilm(details) &&
+                         await _jobRepository.GetSongMaxScoreAsync(
+                             movieId.Value, songId, cancellationToken)
+                         >= TrackDetailsService.ConfirmScoreThreshold)
+                {
+                    await _jobRepository.PromoteUnverifiedToConfirmedAsync(
+                        movieId.Value, songId, cancellationToken);
+                }
+                else
+                {
+                    // Not a false positive and not strong enough to auto-confirm:
+                    // ensure an unreconciled track still gets a visible status.
+                    await _jobRepository.BaselineNullToUnverifiedAsync(
+                        movieId.Value, songId, cancellationToken);
+                }
+            }
+
+            return Ok(details);
+        }
+
+        /// <summary>
+        /// Save a human-authored description for a track in a specific movie and
+        /// lock it, so AI regeneration/backfill never overwrites it.
+        /// </summary>
+        [HttpPut("song/{songId:long}/description")]
+        public async Task<IActionResult> SaveTrackDescription(
+            long songId,
+            [FromBody] SaveDescriptionRequest request,
+            CancellationToken cancellationToken)
+        {
+            if (request == null || request.MovieId <= 0)
+                return BadRequest("movieId is required.");
+            if (string.IsNullOrWhiteSpace(request.Description))
+                return BadRequest("description is required.");
+
+            var details = await _trackDetailsService.SaveDescriptionAsync(
+                songId, request.MovieId, request.Description, cancellationToken);
+            if (details == null)
+                return NotFound();
+            return Ok(details);
+        }
+
+        /// <summary>
+        /// Revert a track's description in a movie back to AI-generated (drops
+        /// the manual/cached row and regenerates).
+        /// </summary>
+        [HttpDelete("song/{songId:long}/description")]
+        public async Task<IActionResult> RevertTrackDescription(
+            long songId,
+            [FromQuery] int movieId,
+            CancellationToken cancellationToken)
+        {
+            if (movieId <= 0)
+                return BadRequest("movieId is required.");
+
+            var details = await _trackDetailsService.RevertDescriptionAsync(
+                songId, movieId, cancellationToken);
+            if (details == null)
+                return NotFound();
+            return Ok(details);
+        }
+
+        /// <summary>
+        /// Audio-listening identification for a weak/false fingerprint match:
+        /// extracts the clip's real audio and asks an audio LLM what the music
+        /// is. Advisory only — returns a suggestion; the caller confirms before
+        /// applying it via the track-edit endpoint. Writes nothing.
+        /// </summary>
+        [HttpPost("song/{songId:long}/audio-identify")]
+        public async Task<IActionResult> AudioIdentify(
+            long songId,
+            [FromQuery] int movieId,
+            [FromQuery] bool refresh,
+            CancellationToken cancellationToken)
+        {
+            if (movieId <= 0)
+                return BadRequest("movieId is required.");
+
+            // Return the last successful result instantly unless a fresh listen
+            // is explicitly requested.
+            if (!refresh)
+            {
+                var cached = await GetCachedAudioIdentifyAsync(movieId, songId, cancellationToken);
+                if (cached != null)
+                    return Ok(cached);
+            }
+
+            var r2Key = await GetR2KeyFromDialogueJobAsync(movieId, cancellationToken)
+                ?? await GetR2KeyForMovieAsync(movieId, cancellationToken)
+                ?? await ResolveR2KeyForMovieAsync(movieId, cancellationToken);
+            if (string.IsNullOrWhiteSpace(r2Key))
+                return NotFound(new { error = $"No source video found for movie {movieId}." });
+
+            var occ = await GetSongOccurrenceAsync(movieId, songId, cancellationToken);
+            if (occ == null)
+                return NotFound(new { error = $"No occurrence found for song {songId} in movie {movieId}." });
+
+            // Ground the audio ID with the film's known soundtrack cues (a hint,
+            // not a whitelist) so the model can name the right real cue; best-effort.
+            IReadOnlyList<SoundtrackCue> soundtrackCues = Array.Empty<SoundtrackCue>();
+            try
+            {
+                soundtrackCues = await _streamingLinkService.GetSoundtrackCuesAsync(movieId, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Fetching soundtrack cues for movie {MovieId} failed.", movieId);
+            }
+
+            var suggestion = await _audioIdentifyService.IdentifyAsync(
+                r2Key,
+                occ.Value.Start,
+                occ.Value.End,
+                occ.Value.Title ?? "",
+                occ.Value.Artist,
+                occ.Value.MovieTitle ?? "",
+                occ.Value.MovieYear,
+                soundtrackCues,
+                cancellationToken);
+
+            // Persist a usable result so a second press returns instantly. Don't
+            // cache errors or empty no-ops (a re-listen may do better).
+            if (IsCacheableSuggestion(suggestion))
+                await SaveCachedAudioIdentifyAsync(movieId, songId, suggestion, cancellationToken);
+
+            return Ok(suggestion);
+        }
+
+        private static bool IsCacheableSuggestion(AudioIdentifySuggestion s)
+        {
+            if (s.Error != null)
+                return false;
+            return !string.IsNullOrWhiteSpace(s.Title)
+                || !string.IsNullOrWhiteSpace(s.Artist)
+                || s.IsScoreCue
+                || s.Candidates.Count > 0;
+        }
+
+        private async Task<AudioIdentifySuggestion?> GetCachedAudioIdentifyAsync(
+            int movieId, long songId, CancellationToken cancellationToken)
+        {
+            const string sql = @"
+SELECT suggestion FROM frl.frl_music_audio_identify_cache
+WHERE movieid = @movieid AND song_id = @song_id;";
+            try
+            {
+                await using var conn = new NpgsqlConnection(_connectionString);
+                await conn.OpenAsync(cancellationToken);
+                await using var cmd = new NpgsqlCommand(sql, conn);
+                cmd.Parameters.AddWithValue("movieid", movieId);
+                cmd.Parameters.AddWithValue("song_id", songId);
+                var json = await cmd.ExecuteScalarAsync(cancellationToken) as string;
+                if (string.IsNullOrWhiteSpace(json))
+                    return null;
+                return JsonSerializer.Deserialize<AudioIdentifySuggestion>(json);
+            }
+            catch (Exception ex)
+            {
+                // Cache is a best-effort optimisation (e.g. table may not exist
+                // until migration 025 runs); never fail the request over it.
+                _logger.LogDebug(ex, "Reading audio-identify cache failed.");
+                return null;
+            }
+        }
+
+        private async Task SaveCachedAudioIdentifyAsync(
+            int movieId, long songId, AudioIdentifySuggestion suggestion,
+            CancellationToken cancellationToken)
+        {
+            const string sql = @"
+INSERT INTO frl.frl_music_audio_identify_cache (movieid, song_id, suggestion, created_at)
+VALUES (@movieid, @song_id, @suggestion::jsonb, now())
+ON CONFLICT (movieid, song_id)
+DO UPDATE SET suggestion = EXCLUDED.suggestion, created_at = now();";
+            try
+            {
+                var json = JsonSerializer.Serialize(suggestion);
+                await using var conn = new NpgsqlConnection(_connectionString);
+                await conn.OpenAsync(cancellationToken);
+                await using var cmd = new NpgsqlCommand(sql, conn);
+                cmd.Parameters.AddWithValue("movieid", movieId);
+                cmd.Parameters.AddWithValue("song_id", songId);
+                cmd.Parameters.AddWithValue("suggestion", json);
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Writing audio-identify cache failed.");
+            }
+        }
+
+        private async Task<(double Start, double End, string? Title, string? Artist, string? MovieTitle, int? MovieYear)?>
+            GetSongOccurrenceAsync(int movieId, long songId, CancellationToken cancellationToken)
+        {
+            const string sql = @"
+SELECT s.start_time, s.end_time, so.title, ar.name AS artist,
+       m.title AS movie_title, m.year AS movie_year
+FROM frl.frl_join_movies_music_segments s
+JOIN frl.frl_music_songs so ON s.song_id = so.id
+LEFT JOIN frl.frl_music_artists ar ON so.artist_id = ar.id
+LEFT JOIN frl.frl_movies m ON m.idnum = s.movieid
+WHERE s.movieid = @movieid AND s.song_id = @song_id
+ORDER BY (s.end_time - s.start_time) DESC
+LIMIT 1;";
+
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken);
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("movieid", movieId);
+            cmd.Parameters.AddWithValue("song_id", songId);
+
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+                return null;
+
+            return (
+                reader.GetDouble(0),
+                reader.GetDouble(1),
+                reader.IsDBNull(2) ? null : reader.GetString(2),
+                reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.IsDBNull(4) ? null : reader.GetString(4),
+                reader.IsDBNull(5) ? (int?)null : reader.GetInt32(5)
+            );
+        }
+
+        /// <summary>
+        /// Reconcile a movie's identified tracks against its known soundtrack
+        /// (Wikipedia): tags each occurrence confirmed / review / unverified and
+        /// returns the report. Non-destructive — nothing is deleted.
+        /// </summary>
+        [HttpPost("reconcile/{movieId:int}")]
+        public async Task<IActionResult> Reconcile(
+            int movieId,
+            CancellationToken cancellationToken)
+        {
+            var result = await _reconciliationService.ReconcileAsync(movieId, cancellationToken);
+            return Ok(result);
+        }
+
+        /// <summary>
+        /// Set the confidence status of a track's occurrences in a movie
+        /// (confirmed / review / unverified / rejected). Rejected tracks are
+        /// excluded from search and movie-track results.
+        /// </summary>
+        [HttpPut("song/{songId:long}/status")]
+        public async Task<IActionResult> SetTrackStatus(
+            long songId,
+            [FromBody] SetStatusRequest request,
+            CancellationToken cancellationToken)
+        {
+            if (request == null || request.MovieId <= 0)
+                return BadRequest(new { error = "movieId is required." });
+
+            var status = (request.Status ?? string.Empty).Trim().ToLowerInvariant();
+            var allowed = new[] { "confirmed", "review", "unverified", "rejected" };
+            if (!allowed.Contains(status))
+                return BadRequest(new
+                {
+                    error = "status must be one of: confirmed, review, unverified, rejected."
+                });
+
+            await _jobRepository.SetSongConfidenceAsync(
+                request.MovieId,
+                new Dictionary<long, string> { [songId] = status },
+                cancellationToken);
+
+            return Ok(new { songId, movieId = request.MovieId, status });
+        }
+
+        /// <summary>
+        /// Edit a track's title and artist (admin). A blank artist clears it;
+        /// a non-blank artist is found-or-created so a brand-new or existing
+        /// name can be used.
+        /// </summary>
+        [HttpPut("song/{songId:long}/track")]
+        public async Task<IActionResult> UpdateTrack(
+            long songId,
+            [FromBody] UpdateTrackRequest request,
+            CancellationToken cancellationToken)
+        {
+            var title = (request?.Title ?? string.Empty).Trim();
+            if (string.IsNullOrEmpty(title))
+                return BadRequest(new { error = "title is required." });
+
+            var result = await _jobRepository.UpdateSongTrackAsync(
+                songId, title, request?.Artist, cancellationToken);
+            if (result == SongTrackUpdate.NotFound)
+                return NotFound();
+
+            var artist = string.IsNullOrWhiteSpace(request?.Artist)
+                ? null
+                : request!.Artist!.Trim();
+
+            // A real change makes the cached description, artwork and streaming
+            // links (resolved for the previous song) stale. UpdateSongTrackAsync
+            // already cleared the links/artwork and song-level details cache;
+            // drop the (non-locked) AI descriptions so they regenerate, and
+            // re-resolve links/artwork for this movie so the corrected song
+            // shows matching art.
+            if (result == SongTrackUpdate.Changed)
+            {
+                await _jobRepository.DeleteUnlockedAiDescriptionsForSongAsync(songId, cancellationToken);
+                if (request?.MovieId is int movieId)
+                {
+                    // Run the streaming-link refresh in the background: it calls
+                    // Spotify/Odesli which can take many seconds (Odesli alone is
+                    // budgeted up to ~2 min), and blocking the response is what
+                    // made applying an AI suggestion feel slow. The client
+                    // re-loads details after saving and picks up the artwork/links
+                    // once they land; results are idempotently persisted.
+                    RunStreamingBackfillInBackground(movieId, songId);
+                }
+            }
+
+            return Ok(new { songId, title, artist, changed = result == SongTrackUpdate.Changed });
+        }
+
+        // Fire-and-forget the post-edit streaming-link refresh on its own DI
+        // scope (the request scope is disposed once the response returns) with a
+        // non-request cancellation token, so the edit responds immediately.
+        private void RunStreamingBackfillInBackground(int movieId, long songId)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var scope = _scopeFactory.CreateScope();
+                    var linkService = scope.ServiceProvider.GetRequiredService<IStreamingLinkService>();
+                    await linkService.BackfillAsync(movieId, force: false, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    // Links/artwork will be refilled on the next backfill run;
+                    // don't let a background failure crash the process.
+                    _logger.LogWarning(ex,
+                        "Background streaming-link refresh failed for song {SongId} in movie {MovieId}.",
+                        songId, movieId);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Backfill streaming links on a movie's identified tracks: search Spotify
+        /// for each (title, artist) with a similarity guard, store the matched
+        /// Spotify URL, and derive a universal all-services link (song.link).
+        /// Non-destructive — only fills links. Pass force=true to re-resolve
+        /// tracks that already have links.
+        /// </summary>
+        [HttpPost("streaming-links/{movieId:int}")]
+        public async Task<IActionResult> BackfillStreamingLinks(
+            int movieId,
+            [FromQuery] bool force = false,
+            CancellationToken cancellationToken = default)
+        {
+            var result = await _streamingLinkService.BackfillAsync(movieId, force, cancellationToken);
+            if (!result.CredentialsConfigured)
+                return StatusCode(503, new { error = "Spotify credentials not configured on the server." });
+            return Ok(result);
         }
 
         /// <summary>
@@ -236,6 +679,119 @@ namespace AdminPanelAPI.Controllers
             });
 
             return Ok(new { movieId, r2Key, url, expiresInMinutes = PresignedUrlExpiryMinutes });
+        }
+
+        /// <summary>
+        /// Return the movie's playback segment manifest (distinct segment index +
+        /// its real start offset), derived from the dialogue transcript. Used by
+        /// the frontend to map a music clip's time to the segment file that the
+        /// /export endpoint cuts from. Every movie is dialogue-processed, so the
+        /// segments exist for all movies that have identified music.
+        /// </summary>
+        [HttpGet("video-segments/{movieId:int}")]
+        public async Task<IActionResult> GetVideoSegments(
+            int movieId,
+            CancellationToken cancellationToken)
+        {
+            const string sql = @"
+SELECT DISTINCT segment_index, segment_start
+FROM frl.frl_transcript_words
+WHERE movieid = @movieid
+  AND segment_index IS NOT NULL
+  AND segment_start IS NOT NULL
+ORDER BY segment_index;";
+
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken);
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("movieid", movieId);
+
+            var segments = new List<VideoSegment>();
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                segments.Add(new VideoSegment
+                {
+                    Index = reader.GetInt32(0),
+                    Start = reader.GetDouble(1)
+                });
+            }
+
+            return Ok(new { movieId, segments });
+        }
+
+        /// <summary>
+        /// Resolve a movie's r2_key from its most recent dialogue transcription job.
+        /// Every movie is dialogue-processed before music, so this is the cheapest,
+        /// most authoritative source. Returns null if the movie has no dialogue job.
+        /// </summary>
+        private async Task<string?> GetR2KeyFromDialogueJobAsync(
+            int movieId, CancellationToken cancellationToken)
+        {
+            const string sql = @"
+SELECT r2_key
+FROM frl.frl_dialogue_transcription_jobs
+WHERE movieid = @movieid
+  AND r2_key IS NOT NULL
+ORDER BY id DESC
+LIMIT 1;";
+
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(cancellationToken);
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("movieid", movieId);
+
+            return await cmd.ExecuteScalarAsync(cancellationToken) as string;
+        }
+
+        /// <summary>
+        /// Resolve a movie's mp4 key from the movies bucket by convention:
+        /// files live at movies/{movieId}/{file}.mp4. The final source file to scan
+        /// is tagged "SF" in its name (e.g. "..._SFv1.3.mp4") and there is normally
+        /// exactly one; prefer it, falling back to the largest mp4. Null if none.
+        /// </summary>
+        private async Task<string?> ResolveR2KeyForMovieAsync(
+            int movieId, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(_r2AccountId) ||
+                string.IsNullOrWhiteSpace(_r2AccessKey) ||
+                string.IsNullOrWhiteSpace(_r2SecretKey))
+            {
+                return null;
+            }
+
+            var creds = new BasicAWSCredentials(_r2AccessKey.Trim(), _r2SecretKey.Trim());
+            var s3Config = new AmazonS3Config
+            {
+                ServiceURL = $"https://{_r2AccountId.Trim()}.r2.cloudflarestorage.com",
+                ForcePathStyle = true,
+                UseAccelerateEndpoint = false,
+                UseDualstackEndpoint = false,
+                EndpointDiscoveryEnabled = false
+            };
+
+            using var s3Client = new AmazonS3Client(creds, s3Config);
+
+            var response = await s3Client.ListObjectsV2Async(new ListObjectsV2Request
+            {
+                BucketName = _r2BucketName,
+                Prefix = $"{movieId}/"
+            }, cancellationToken);
+
+            var mp4s = (response.S3Objects ?? new List<S3Object>())
+                .Where(o => o.Key.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var sourceFiles = mp4s
+                .Where(o => o.Key.Contains("SF", StringComparison.Ordinal))
+                .ToList();
+
+            return (sourceFiles.Count > 0 ? sourceFiles : mp4s)
+                .OrderByDescending(o => o.Size)
+                .Select(o => o.Key)
+                .FirstOrDefault();
         }
 
         private async Task<string?> GetR2KeyForMovieAsync(int movieId, CancellationToken cancellationToken)

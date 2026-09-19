@@ -66,7 +66,8 @@ namespace AdminPanelAPI.Controllers
             [FromQuery] bool music = false,
             CancellationToken cancellationToken = default)
         {
-            return await UploadToR2AndQueueAsync(movieId, file, music, cancellationToken);
+            return await UploadToR2AndQueueAsync(
+                movieId, file, true, music, cancellationToken);
         }
 
         /// <summary>
@@ -80,6 +81,7 @@ namespace AdminPanelAPI.Controllers
         [RequestFormLimits(MultipartBodyLengthLimit = MaxUploadSizeBytes)]
         public async Task<IActionResult> UploadAndTranscribeByFileName(
             IFormFile file,
+            [FromQuery] bool transcribe = true,
             [FromQuery] bool music = false,
             CancellationToken cancellationToken = default)
         {
@@ -100,12 +102,14 @@ namespace AdminPanelAPI.Controllers
                     error = $"No movie found in frl_movies matching title '{title}' and year {year}."
                 });
 
-            return await UploadToR2AndQueueAsync(movieId.Value, file, music, cancellationToken);
+            return await UploadToR2AndQueueAsync(
+                movieId.Value, file, transcribe, music, cancellationToken);
         }
 
         private async Task<IActionResult> UploadToR2AndQueueAsync(
             int movieId,
             IFormFile file,
+            bool queueTranscription,
             bool music,
             CancellationToken cancellationToken)
         {
@@ -171,10 +175,13 @@ namespace AdminPanelAPI.Controllers
                     movieId, r2Key);
             }
 
-            var jobId = await _jobRepository.CreateJobAsync(
-                movieId, r2Key, null, cancellationToken);
-
-            await _jobQueue.QueueJobAsync(jobId, cancellationToken);
+            long? jobId = null;
+            if (queueTranscription)
+            {
+                jobId = await _jobRepository.CreateJobAsync(
+                    movieId, r2Key, null, cancellationToken);
+                await _jobQueue.QueueJobAsync(jobId.Value, cancellationToken);
+            }
 
             // Optionally kick off music identification on the same uploaded file,
             // so a single upload runs dialogue + music in parallel. The music
@@ -196,7 +203,7 @@ namespace AdminPanelAPI.Controllers
                 r2Bucket = _r2BucketName,
                 fileSizeBytes = file.Length,
                 skippedUpload = alreadyExists,
-                status = "Queued"
+                status = queueTranscription || music ? "Queued" : "Uploaded"
             });
         }
 

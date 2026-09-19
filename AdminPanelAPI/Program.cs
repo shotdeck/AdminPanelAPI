@@ -24,8 +24,15 @@ builder.Services.AddApplicationInsightsTelemetry(options =>
 });
 
 
+// Move the tunnel off a loopback port another slot on this worker already
+// owns, keeping ConnectionStrings:Default in step. Must run before anything
+// reads the connection string.
+TunnelPortSelector.Apply(builder.Configuration);
+
 // SSH tunnel (optional, you had this)
-builder.Services.AddHostedService<SshTunnelService>();
+// Singleton so the health endpoint can report the tunnel's live state.
+builder.Services.AddSingleton<SshTunnelService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<SshTunnelService>());
 
 // Database connection (scoped, lazy - only opened when first accessed)
 builder.Services.AddScoped<Lazy<NpgsqlConnection>>(sp =>
@@ -78,7 +85,31 @@ builder.Services.AddHostedService<DialogueTranscriptionWorker>();
 builder.Services.AddSingleton<IMusicJobQueue, MusicJobQueue>();
 builder.Services.AddScoped<IMusicIdentificationJobRepository, MusicIdentificationJobRepository>();
 builder.Services.AddScoped<IMusicIdentificationService, MusicIdentificationService>();
+builder.Services.AddHttpClient<ISoundtrackReconciliationService, SoundtrackReconciliationService>();
+builder.Services.AddHttpClient<IStreamingLinkService, StreamingLinkService>();
+builder.Services.AddHttpClient<ITrackDetailsService, TrackDetailsService>();
+builder.Services.AddScoped<IAudioIdentifyService, AudioIdentifyService>();
 builder.Services.AddHostedService<MusicIdentificationWorker>();
+
+// Movie source files in R2 (dashboard file browser)
+builder.Services.AddSingleton<IMovieFileStorageService, MovieFileStorageService>();
+builder.Services.AddSingleton<IMovieTranscodeService, MovieTranscodeService>();
+builder.Services.AddSingleton<IKeyImageAnalysisService, KeyImageAnalysisService>();
+builder.Services.AddSingleton<IFilmSynopsisService, FilmSynopsisService>();
+builder.Services.AddSingleton<IWalkthroughService, WalkthroughService>();
+builder.Services.AddSingleton<IStoryRatingService, StoryRatingService>();
+
+// TMDB lookups for saying which film an uploaded master is
+builder.Services.AddSingleton<ITmdbService, TmdbService>();
+
+// Describes and analyses a movie as soon as its SF proxy exists, so a tagger
+// who finishes watching finds the walkthrough and the proposals waiting.
+builder.Services.AddHostedService<MoviePreparationWorker>();
+
+// Camera-movement QC: shared analysis pipeline plus a worker that keeps a bank
+// of pre-analysed images so a reviewer's fetch is an instant assignment.
+builder.Services.AddScoped<CameraMovementAnalysisService>();
+builder.Services.AddHostedService<CameraMovementBankWorker>();
 
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();

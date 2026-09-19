@@ -59,7 +59,13 @@ namespace AdminPanelAPI.Models
         public string? Isrc { get; set; }
 
         [JsonPropertyName("score")]
-        public double Score { get; set; }
+        public double? Score { get; set; }
+
+        [JsonPropertyName("source")]
+        public string? Source { get; set; }
+
+        [JsonPropertyName("spotify_url")]
+        public string? SpotifyUrl { get; set; }
     }
 
     public class UnmatchedWindow

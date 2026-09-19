@@ -9,6 +9,9 @@ namespace AdminPanelAPI.Services
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<MusicIdentificationService> _logger;
         private readonly IMusicIdentificationJobRepository _repo;
+        private readonly IStreamingLinkService _streamingLinkService;
+        private readonly ISoundtrackReconciliationService _reconciliationService;
+        private readonly ITrackDetailsService _trackDetailsService;
 
         private readonly string _musicApiBaseUrl;
 
@@ -16,12 +19,18 @@ namespace AdminPanelAPI.Services
             IConfiguration configuration,
             IHttpClientFactory httpClientFactory,
             ILogger<MusicIdentificationService> logger,
-            IMusicIdentificationJobRepository repo)
+            IMusicIdentificationJobRepository repo,
+            IStreamingLinkService streamingLinkService,
+            ISoundtrackReconciliationService reconciliationService,
+            ITrackDetailsService trackDetailsService)
         {
             _configuration = configuration;
             _httpClientFactory = httpClientFactory;
             _logger = logger;
             _repo = repo;
+            _streamingLinkService = streamingLinkService;
+            _reconciliationService = reconciliationService;
+            _trackDetailsService = trackDetailsService;
 
             _musicApiBaseUrl = _configuration["MusicIdentification:MusicApiBaseUrl"]
                 ?? "http://localhost:8000";
@@ -42,23 +51,207 @@ namespace AdminPanelAPI.Services
 
             await _repo.UpdateProgressAsync(jobId, "Sending to music identification API", 5, cancellationToken);
 
+            var baseUrl = _musicApiBaseUrl.TrimEnd('/');
+
+            // A typical full-movie scan finishes in ~10-12 min. Modal occasionally
+            // stalls at the detect step (an intermittent hang we've observed on
+            // larger files); rather than blocking the single-threaded queue on one
+            // hung call, cap each attempt and re-spawn a fresh Modal call, which
+            // reliably clears the stall.
+            //
+            // The cap must still clear the slowest legitimate scans: heavily-scored
+            // films (e.g. True Lies ~20 min) have lots of music the fingerprint
+            // providers can't match, so recognition steps finely through every
+            // region with paced provider calls. The previous 18-min cap sat right
+            // on that runtime and cancelled the real work just before it finished,
+            // so the movie re-spawned forever and never completed. 60 min gives
+            // ample headroom for such scans while still bounding a genuine hang.
+            var perAttemptTimeout = TimeSpan.FromMinutes(60);
+            const int maxAttempts = 2;
+
+            MusicApiResponse? result = null;
+            Exception? lastError = null;
+
+            for (int attempt = 1; attempt <= maxAttempts && result == null; attempt++)
+            {
+                try
+                {
+                    result = await RunIdentifyAttemptAsync(
+                        jobId, movieId, r2Key, baseUrl, perAttemptTimeout, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                    _logger.LogWarning(
+                        ex,
+                        "Music job {JobId} attempt {Attempt}/{Max} failed or stalled.",
+                        jobId, attempt, maxAttempts);
+                    if (attempt < maxAttempts)
+                        await _repo.UpdateProgressAsync(
+                            jobId, "Modal call stalled — retrying", 10, cancellationToken);
+                }
+            }
+
+            if (result == null)
+                throw lastError ?? new Exception("Music identification failed with no result.");
+
+            await _repo.UpdateProgressAsync(jobId, "Storing segments in database", 85, cancellationToken);
+
+            await _repo.StoreSegmentsAsync(movieId, result, cancellationToken);
+
+            // Enrichment runs as part of the same job so a single upload yields a
+            // fully linked + statused movie. Both are best-effort: a failure here
+            // must not fail identification (the segments are already stored).
+            try
+            {
+                await _repo.UpdateProgressAsync(jobId, "Finding streaming links", 90, cancellationToken);
+                await _streamingLinkService.BackfillAsync(movieId, false, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Streaming-link backfill failed for movie {MovieId}.", movieId);
+            }
+
+            try
+            {
+                await _repo.UpdateProgressAsync(jobId, "Reconciling soundtrack", 93, cancellationToken);
+                await _reconciliationService.ReconcileAsync(movieId, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Soundtrack reconciliation failed for movie {MovieId}.", movieId);
+            }
+
+            // Pre-warm each track's details (MusicBrainz + Wikipedia + Spotify)
+            // and its film-specific AI description so the popup opens instantly
+            // instead of fetching on first click. Best-effort and sequential to
+            // respect MusicBrainz/OpenAI rate limits.
+            string? aiWarning = null;
+            try
+            {
+                await _repo.UpdateProgressAsync(jobId, "Generating track descriptions", 96, cancellationToken);
+                var tracks = await _repo.GetMovieTracksAsync(movieId, false, cancellationToken);
+                // Tracks the web-search agent judges are NOT in the film, or that
+                // were released after the film, are likely fingerprint false
+                // positives; flag them for review.
+                // The soundtrack cross-check can't corroborate every real
+                // needle-drop/score cue, so when the agent confirms a track is
+                // in the film and its match is solid, promote it to confirmed.
+                var confidenceUpdates = new Dictionary<long, string>();
+                foreach (var track in tracks)
+                {
+                    if (cancellationToken.IsCancellationRequested) break;
+                    try
+                    {
+                        var details = await _trackDetailsService.GetOrFetchAsync(
+                            track.SongId, movieId, false, cancellationToken);
+                        if (aiWarning == null && !string.IsNullOrWhiteSpace(details?.AiDescriptionError))
+                            aiWarning = details!.AiDescriptionError;
+                        if (details == null) continue;
+
+                        // Only decide for tracks the soundtrack cross-check left
+                        // undecided (unverified or no status); never override a
+                        // confirmed/review/rejected decision.
+                        var undecided = string.IsNullOrEmpty(track.Confidence) ||
+                            string.Equals(track.Confidence, "unverified", StringComparison.OrdinalIgnoreCase);
+                        if (!undecided) continue;
+
+                        if (TrackDetailsService.ShouldFlagForReview(details))
+                        {
+                            confidenceUpdates[track.SongId] = "review";
+                        }
+                        else if (TrackDetailsService.AiConfirmsInFilm(details) &&
+                                 track.Occurrences.Max(o => o.Score ?? 0) >= TrackDetailsService.ConfirmScoreThreshold)
+                        {
+                            confidenceUpdates[track.SongId] = "confirmed";
+                        }
+                        else if (string.IsNullOrEmpty(track.Confidence))
+                        {
+                            // Unreconciled and not (yet) confirmable: give it a
+                            // visible baseline instead of a null/blank status.
+                            confidenceUpdates[track.SongId] = "unverified";
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(
+                            ex, "Pre-warming details failed for song {SongId} (movie {MovieId}).",
+                            track.SongId, movieId);
+                    }
+                }
+
+                if (confidenceUpdates.Count > 0)
+                {
+                    _logger.LogInformation(
+                        "AI verdict updated {Count} track status(es) for movie {MovieId}.",
+                        confidenceUpdates.Count, movieId);
+                    await _repo.SetSongConfidenceAsync(movieId, confidenceUpdates, cancellationToken);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Track-details pre-warm failed for movie {MovieId}.", movieId);
+            }
+
+            // The description pass can auto-correct cover/tribute artists, which
+            // clears those tracks' now-wrong streaming links + artwork. Re-run
+            // the backfill so the corrected songs get matching art/links. Cheap:
+            // force=false only searches the just-cleared (null-link) tracks.
+            try
+            {
+                await _repo.UpdateProgressAsync(jobId, "Refreshing links for corrected tracks", 98, cancellationToken);
+                await _streamingLinkService.BackfillAsync(movieId, false, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Post-correction streaming-link refill failed for movie {MovieId}.", movieId);
+            }
+
+            await _repo.MarkCompletedAsync(
+                jobId,
+                result.MatchedSegments.Count,
+                result.UnmatchedWindows.Count,
+                aiWarning,
+                cancellationToken);
+
+            _logger.LogInformation(
+                "Music identification complete. JobId={JobId}, MovieId={MovieId}, Matched={Matched}, Unmatched={Unmatched}",
+                jobId, movieId, result.MatchedSegments.Count, result.UnmatchedWindows.Count);
+        }
+
+        // Spawns one Modal /identify call and polls /result until it completes.
+        // Bounded by `timeout` (a linked CTS): if Modal stalls, this throws so the
+        // caller can re-spawn a fresh call instead of blocking the queue.
+        private async Task<MusicApiResponse> RunIdentifyAttemptAsync(
+            long jobId,
+            int movieId,
+            string? r2Key,
+            string baseUrl,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            using var attemptCts =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            attemptCts.CancelAfter(timeout);
+            var ct = attemptCts.Token;
+
             var client = _httpClientFactory.CreateClient();
             client.Timeout = TimeSpan.FromMinutes(10);
-
-            var baseUrl = _musicApiBaseUrl.TrimEnd('/');
 
             // The Modal app processes a full movie asynchronously: POST /identify
             // returns a call_id immediately, then we poll GET /result/{call_id}.
             var startUrl = $"{baseUrl}/identify" +
-                           $"?movie_id={movieId}&r2_key={Uri.EscapeDataString(r2Key)}";
+                           $"?movie_id={movieId}&r2_key={Uri.EscapeDataString(r2Key!)}";
 
-            using var startResponse = await client.PostAsync(startUrl, null, cancellationToken);
-            var startContent = await startResponse.Content.ReadAsStringAsync(cancellationToken);
+            using var startResponse = await client.PostAsync(startUrl, null, ct);
+            var startContent = await startResponse.Content.ReadAsStringAsync(ct);
             if (!startResponse.IsSuccessStatusCode)
-            {
                 throw new Exception(
                     $"Music identification API failed to start. Status: {(int)startResponse.StatusCode}, Body: {startContent}");
-            }
 
             var start = JsonSerializer.Deserialize<MusicApiStartResponse>(startContent);
             if (start?.CallId == null)
@@ -66,17 +259,15 @@ namespace AdminPanelAPI.Services
 
             await _repo.UpdateProgressAsync(jobId, "Detecting music and recognizing songs", 30, cancellationToken);
 
-            MusicApiResponse? result = null;
             var resultUrl = $"{baseUrl}/result/{start.CallId}";
-            var deadline = DateTime.UtcNow.AddMinutes(55);
 
-            while (DateTime.UtcNow < deadline)
+            while (true)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                ct.ThrowIfCancellationRequested();
+                await Task.Delay(TimeSpan.FromSeconds(5), ct);
 
-                using var poll = await client.GetAsync(resultUrl, cancellationToken);
-                var pollContent = await poll.Content.ReadAsStringAsync(cancellationToken);
+                using var poll = await client.GetAsync(resultUrl, ct);
+                var pollContent = await poll.Content.ReadAsStringAsync(ct);
                 if (!poll.IsSuccessStatusCode)
                     throw new Exception(
                         $"Music identification result poll failed. Status: {(int)poll.StatusCode}, Body: {pollContent}");
@@ -90,26 +281,8 @@ namespace AdminPanelAPI.Services
                     throw new Exception(
                         $"Music identification API returned error: {status.Error ?? "unknown error"}");
 
-                result = status;
-                break;
+                return status;
             }
-
-            if (result == null)
-                throw new Exception("Music identification timed out waiting for results.");
-
-            await _repo.UpdateProgressAsync(jobId, "Storing segments in database", 85, cancellationToken);
-
-            await _repo.StoreSegmentsAsync(movieId, result, cancellationToken);
-
-            await _repo.MarkCompletedAsync(
-                jobId,
-                result.MatchedSegments.Count,
-                result.UnmatchedWindows.Count,
-                cancellationToken);
-
-            _logger.LogInformation(
-                "Music identification complete. JobId={JobId}, MovieId={MovieId}, Matched={Matched}, Unmatched={Unmatched}",
-                jobId, movieId, result.MatchedSegments.Count, result.UnmatchedWindows.Count);
         }
     }
 }
