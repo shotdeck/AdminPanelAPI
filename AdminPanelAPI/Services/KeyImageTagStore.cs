@@ -31,6 +31,19 @@ namespace AdminPanelAPI.Services
     /// <summary>A frame waiting to be read by the image tagger.</summary>
     public sealed record KeyImageTagClaim(long Id, string ImageKey);
 
+    /// <summary>
+    /// One category of one confirmed frame, as the model should learn it: the
+    /// term the tagger stood by, whether they changed it or let the model's
+    /// stand.
+    /// </summary>
+    public sealed record TrainingDecision(
+        long KeyImageId,
+        int MovieId,
+        string ImageKey,
+        string Category,
+        string? Value,
+        bool Corrected);
+
     /// <summary>How far a movie's kept frames have got with the image tagger.</summary>
     public sealed record KeyImageTagProgress(
         int MovieId, int Kept, int Waiting, int Tagged, int Failed, int Confirmed);
@@ -129,7 +142,12 @@ CREATE INDEX IF NOT EXISTS idx_fmkitc_movie
     ON frl.frl_movie_key_image_tag_changes (movie_id, changed_at);
 CREATE INDEX IF NOT EXISTS idx_fmkitc_unexported
     ON frl.frl_movie_key_image_tag_changes (changed_at)
-    WHERE exported_at IS NULL;";
+    WHERE exported_at IS NULL;
+ALTER TABLE frl.frl_movie_key_images
+    ADD COLUMN IF NOT EXISTS tags_exported_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_fmki_training_pending
+    ON frl.frl_movie_key_images (tags_confirmed_at)
+    WHERE tags_confirmed_at IS NOT NULL AND tags_exported_at IS NULL;";
 
         /// <summary>
         /// Queue kept frames of a movie to be read. Only frames with a picture
@@ -554,6 +572,70 @@ LIMIT @limit;";
 UPDATE frl.frl_movie_key_image_tag_changes
 SET exported_at = now()
 WHERE id = ANY(@ids) AND exported_at IS NULL;";
+
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@ids", ids);
+            return await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        /// <summary>
+        /// The terms of the frames taggers have stood by, a row per category,
+        /// for the batch the model is retrained from. A confirmed frame is a
+        /// person's word on all fifteen terms, not only the ones they changed,
+        /// so the model learns what it got right as well as what it got wrong.
+        /// Frames already taken by a batch are left out.
+        /// </summary>
+        public static async Task<List<TrainingDecision>> TrainingDecisionsAsync(
+            NpgsqlConnection connection, int limit, CancellationToken ct)
+        {
+            const string sql = @"
+SELECT k.id, k.movie_id, k.image_key, t.category,
+       COALESCE(t.value, t.ai_value),
+       t.value IS NOT NULL AND t.value IS DISTINCT FROM t.ai_value
+FROM frl.frl_movie_key_images k
+JOIN frl.frl_movie_key_image_tags t ON t.key_image_id = k.id
+WHERE k.decision = 'kept'
+  AND k.image_key IS NOT NULL
+  AND k.tags_confirmed_at IS NOT NULL
+  AND k.tags_exported_at IS NULL
+  AND k.id IN (
+      SELECT id FROM frl.frl_movie_key_images
+      WHERE decision = 'kept' AND image_key IS NOT NULL
+        AND tags_confirmed_at IS NOT NULL AND tags_exported_at IS NULL
+      ORDER BY tags_confirmed_at
+      LIMIT @limit)
+ORDER BY k.id, t.category;";
+
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@limit", limit);
+
+            var rows = new List<TrainingDecision>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                rows.Add(new TrainingDecision(
+                    reader.GetInt64(0),
+                    reader.GetInt32(1),
+                    reader.GetString(2),
+                    reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetString(4),
+                    !reader.IsDBNull(5) && reader.GetBoolean(5)));
+            return rows;
+        }
+
+        /// <summary>
+        /// Mark frames as taken by a retraining batch, so next week's batch is
+        /// the week's new work rather than everything again.
+        /// </summary>
+        public static async Task<int> MarkFramesExportedAsync(
+            NpgsqlConnection connection, long[] ids, CancellationToken ct)
+        {
+            if (ids.Length == 0)
+                return 0;
+
+            const string sql = @"
+UPDATE frl.frl_movie_key_images
+SET tags_exported_at = now()
+WHERE id = ANY(@ids) AND tags_exported_at IS NULL;";
 
             await using var cmd = new NpgsqlCommand(sql, connection);
             cmd.Parameters.AddWithValue("@ids", ids);

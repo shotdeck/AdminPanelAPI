@@ -34,6 +34,12 @@ namespace ShotDeckSearch.Controllers
             "key_images_extracted", "ai_tags_read", "tags_confirmed"
         };
 
+        private static readonly string[] TrainingRunStatuses =
+        {
+            TrainingRunStore.Running, TrainingRunStore.Skipped,
+            TrainingRunStore.Trained, TrainingRunStore.Failed
+        };
+
         /// <summary>
         /// How far a single progress report may move the watched position. The
         /// player reports every 10s, so anything beyond this is a seek and is
@@ -193,6 +199,22 @@ namespace ShotDeckSearch.Controllers
         public sealed class TagChangeExportRequest
         {
             public long[]? Ids { get; set; }
+        }
+
+        public sealed class TrainingRunStartRequest
+        {
+            public int Frames { get; set; }
+            public int Decisions { get; set; }
+            public int Corrections { get; set; }
+        }
+
+        public sealed class TrainingRunFinishRequest
+        {
+            public string? Status { get; set; }
+            public string? ModelVersion { get; set; }
+            public bool Promoted { get; set; }
+            public string? Note { get; set; }
+            public JsonElement? Report { get; set; }
         }
 
         public sealed class KeyImageRequest
@@ -1686,6 +1708,129 @@ WHERE movie_id = @movieId
         }
 
         /// <summary>
+        /// The batch the weekly retraining learns from: every category of every
+        /// frame a tagger has stood by and no batch has taken, with a link to
+        /// the picture. Frames are only stamped as taken when the job says it
+        /// has them, so a run that dies loses nothing.
+        /// </summary>
+        [HttpGet("key-image-tags/training-decisions")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetTrainingDecisions(
+            [FromQuery] int limit = 2000, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            var rows = await KeyImageTagStore.TrainingDecisionsAsync(
+                _connection, Math.Clamp(limit, 1, 20000), ct);
+
+            return Ok(new
+            {
+                frameIds = rows.Select(row => row.KeyImageId).Distinct(),
+                corrections = rows.Count(row => row.Corrected),
+                decisions = rows.Select(row => new
+                {
+                    imageId = row.KeyImageId,
+                    movieId = row.MovieId,
+                    imageUrl = _storage.CreateDownloadUrl(row.ImageKey, false),
+                    category = row.Category,
+                    chosenValue = row.Value,
+                    corrected = row.Corrected
+                })
+            });
+        }
+
+        /// <summary>
+        /// Mark frames as taken by a retraining batch.
+        /// </summary>
+        [HttpPost("key-image-tags/training-decisions/exported")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> MarkTrainingDecisionsExported(
+            [FromBody] TagChangeExportRequest request, CancellationToken ct = default)
+        {
+            if (request.Ids is not { Length: > 0 })
+                return BadRequest(new { error = "ids is required." });
+
+            await EnsureReadyAsync(ct);
+            var marked = await KeyImageTagStore.MarkFramesExportedAsync(
+                _connection, request.Ids, ct);
+            return Ok(new { marked });
+        }
+
+        /// <summary>What each week's retraining did, newest first.</summary>
+        [HttpGet("training-runs")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetTrainingRuns(
+            [FromQuery] int limit = 20, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            var rows = await TrainingRunStore.ListAsync(
+                _connection, Math.Clamp(limit, 1, 200), ct);
+
+            return Ok(new
+            {
+                runs = rows.Select(row => new
+                {
+                    id = row.Id,
+                    status = row.Status,
+                    modelVersion = row.ModelVersion,
+                    frames = row.Frames,
+                    decisions = row.Decisions,
+                    corrections = row.Corrections,
+                    promoted = row.Promoted,
+                    note = row.Note,
+                    report = row.Report is { Length: > 0 } text
+                        ? JsonDocument.Parse(text).RootElement
+                        : (JsonElement?)null,
+                    startedAt = row.StartedAt,
+                    finishedAt = row.FinishedAt
+                })
+            });
+        }
+
+        /// <summary>Open a retraining run, for the weekly job to report into.</summary>
+        [HttpPost("training-runs")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> StartTrainingRun(
+            [FromBody] TrainingRunStartRequest request, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            var id = await TrainingRunStore.StartAsync(
+                _connection,
+                Math.Max(0, request.Frames),
+                Math.Max(0, request.Decisions),
+                Math.Max(0, request.Corrections),
+                ct);
+            return Ok(new { id });
+        }
+
+        /// <summary>Close a retraining run with what it found.</summary>
+        [HttpPut("training-runs/{id:long}")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<IActionResult> FinishTrainingRun(
+            long id, [FromBody] TrainingRunFinishRequest request,
+            CancellationToken ct = default)
+        {
+            var status = (request.Status ?? "").Trim().ToLowerInvariant();
+            if (Array.IndexOf(TrainingRunStatuses, status) < 0)
+                return BadRequest(new
+                {
+                    error = "status must be one of: " + string.Join(", ", TrainingRunStatuses)
+                });
+
+            await EnsureReadyAsync(ct);
+
+            var updated = await TrainingRunStore.FinishAsync(
+                _connection, id, status, request.ModelVersion, request.Promoted,
+                request.Note,
+                request.Report?.GetRawText(),
+                ct);
+            return updated ? Ok(new { id, status }) : NotFound(new { error = "No such run." });
+        }
+
+        /// <summary>
         /// The values each category may take, from the image tagger's taxonomy.
         /// Empty when the tagger cannot be reached, in which case a tagger's
         /// choice is taken on trust rather than refused.
@@ -1876,7 +2021,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_fmki_movie_position_story
     ON frl.frl_movie_key_images (movie_id, position_seconds, COALESCE(story_from, ''));
 CREATE INDEX IF NOT EXISTS idx_fmki_movie_decision
     ON frl.frl_movie_key_images (movie_id, decision);"
-                + MoviePreparationStore.Schema + KeyImageTagStore.Schema;
+                + MoviePreparationStore.Schema + KeyImageTagStore.Schema
+                + TrainingRunStore.Schema;
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
         }
