@@ -1756,6 +1756,83 @@ WHERE movie_id = @movieId
             return Ok(new { marked });
         }
 
+        /// <summary>
+        /// The tagging work as numbers over a date range: day by day, by tagger,
+        /// and by technical category, for the admin dashboard's charts. The
+        /// range is inclusive of both days; it defaults to the last 30.
+        /// </summary>
+        [HttpGet("stats")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetStats(
+            [FromQuery] string? from = null,
+            [FromQuery] string? to = null,
+            CancellationToken ct = default)
+        {
+            var today = DateTime.UtcNow.Date;
+            if (!DateTime.TryParse(to, out var last)) last = today;
+            if (!DateTime.TryParse(from, out var first)) first = last.AddDays(-29);
+            first = first.Date;
+            last = last.Date;
+            if (last < first) (first, last) = (last, first);
+            // A range longer than a couple of years would draw nothing readable.
+            if ((last - first).TotalDays > 730) first = last.AddDays(-730);
+            var end = last.AddDays(1);
+
+            await EnsureReadyAsync(ct);
+
+            var totals = await TaggingStatsStore.TotalsAsync(_connection, first, end, ct);
+            var days = await TaggingStatsStore.DaysAsync(_connection, first, end, ct);
+            var taggers = await TaggingStatsStore.TaggersAsync(_connection, first, end, ct);
+            var categories = await TaggingStatsStore.CategoriesAsync(_connection, first, end, ct);
+            var stages = await TaggingStatsStore.StagesAsync(_connection, ct);
+
+            return Ok(new
+            {
+                from = first.ToString("yyyy-MM-dd"),
+                to = last.ToString("yyyy-MM-dd"),
+                totals = new
+                {
+                    movies = totals.Movies,
+                    moviesFinished = totals.MoviesFinished,
+                    proposed = totals.Proposed,
+                    kept = totals.Kept,
+                    discarded = totals.Discarded,
+                    read = totals.Read,
+                    confirmed = totals.Confirmed,
+                    corrections = totals.Corrections,
+                    taggers = totals.Taggers
+                },
+                days = days.Select(d => new
+                {
+                    day = d.Day.ToString("yyyy-MM-dd"),
+                    kept = d.Kept,
+                    discarded = d.Discarded,
+                    read = d.Read,
+                    confirmed = d.Confirmed,
+                    corrections = d.Corrections,
+                    moviesFinished = d.MoviesFinished
+                }),
+                taggers = taggers.Select(t => new
+                {
+                    tagger = t.Tagger,
+                    moviesAllocated = t.MoviesAllocated,
+                    moviesFinished = t.MoviesFinished,
+                    kept = t.Kept,
+                    discarded = t.Discarded,
+                    confirmed = t.Confirmed,
+                    corrections = t.Corrections,
+                    lastActive = t.LastActive
+                }),
+                categories = categories.Select(c => new
+                {
+                    category = c.Category,
+                    confirmed = c.Confirmed,
+                    corrections = c.Corrections
+                }),
+                stages = stages.Select(s => new { stage = s.Stage, movies = s.Movies })
+            });
+        }
+
         /// <summary>What each week's retraining did, newest first.</summary>
         [HttpGet("training-runs")]
         [ProducesResponseType(StatusCodes.Status200OK)]
