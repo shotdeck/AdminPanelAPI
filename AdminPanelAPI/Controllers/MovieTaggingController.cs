@@ -1766,30 +1766,29 @@ WHERE movie_id = @movieId
         public async Task<IActionResult> GetStats(
             [FromQuery] string? from = null,
             [FromQuery] string? to = null,
+            [FromQuery] string? tagger = null,
             CancellationToken ct = default)
         {
-            var today = DateTime.UtcNow.Date;
-            if (!DateTime.TryParse(to, out var last)) last = today;
-            if (!DateTime.TryParse(from, out var first)) first = last.AddDays(-29);
-            first = first.Date;
-            last = last.Date;
-            if (last < first) (first, last) = (last, first);
-            // A range longer than a couple of years would draw nothing readable.
-            if ((last - first).TotalDays > 730) first = last.AddDays(-730);
-            var end = last.AddDays(1);
+            var (first, last, end) = StatsRange(from, to);
 
             await EnsureReadyAsync(ct);
 
-            var totals = await TaggingStatsStore.TotalsAsync(_connection, first, end, ct);
-            var days = await TaggingStatsStore.DaysAsync(_connection, first, end, ct);
+            var totals = await TaggingStatsStore.TotalsAsync(_connection, first, end, tagger, ct);
+            var days = await TaggingStatsStore.DaysAsync(_connection, first, end, tagger, ct);
             var taggers = await TaggingStatsStore.TaggersAsync(_connection, first, end, ct);
-            var categories = await TaggingStatsStore.CategoriesAsync(_connection, first, end, ct);
-            var stages = await TaggingStatsStore.StagesAsync(_connection, ct);
+            var categories = await TaggingStatsStore.CategoriesAsync(_connection, first, end, tagger, ct);
+            var stages = await TaggingStatsStore.StagesAsync(_connection, tagger, ct);
+
+            if (!string.IsNullOrWhiteSpace(tagger))
+                taggers = taggers
+                    .Where(t => string.Equals(t.Tagger, tagger.Trim(), StringComparison.OrdinalIgnoreCase))
+                    .ToList();
 
             return Ok(new
             {
                 from = first.ToString("yyyy-MM-dd"),
                 to = last.ToString("yyyy-MM-dd"),
+                tagger = string.IsNullOrWhiteSpace(tagger) ? null : tagger.Trim(),
                 totals = new
                 {
                     movies = totals.Movies,
@@ -1831,6 +1830,106 @@ WHERE movie_id = @movieId
                 }),
                 stages = stages.Select(s => new { stage = s.Stage, movies = s.Movies })
             });
+        }
+
+        /// <summary>
+        /// The movies behind a figure on the dashboard: everything allocated,
+        /// or narrowed to a stage, a tagger, or the movies finished or worked
+        /// on inside the period. Capped at 200, newest activity first.
+        /// </summary>
+        [HttpGet("stats/movies")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetStatsMovies(
+            [FromQuery] string? from = null,
+            [FromQuery] string? to = null,
+            [FromQuery] string? tagger = null,
+            [FromQuery] string? stage = null,
+            [FromQuery] string? metric = null,
+            CancellationToken ct = default)
+        {
+            var normalizedStage = NormalizeStatus(stage);
+            if (!string.IsNullOrWhiteSpace(stage) && normalizedStage == null)
+                return BadRequest(new { error = "stage must be one of: " + string.Join(", ", Statuses) });
+
+            var (first, last, end) = StatsRange(from, to);
+
+            await EnsureReadyAsync(ct);
+
+            var movies = await TaggingStatsStore.MoviesAsync(
+                _connection, first, end, tagger, normalizedStage, metric, PosterBaseUrl, ct);
+
+            return Ok(new
+            {
+                from = first.ToString("yyyy-MM-dd"),
+                to = last.ToString("yyyy-MM-dd"),
+                movies = movies.Select(m => new
+                {
+                    movieId = m.MovieId,
+                    title = m.Title,
+                    year = m.Year,
+                    poster = m.Poster,
+                    tagger = m.Tagger,
+                    status = m.Status,
+                    assignedAt = m.AssignedAt,
+                    finishedAt = m.FinishedAt,
+                    kept = m.Kept,
+                    discarded = m.Discarded,
+                    confirmed = m.Confirmed,
+                    corrections = m.Corrections,
+                    lastActive = m.LastActive
+                })
+            });
+        }
+
+        /// <summary>
+        /// What a category's corrections were term by term: the model's answer,
+        /// the tagger's, and how often that swap was made.
+        /// </summary>
+        [HttpGet("stats/terms")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetStatsTerms(
+            [FromQuery] string? from = null,
+            [FromQuery] string? to = null,
+            [FromQuery] string? category = null,
+            [FromQuery] string? tagger = null,
+            CancellationToken ct = default)
+        {
+            var (first, last, end) = StatsRange(from, to);
+
+            await EnsureReadyAsync(ct);
+
+            var terms = await TaggingStatsStore.TermsAsync(
+                _connection, first, end, category, tagger, ct);
+
+            return Ok(new
+            {
+                from = first.ToString("yyyy-MM-dd"),
+                to = last.ToString("yyyy-MM-dd"),
+                category = string.IsNullOrWhiteSpace(category) ? null : category.Trim(),
+                terms = terms.Select(t => new
+                {
+                    category = t.Category,
+                    from = t.From,
+                    to = t.To,
+                    corrections = t.Corrections
+                })
+            });
+        }
+
+        /// <summary>
+        /// The days a range covers: inclusive of both ends for the caller, with
+        /// an exclusive end for the SQL, and never longer than a couple of years.
+        /// </summary>
+        static (DateTime First, DateTime Last, DateTime End) StatsRange(string? from, string? to)
+        {
+            var today = DateTime.UtcNow.Date;
+            if (!DateTime.TryParse(to, out var last)) last = today;
+            if (!DateTime.TryParse(from, out var first)) first = last.AddDays(-29);
+            first = first.Date;
+            last = last.Date;
+            if (last < first) (first, last) = (last, first);
+            if ((last - first).TotalDays > 730) first = last.AddDays(-730);
+            return (first, last, last.AddDays(1));
         }
 
         /// <summary>What each week's retraining did, newest first.</summary>
