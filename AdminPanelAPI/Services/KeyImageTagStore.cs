@@ -563,14 +563,30 @@ WHERE id = ANY(@ids) AND exported_at IS NULL;";
         /// <summary>
         /// Move a movie on to the AI tags stage once every kept frame of it has
         /// been read. A frame that could not be read does not hold the movie
-        /// back, or a single bad still would strand it for ever.
+        /// back, or a single bad still would strand it for ever. A movie whose
+        /// frames were all confirmed before this ran goes straight to the last
+        /// stage rather than waiting for the next tick to be taken away and put
+        /// back.
         /// </summary>
         public static async Task<int> AdvanceReadMoviesAsync(
             NpgsqlConnection connection, CancellationToken ct)
         {
             const string sql = @"
 UPDATE frl.frl_movie_tagger_assignments a
-SET status = 'ai_tags_read', ai_tags_at = COALESCE(a.ai_tags_at, now()), updated_at = now()
+SET status = CASE WHEN NOT EXISTS (
+        SELECT 1 FROM frl.frl_movie_key_images k
+        WHERE k.movie_id = a.movie_id AND k.decision = 'kept'
+          AND k.image_key IS NOT NULL AND k.tag_status = 'tagged'
+          AND k.tags_confirmed_at IS NULL)
+    THEN 'tags_confirmed' ELSE 'ai_tags_read' END,
+    ai_tags_at = COALESCE(a.ai_tags_at, now()),
+    tags_confirmed_at = CASE WHEN NOT EXISTS (
+        SELECT 1 FROM frl.frl_movie_key_images k
+        WHERE k.movie_id = a.movie_id AND k.decision = 'kept'
+          AND k.image_key IS NOT NULL AND k.tag_status = 'tagged'
+          AND k.tags_confirmed_at IS NULL)
+    THEN COALESCE(a.tags_confirmed_at, now()) END,
+    updated_at = now()
 WHERE a.status = 'key_images_extracted'
   AND EXISTS (
       SELECT 1 FROM frl.frl_movie_key_images k
@@ -583,6 +599,44 @@ WHERE a.status = 'key_images_extracted'
 
             await using var cmd = new NpgsqlCommand(sql, connection);
             return await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        /// <summary>
+        /// Settle a movie's stage against its ticks: tags_confirmed once every
+        /// read frame has been stood by, back to ai_tags_read the moment one
+        /// tick is taken away. A frame the tagger could not read is not waited
+        /// on, matching how the movie reached the AI tags stage in the first
+        /// place. Returns the stage the movie is left on, or null if it has no
+        /// assignment row.
+        /// </summary>
+        public static async Task<string?> SettleConfirmedStageAsync(
+            NpgsqlConnection connection, int movieId, CancellationToken ct)
+        {
+            const string sql = @"
+WITH frames AS (
+    SELECT COUNT(*) FILTER (WHERE tag_status = 'tagged')          AS read_frames,
+           COUNT(*) FILTER (WHERE tag_status = 'tagged'
+                              AND tags_confirmed_at IS NOT NULL)  AS confirmed,
+           COUNT(*) FILTER (WHERE tag_status IS NULL
+                              OR tag_status IN ('pending', 'running')) AS waiting
+    FROM frl.frl_movie_key_images
+    WHERE movie_id = @movieId AND decision = 'kept' AND image_key IS NOT NULL
+)
+UPDATE frl.frl_movie_tagger_assignments a
+SET status = CASE WHEN f.done THEN 'tags_confirmed' ELSE 'ai_tags_read' END,
+    tags_confirmed_at = CASE WHEN f.done
+        THEN COALESCE(a.tags_confirmed_at, now()) END,
+    ai_tags_at = COALESCE(a.ai_tags_at, now()),
+    updated_at = now()
+FROM (SELECT read_frames > 0 AND waiting = 0 AND confirmed = read_frames AS done
+      FROM frames) f
+WHERE a.movie_id = @movieId
+  AND a.status IN ('ai_tags_read', 'tags_confirmed')
+RETURNING a.status;";
+
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            return await cmd.ExecuteScalarAsync(ct) as string;
         }
 
         /// <summary>The movie a key image belongs to, for the allocation check.</summary>
