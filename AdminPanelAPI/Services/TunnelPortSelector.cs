@@ -10,8 +10,13 @@ using Npgsql;
 /// second cannot bind ("Only one usage of each socket address is normally
 /// permitted") and has no route to Postgres. Rather than requiring a distinct
 /// port per slot in App Settings, keep the configured port when it is free and
-/// fall back to any free port, rewriting the connection string to match so
-/// every consumer of <c>ConnectionStrings:Default</c> follows the tunnel.
+/// fall back to any free port.
+/// </para>
+/// <para>
+/// A loopback <c>ConnectionStrings:Default</c> is then pointed at whichever port
+/// the tunnel forwards from, so the two cannot disagree: a bind port set by hand
+/// without the connection string being edited to match would otherwise leave
+/// every query dialling a port nothing listens on.
 /// </para>
 /// </summary>
 public static class TunnelPortSelector
@@ -33,17 +38,36 @@ public static class TunnelPortSelector
         if (!IPAddress.TryParse(bindHost, out var bindAddress))
             return;
 
-        if (IsFree(bindAddress, configuredPort))
+        var port = configuredPort;
+
+        if (!IsFree(bindAddress, configuredPort))
+        {
+            var free = FindFreePort(bindAddress);
+            if (free is null)
+                return;
+
+            port = free.Value;
+            configuration["SshTunnel:LocalBindPort"] = port.ToString();
+        }
+
+        var builder = new NpgsqlConnectionStringBuilder(connStr);
+
+        if (!IsLoopback(builder.Host) || builder.Port == port)
             return;
 
-        var port = FindFreePort(bindAddress);
-        if (port is null || port == configuredPort)
-            return;
-
-        var builder = new NpgsqlConnectionStringBuilder(connStr) { Port = port.Value };
-
-        configuration["SshTunnel:LocalBindPort"] = port.Value.ToString();
+        builder.Port = port;
         configuration["ConnectionStrings:Default"] = builder.ConnectionString;
+    }
+
+    private static bool IsLoopback(string? host)
+    {
+        if (string.IsNullOrWhiteSpace(host))
+            return false;
+
+        if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return IPAddress.TryParse(host, out var address) && IPAddress.IsLoopback(address);
     }
 
     private static bool IsFree(IPAddress address, int port)
