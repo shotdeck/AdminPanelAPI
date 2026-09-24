@@ -1070,6 +1070,10 @@ WHERE id = @id;";
         /// that way, which is how the walkthrough's frames and the plot's are
         /// compared; runs always reports what each way of judging has waiting,
         /// so the page knows which comparisons it can offer.
+        ///
+        /// decision reads the frames already judged instead of the undecided
+        /// ones, so a tagger can look back over what they kept or threw away
+        /// and change their mind; decisions counts all three either way.
         /// </summary>
         [HttpGet("key-image-proposals")]
         [ProducesResponseType(StatusCodes.Status200OK)]
@@ -1082,6 +1086,7 @@ WHERE id = @id;";
             [FromQuery] double? fromSeconds = null,
             [FromQuery] double? toSeconds = null,
             [FromQuery] string? storyFrom = null,
+            [FromQuery] string? decision = null,
             CancellationToken ct = default)
         {
             await EnsureReadyAsync(ct);
@@ -1091,6 +1096,14 @@ WHERE id = @id;";
                 return BadRequest(new
                 {
                     error = "storyFrom must be walkthrough or description."
+                });
+
+            var wanted = (decision ?? "").Trim().ToLowerInvariant();
+            if (wanted.Length == 0) wanted = "proposed";
+            if (wanted is not ("proposed" or "kept" or "discarded"))
+                return BadRequest(new
+                {
+                    error = "decision must be proposed, kept or discarded."
                 });
 
             const string columns = @"id, position_seconds, frame_number, score, image_key,
@@ -1104,7 +1117,7 @@ WHERE id = @id;";
             var page = @"
 SELECT " + columns + @"
 FROM frl.frl_movie_key_images
-WHERE movie_id = @movieId AND decision = 'proposed'" + window + @"
+WHERE movie_id = @movieId AND decision = @decision" + window + @"
 ORDER BY " + (blend.HasValue
                 ? @"(1 - @blend) * COALESCE(look_score, 0) +
                     @blend * COALESCE(story_score, 0) DESC, position_seconds"
@@ -1119,6 +1132,7 @@ LIMIT @limit OFFSET @offset";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@decision", wanted);
             if (blend.HasValue)
                 cmd.Parameters.AddWithValue("@blend", (decimal)Math.Clamp(blend.Value, 0, 1));
             if (fromSeconds.HasValue)
@@ -1154,33 +1168,94 @@ LIMIT @limit OFFSET @offset";
                 }
             }
 
-            var runs = await RunsAsync(movieId, ct);
+            var runs = await RunsAsync(movieId, wanted, ct);
             var total = run.Length > 0
                 ? runs.TryGetValue(run, out var counted) ? counted : 0
-                : fromSeconds.HasValue || toSeconds.HasValue
-                    ? await KeyImageProposalStore.CountAsync(
-                        _connection, movieId, fromSeconds, toSeconds, ct)
-                    : await CountProposalsAsync(movieId, ct);
+                : await CountDecidedAsync(movieId, wanted, fromSeconds, toSeconds, ct);
 
-            return Ok(new { proposals, total, storyFrom = run.Length == 0 ? null : run, runs });
+            return Ok(new
+            {
+                proposals,
+                total,
+                storyFrom = run.Length == 0 ? null : run,
+                runs,
+                decision = wanted,
+                decisions = await DecisionCountsAsync(movieId, ct)
+            });
         }
 
         /// <summary>
-        /// What each way of judging the story half has waiting on this movie,
-        /// so the page can offer one run against the other. Frames from before
-        /// a run recorded how it judged are counted as "unknown".
+        /// How many of the movie's frames sit at each decision, so the page can
+        /// label its undecided, kept and discarded tabs without reading each.
         /// </summary>
-        private async Task<Dictionary<string, int>> RunsAsync(
+        private async Task<Dictionary<string, int>> DecisionCountsAsync(
             int movieId, CancellationToken ct)
         {
             const string sql = @"
-SELECT COALESCE(story_from, 'unknown'), count(*)
+SELECT decision, count(*)
 FROM frl.frl_movie_key_images
-WHERE movie_id = @movieId AND decision = 'proposed' AND source = 'ai'
+WHERE movie_id = @movieId
 GROUP BY 1;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
+
+            var counts = new Dictionary<string, int>
+            {
+                ["proposed"] = 0,
+                ["kept"] = 0,
+                ["discarded"] = 0
+            };
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                counts[reader.GetString(0)] = (int)reader.GetInt64(1);
+            return counts;
+        }
+
+        /// <summary>
+        /// The frames at one decision, optionally over a stretch of the film.
+        /// </summary>
+        private async Task<int> CountDecidedAsync(
+            int movieId,
+            string decision,
+            double? fromSeconds,
+            double? toSeconds,
+            CancellationToken ct)
+        {
+            var sql = @"
+SELECT count(*) FROM frl.frl_movie_key_images
+WHERE movie_id = @movieId AND decision = @decision" +
+                (fromSeconds.HasValue ? " AND position_seconds >= @fromSeconds" : "") +
+                (toSeconds.HasValue ? " AND position_seconds <= @toSeconds" : "") + ";";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@decision", decision);
+            if (fromSeconds.HasValue)
+                cmd.Parameters.AddWithValue("@fromSeconds", (decimal)fromSeconds.Value);
+            if (toSeconds.HasValue)
+                cmd.Parameters.AddWithValue("@toSeconds", (decimal)toSeconds.Value);
+            return (int)(long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
+        }
+
+        /// <summary>
+        /// What each way of judging the story half holds on this movie at the
+        /// decision being read, so the page can offer one run against the
+        /// other. Frames from before a run recorded how it judged are counted
+        /// as "unknown".
+        /// </summary>
+        private async Task<Dictionary<string, int>> RunsAsync(
+            int movieId, string decision, CancellationToken ct)
+        {
+            const string sql = @"
+SELECT COALESCE(story_from, 'unknown'), count(*)
+FROM frl.frl_movie_key_images
+WHERE movie_id = @movieId AND decision = @decision AND source = 'ai'
+GROUP BY 1;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@decision", decision);
 
             var runs = new Dictionary<string, int>();
             await using var reader = await cmd.ExecuteReaderAsync(ct);
