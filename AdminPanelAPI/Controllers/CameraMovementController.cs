@@ -2191,10 +2191,12 @@ WHERE job_id = @jobId;";
         // Parent movement -> more specific "sub" variants. When a parent tag is
         // QC-confirmed (status 'ok'), each sub is queued as 'not_checked' so a
         // reviewer can decide whether the clip is actually the niche variant.
+        // Dolly zoom is cross-mapped on purpose: a dolly zoom *out* looks like a
+        // zoom in (lens zooms in while the camera pulls back), and vice versa.
         private static readonly Dictionary<string, string[]> SubMovements = new()
         {
-            ["zoom_in"]   = new[] { "crash_zoom_in", "dolly_zoom_in" },
-            ["zoom_out"]  = new[] { "crash_zoom_out", "dolly_zoom_out" },
+            ["zoom_in"]   = new[] { "crash_zoom_in", "dolly_zoom_out" },
+            ["zoom_out"]  = new[] { "crash_zoom_out", "dolly_zoom_in" },
             ["dolly_in"]  = new[] { "push_in", "following" },
             ["dolly_out"] = new[] { "pull_out", "leading" },
             ["pan_left"]  = new[] { "whip_pan_left" },
