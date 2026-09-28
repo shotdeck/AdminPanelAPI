@@ -1250,6 +1250,8 @@ LIMIT 1;";
             [FromQuery] double? maxLen = null,
             [FromQuery] string? owner = null,
             [FromQuery] int? movieId = null,
+            [FromQuery] double? minConf = null,
+            [FromQuery] double? maxConf = null,
             CancellationToken ct = default)
         {
             if (page < 1) page = 1;
@@ -1268,6 +1270,10 @@ LIMIT 1;";
             var whereClauses = new List<string> { "cm.camera_movements = @movement" };
             if (!string.IsNullOrWhiteSpace(status))
                 whereClauses.Add("cm.status = @status");
+            if (minConf.HasValue)
+                whereClauses.Add("cm.confidence >= @minConf");
+            if (maxConf.HasValue)
+                whereClauses.Add("cm.confidence <= @maxConf");
             if (cutActive)
                 whereClauses.AddRange(CutLengthWhere(minLen, maxLen));
             if (ownerActive)
@@ -1297,6 +1303,8 @@ WHERE {whereStr};";
             AddCutLengthParams(countCmd, minLen, maxLen);
             if (ownerActive) countCmd.Parameters.AddWithValue("@owner", owner!.Trim());
             if (movieActive) countCmd.Parameters.AddWithValue("@movieId", movieId!.Value);
+            if (minConf.HasValue) countCmd.Parameters.AddWithValue("@minConf", (float)minConf.Value);
+            if (maxConf.HasValue) countCmd.Parameters.AddWithValue("@maxConf", (float)maxConf.Value);
 
             var totalCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(ct));
 
@@ -1331,6 +1339,8 @@ LIMIT @limit OFFSET @offset;";
             AddCutLengthParams(cmd, minLen, maxLen);
             if (ownerActive) cmd.Parameters.AddWithValue("@owner", owner!.Trim());
             if (movieActive) cmd.Parameters.AddWithValue("@movieId", movieId!.Value);
+            if (minConf.HasValue) cmd.Parameters.AddWithValue("@minConf", (float)minConf.Value);
+            if (maxConf.HasValue) cmd.Parameters.AddWithValue("@maxConf", (float)maxConf.Value);
             cmd.Parameters.AddWithValue("@limit", pageSize);
             cmd.Parameters.AddWithValue("@offset", offset);
 
