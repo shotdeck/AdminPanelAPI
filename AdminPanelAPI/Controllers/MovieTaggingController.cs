@@ -553,7 +553,7 @@ ORDER BY position_seconds;";
 INSERT INTO frl.frl_movie_key_images
     (movie_id, position_seconds, frame_number, thumbnail, captured_by)
 VALUES (@movieId, @position, @frame, @thumbnail, @actingUser)
-ON CONFLICT (movie_id, position_seconds) DO UPDATE
+ON CONFLICT (movie_id, position_seconds, COALESCE(story_from, '')) DO UPDATE
     SET thumbnail = COALESCE(EXCLUDED.thumbnail, frl.frl_movie_key_images.thumbnail),
         frame_number = COALESCE(EXCLUDED.frame_number, frl.frl_movie_key_images.frame_number),
         captured_by = EXCLUDED.captured_by,
