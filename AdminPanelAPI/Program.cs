@@ -147,10 +147,19 @@ app.UseExceptionHandler(errors => errors.Run(async context =>
     context.Response.StatusCode = StatusCodes.Status500InternalServerError;
     context.Response.ContentType = "application/json";
     context.Response.Headers["Access-Control-Allow-Origin"] = "*";
+    /* What went wrong is logged rather than answered: the API takes any
+     * origin, so a database or storage message would be readable by anyone. */
     var failure = context.Features.Get<IExceptionHandlerFeature>()?.Error;
+    if (failure != null)
+        context.RequestServices
+            .GetRequiredService<ILoggerFactory>()
+            .CreateLogger("UnhandledError")
+            .LogError(failure, "{Method} {Path} failed.",
+                context.Request.Method, context.Request.Path);
+
     await context.Response.WriteAsJsonAsync(new
     {
-        error = failure?.Message ?? "The request failed."
+        error = "The request failed. Please try again."
     });
 }));
 
