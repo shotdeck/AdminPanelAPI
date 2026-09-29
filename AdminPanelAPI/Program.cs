@@ -1,4 +1,5 @@
 using AdminPanelAPI.Services;
+using Microsoft.AspNetCore.Diagnostics;
 using Npgsql;
 using ShotDeck.Keywords;
 
@@ -136,6 +137,22 @@ builder.Services.AddCors(opt =>
 var app = builder.Build();
 
 app.UseCors("AllowAll");
+
+/* An unhandled exception resets the response, taking the CORS headers with it,
+ * so the browser sees a failed request rather than a 500 and the page can only
+ * say the server did not answer. Writing the error here keeps the headers and
+ * gives the page something to show. */
+app.UseExceptionHandler(errors => errors.Run(async context =>
+{
+    context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+    context.Response.ContentType = "application/json";
+    context.Response.Headers["Access-Control-Allow-Origin"] = "*";
+    var failure = context.Features.Get<IExceptionHandlerFeature>()?.Error;
+    await context.Response.WriteAsJsonAsync(new
+    {
+        error = failure?.Message ?? "The request failed."
+    });
+}));
 
 app.UseStaticFiles();
 app.UseSwagger();
