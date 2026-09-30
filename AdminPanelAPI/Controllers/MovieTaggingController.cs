@@ -76,6 +76,7 @@ namespace ShotDeckSearch.Controllers
         private readonly IFilmSynopsisService _synopsis;
         private readonly IWalkthroughService _walkthrough;
         private readonly IImageTechnicalTagService _imageTags;
+        private readonly IKeyImageStillService _stills;
         private readonly ILogger<MovieTaggingController> _logger;
 
         public MovieTaggingController(
@@ -85,6 +86,7 @@ namespace ShotDeckSearch.Controllers
             IFilmSynopsisService synopsis,
             IWalkthroughService walkthrough,
             IImageTechnicalTagService imageTags,
+            IKeyImageStillService stills,
             ILogger<MovieTaggingController> logger)
         {
             _connection = connection;
@@ -93,6 +95,7 @@ namespace ShotDeckSearch.Controllers
             _synopsis = synopsis;
             _walkthrough = walkthrough;
             _imageTags = imageTags;
+            _stills = stills;
             _logger = logger;
         }
 
@@ -579,25 +582,11 @@ RETURNING id, created_at;";
 
             await MarkKeyImagesExtractedAsync(request.MovieId, ct);
 
-            // The frame's picture goes into R2 now, while it is being picked,
-            // rather than the first time somebody opens it: the tagger is
-            // already waiting on this click, and the terms cannot be read off a
-            // frame that has no picture there.
-            string? pictureKey = null;
-            try
-            {
-                pictureKey = await CutKeyImagePictureAsync(
-                    capturedId, request.MovieId, request.FrameNumber,
-                    request.PositionSeconds, ct);
-            }
-            catch (Exception ex)
-            {
-                // A picked frame is worth keeping even if the cut fails; the
-                // still endpoint tries again when it is opened.
-                _logger.LogWarning(
-                    ex, "Cutting the picture of key image {Id} failed.", capturedId);
-            }
-
+            // The frame's picture is cut off the proxy by KeyImageStillWorker
+            // within seconds rather than here: the cut runs on Modal and takes
+            // as long as the rest of this request put together, which is the
+            // whole of the wait on the tagger's click. Until it lands the
+            // browser shows the preview it captured itself.
             return Ok(new
             {
                 id = capturedId,
@@ -606,9 +595,7 @@ RETURNING id, created_at;";
                 frameNumber = request.FrameNumber,
                 capturedBy = actingUser,
                 createdAt = capturedAt,
-                imageUrl = pictureKey == null
-                    ? null
-                    : _storage.CreateDownloadUrl(pictureKey, false)
+                imageUrl = (string?)null
             });
         }
 
@@ -661,7 +648,7 @@ WHERE id = @id;";
             string? pictureKey;
             try
             {
-                pictureKey = await CutKeyImagePictureAsync(
+                pictureKey = await _stills.CutAsync(
                     id, movieId, frameNumber, positionSeconds, ct);
             }
             catch (InvalidOperationException ex)
@@ -678,68 +665,6 @@ WHERE id = @id;";
                 imageUrl = _storage.CreateDownloadUrl(pictureKey, false),
                 cut = true
             });
-        }
-
-        /// <summary>
-        /// Cut one frame out of the movie into R2 and hang it on the key image's
-        /// row, so the frame has a picture of its own to be shown and read. Null
-        /// if the movie has no video to cut from; anything the cutting service
-        /// itself refuses is thrown.
-        /// </summary>
-        private async Task<string?> CutKeyImagePictureAsync(
-            long id,
-            int movieId,
-            int? frameNumber,
-            double positionSeconds,
-            CancellationToken ct)
-        {
-            var variants = await _storage.GetMovieVariantsAsync(new[] { movieId }, ct);
-            var variant = variants.FirstOrDefault();
-            var sourceKey = variant?.SlimKey ?? variant?.HdKey;
-            if (string.IsNullOrWhiteSpace(sourceKey))
-                return null;
-
-            // A frame number counts the master's frames, so it only means the
-            // same thing on the file it was read off. Against the proxy it is
-            // the position in seconds that holds.
-            var fromProxy = variant?.SlimKey != null;
-            var askFrame = fromProxy ? null : frameNumber;
-            var result = await _analysis.CutStillAsync(
-                sourceKey, askFrame, askFrame.HasValue ? null : positionSeconds, ct);
-            if (!result.IsSuccess)
-                throw new InvalidOperationException(result.Body);
-
-            using var document = JsonDocument.Parse(result.Body);
-            if (!document.RootElement.TryGetProperty("imageKey", out var cutKey) ||
-                cutKey.GetString() is not { Length: > 0 } pictureKey)
-                throw new InvalidOperationException("The still service returned no image.");
-
-            // Only a cut off the master counts the frames the row means, so a
-            // proxy's own frame number is not written over it.
-            var cutFrame = !fromProxy &&
-                document.RootElement.TryGetProperty("frame", out var frame) &&
-                frame.TryGetInt32(out var number)
-                ? number
-                : frameNumber;
-
-            const string saveSql = @"
-UPDATE frl.frl_movie_key_images
-SET image_key = @imageKey,
-    frame_number = COALESCE(@frame, frame_number)
-WHERE id = @id;";
-            await using (var save = new NpgsqlCommand(saveSql, _connection))
-            {
-                save.Parameters.AddWithValue("@imageKey", pictureKey);
-                save.Parameters.AddWithValue("@frame", (object?)cutFrame ?? DBNull.Value);
-                save.Parameters.AddWithValue("@id", id);
-                await save.ExecuteNonQueryAsync(ct);
-            }
-
-            // A frame picked while watching only gets a picture in R2 here, so
-            // this is the first moment its terms can be read.
-            await KeyImageTagStore.QueueOneAsync(_connection, id, ct);
-
-            return pictureKey;
         }
 
         /// <summary>Drop a frame the tagger picked by mistake.</summary>

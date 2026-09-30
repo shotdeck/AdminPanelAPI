@@ -112,6 +112,11 @@ builder.Services.AddHostedService<MoviePreparationWorker>();
 // when the tagger opens an image rather than fetched while they wait.
 builder.Services.AddHostedService<KeyImageTagWorker>();
 
+// Cuts the picture of a frame picked while watching just after it is picked,
+// rather than making the tagger wait on the cut as they pick.
+builder.Services.AddScoped<IKeyImageStillService, KeyImageStillService>();
+builder.Services.AddHostedService<KeyImageStillWorker>();
+
 // Camera-movement QC: shared analysis pipeline plus a worker that keeps a bank
 // of pre-analysed images so a reviewer's fetch is an instant assignment.
 builder.Services.AddScoped<CameraMovementAnalysisService>();
