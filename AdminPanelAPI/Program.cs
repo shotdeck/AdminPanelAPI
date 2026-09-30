@@ -121,6 +121,7 @@ builder.Services.AddHostedService<KeyImageStillWorker>();
 // of pre-analysed images so a reviewer's fetch is an instant assignment.
 builder.Services.AddScoped<CameraMovementAnalysisService>();
 builder.Services.AddHostedService<CameraMovementBankWorker>();
+builder.Services.AddHostedService<CameraMovementMovieFetchWorker>();
 
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();
