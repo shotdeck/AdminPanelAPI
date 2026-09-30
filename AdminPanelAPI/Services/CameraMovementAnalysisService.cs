@@ -103,7 +103,24 @@ CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_bank (
     media_type   VARCHAR(60)  NOT NULL,
     analyzed_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_cmb_media_type ON frl.frl_camera_movement_bank (media_type);";
+CREATE INDEX IF NOT EXISTS idx_cmb_media_type ON frl.frl_camera_movement_bank (media_type);
+CREATE TABLE IF NOT EXISTS frl.frl_camera_movement_movie_jobs (
+    id            SERIAL       PRIMARY KEY,
+    movie_id      INTEGER      NOT NULL,
+    owner         VARCHAR(120) NOT NULL,
+    requested_by  VARCHAR(120) NOT NULL,
+    claim_id      UUID         NOT NULL,
+    status        VARCHAR(20)  NOT NULL DEFAULT 'queued',
+    assigned      INTEGER      NOT NULL DEFAULT 0,
+    to_analyze    INTEGER      NOT NULL DEFAULT 0,
+    processed     INTEGER      NOT NULL DEFAULT 0,
+    failed        INTEGER      NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    started_at    TIMESTAMPTZ,
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    finished_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_cmmj_status ON frl.frl_camera_movement_movie_jobs (status);";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
             _tablesReady = true;
@@ -239,22 +256,25 @@ ON CONFLICT (imageid) DO NOTHING;";
         /// fetch and the bank worker, or two fetches) never grab the same images.
         /// </summary>
         public async Task<List<AnalyzeItem>> ClaimImagesAsync(
-            Guid jobId, int limit, string? mediaType, CancellationToken ct)
+            Guid jobId, int limit, string? mediaType, CancellationToken ct, int? movieId = null)
         {
             // Media-type filter. A specific type selects only that type; "all"
             // (or null/empty) selects every type except trailers, which are
             // never fetched. Values come straight from frl_movies.media_type
             // (see the media-types endpoint), so match them case-insensitively.
-            var isAll = IsAllMediaTypes(mediaType);
+            // A movie fetch takes every image of that title, whatever its type.
+            var isAll = movieId.HasValue || IsAllMediaTypes(mediaType);
             string? exactMediaType = null;
             if (!isAll)
             {
                 exactMediaType = await ResolveMediaTypeAsync(mediaType!, ct);
                 if (exactMediaType == null) return new List<AnalyzeItem>();
             }
-            var mediaClause = isAll
-                ? " AND (m.media_type IS NULL OR lower(m.media_type::text) <> 'trailer')"
-                : $" AND m.media_type = CAST(@mediaType AS {await GetMediaTypeSqlTypeAsync(ct)})";
+            var mediaClause = movieId.HasValue
+                ? " AND i.movieid = @movieId"
+                : isAll
+                    ? " AND (m.media_type IS NULL OR lower(m.media_type::text) <> 'trailer')"
+                    : $" AND m.media_type = CAST(@mediaType AS {await GetMediaTypeSqlTypeAsync(ct)})";
 
             var sql = $@"
 WITH candidates AS (
@@ -298,7 +318,9 @@ WHERE idnum IN (SELECT imageid FROM claimed);";
             await using var cmd = new NpgsqlCommand(sql, _connection) { CommandTimeout = ClaimTimeoutSeconds };
             cmd.Parameters.AddWithValue("@limit", limit);
             cmd.Parameters.AddWithValue("@jobId", jobId);
-            if (!isAll)
+            if (movieId.HasValue)
+                cmd.Parameters.AddWithValue("@movieId", movieId.Value);
+            else if (!isAll)
                 cmd.Parameters.AddWithValue("@mediaType", exactMediaType!);
 
             var images = new List<AnalyzeItem>();
@@ -325,6 +347,149 @@ WHERE idnum IN (SELECT imageid FROM claimed);";
 DELETE FROM frl.frl_camera_movement_claims WHERE imageid = ANY(@ids);";
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@ids", imageIds.ToArray());
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        // ── Movie fetch jobs ──────────────────────────────────────────
+
+        public const string MovieJobActiveSql = "status IN ('queued', 'running')";
+
+        /// <summary>
+        /// Live images of a title that still need analysing (have a clip, not
+        /// yet analysed, not parked after repeated failures).
+        /// </summary>
+        public async Task<int> CountMovieRemainingAsync(int movieId, CancellationToken ct)
+        {
+            var sql = $@"
+SELECT count(*)::int
+FROM frl.frl_images i
+INNER JOIN frl.frl_image_scene_boundaries sb
+    ON sb.movieid = i.movieid AND sb.filename = i.randid
+WHERE i.movieid = @movieId
+  AND i.status = 'live'
+  AND NOT EXISTS (
+      SELECT 1 FROM frl.frl_join_images_camera_movements cm
+      WHERE cm.imageid = i.idnum)
+  AND NOT EXISTS (
+      SELECT 1 FROM frl.frl_camera_movement_failures f
+      WHERE f.imageid = i.idnum
+        AND f.attempts >= {MaxFailedAttempts});";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            return (int)(await cmd.ExecuteScalarAsync(ct) ?? 0);
+        }
+
+        /// <summary>
+        /// Give a reviewer every already-analysed image of a title that nobody
+        /// owns yet (including any sitting in the bank). Images other
+        /// reviewers already own are left alone.
+        /// </summary>
+        public async Task<int> AssignAnalyzedMovieImagesAsync(int movieId, string owner, CancellationToken ct)
+        {
+            const string sql = @"
+WITH unowned AS (
+    SELECT i.idnum AS imageid
+    FROM frl.frl_images i
+    WHERE i.movieid = @movieId
+      AND i.status = 'live'
+      AND EXISTS (
+          SELECT 1 FROM frl.frl_join_images_camera_movements cm
+          WHERE cm.imageid = i.idnum)
+      AND NOT EXISTS (
+          SELECT 1 FROM frl.frl_camera_movement_image_owner o
+          WHERE o.imageid = i.idnum)
+),
+unbanked AS (
+    DELETE FROM frl.frl_camera_movement_bank b
+    USING unowned u
+    WHERE b.imageid = u.imageid
+)
+INSERT INTO frl.frl_camera_movement_image_owner (imageid, owner)
+SELECT imageid, @owner FROM unowned
+ON CONFLICT (imageid) DO NOTHING;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@owner", owner.Trim());
+            return await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        public async Task<bool> HasActiveMovieJobsAsync(CancellationToken ct)
+        {
+            var sql = $"SELECT 1 FROM frl.frl_camera_movement_movie_jobs WHERE {MovieJobActiveSql} LIMIT 1;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            return await cmd.ExecuteScalarAsync(ct) != null;
+        }
+
+        /// <summary>The oldest queued or running movie job; jobs run one at a time.</summary>
+        public async Task<MovieJobWork?> NextMovieJobAsync(CancellationToken ct)
+        {
+            var sql = $@"
+SELECT id, movie_id, owner, claim_id, status
+FROM frl.frl_camera_movement_movie_jobs
+WHERE {MovieJobActiveSql}
+ORDER BY created_at, id
+LIMIT 1;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct)) return null;
+            return new MovieJobWork
+            {
+                Id = reader.GetInt32(0),
+                MovieId = reader.GetInt32(1),
+                Owner = reader.GetString(2),
+                ClaimId = reader.GetGuid(3),
+                Status = reader.GetString(4),
+            };
+        }
+
+        public async Task MarkMovieJobRunningAsync(int jobId, CancellationToken ct)
+        {
+            const string sql = @"
+UPDATE frl.frl_camera_movement_movie_jobs
+SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
+WHERE id = @id AND status = 'queued';";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@id", jobId);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        public async Task RecordMovieJobProgressAsync(int jobId, int processed, int failed, CancellationToken ct)
+        {
+            const string sql = @"
+UPDATE frl.frl_camera_movement_movie_jobs
+SET processed = processed + @processed, failed = failed + @failed, updated_at = now()
+WHERE id = @id;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@id", jobId);
+            cmd.Parameters.AddWithValue("@processed", processed);
+            cmd.Parameters.AddWithValue("@failed", failed);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        public async Task FinishMovieJobAsync(int jobId, int lateAssigned, CancellationToken ct)
+        {
+            const string sql = @"
+UPDATE frl.frl_camera_movement_movie_jobs
+SET status = 'done', assigned = assigned + @late, finished_at = now(), updated_at = now()
+WHERE id = @id AND status IN ('queued', 'running');";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@id", jobId);
+            cmd.Parameters.AddWithValue("@late", lateAssigned);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        /// <summary>
+        /// Drop claims left behind by movie jobs whose batch was interrupted
+        /// (e.g. by a redeploy), so the job can pick those images up again
+        /// straight away instead of waiting out the claim TTL.
+        /// </summary>
+        public async Task ReleaseMovieJobClaimsAsync(CancellationToken ct)
+        {
+            var sql = $@"
+DELETE FROM frl.frl_camera_movement_claims c
+USING frl.frl_camera_movement_movie_jobs j
+WHERE c.job_id = j.claim_id AND j.{MovieJobActiveSql};";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
         }
 
@@ -633,6 +798,15 @@ ON CONFLICT (imageid) DO UPDATE SET owner = EXCLUDED.owner, assigned_at = now();
         }
 
         // ── Types ─────────────────────────────────────────────────────
+
+        public sealed class MovieJobWork
+        {
+            public int Id { get; set; }
+            public int MovieId { get; set; }
+            public string Owner { get; set; } = "";
+            public Guid ClaimId { get; set; }
+            public string Status { get; set; } = "";
+        }
 
         public sealed class AnalyzeItem
         {

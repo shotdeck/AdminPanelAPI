@@ -30,6 +30,9 @@ namespace AdminPanelAPI.Services
         /// <summary>How long to wait between sweeps once every bank is full.</summary>
         private static readonly TimeSpan IdleDelay = TimeSpan.FromMinutes(1);
 
+        /// <summary>How often to re-check while Fetch Movie jobs have priority.</summary>
+        private static readonly TimeSpan MovieJobYieldDelay = TimeSpan.FromSeconds(15);
+
         /// <summary>
         /// How long to stand down when the analysis API looks to be down. Every
         /// failed attempt counts towards an image being parked, so a whole
@@ -115,6 +118,10 @@ namespace AdminPanelAPI.Services
                     _logger.LogWarning("Camera-movement bank: R2 settings missing; not banking.");
                     return OutageDelay;
                 }
+
+                // A reviewer is waiting on a Fetch Movie job; give it the GPU.
+                if (await svc.HasActiveMovieJobsAsync(ct))
+                    return MovieJobYieldDelay;
 
                 mediaTypes = await svc.GetMediaTypesAsync(ct);
                 counts = await svc.GetBankCountsAsync(ct);

@@ -1236,6 +1236,269 @@ LIMIT 1;";
             return result is bool b && b;
         }
 
+        // ── Fetch Movie: analyse a whole title for one reviewer ────────
+        // Used when a job has no observed rate yet (includes GPU cold start).
+        private const double DefaultMovieSecondsPerImage = 4.0;
+
+        // GET /api/admin/camera-movements/movie-fetch/search?q=
+        // Titles matching q, with how much of each is already analysed.
+        [HttpGet("movie-fetch/search")]
+        [ProducesResponseType(typeof(List<MovieFetchCandidate>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<List<MovieFetchCandidate>>> SearchMovieFetch(
+            [FromQuery] string? q = null,
+            CancellationToken ct = default)
+        {
+            var term = (q ?? "").Trim();
+            if (term.Length < 2) return Ok(new List<MovieFetchCandidate>());
+
+            await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            await _analysis.EnsureTablesAsync(ct);
+
+            var sql = $@"
+WITH matches AS (
+    SELECT m.idnum, COALESCE(m.title, '') AS title, m.year, m.media_type::text AS media_type
+    FROM frl.frl_movies m
+    WHERE m.title ILIKE '%' || @q || '%'
+      AND (m.media_type IS NULL OR lower(m.media_type::text) <> 'trailer')
+    ORDER BY (lower(m.title) = lower(@q)) DESC,
+             (m.title ILIKE @q || '%') DESC,
+             m.title, m.year
+    LIMIT 20
+)
+SELECT mt.idnum, mt.title, mt.year, mt.media_type,
+       c.total, c.analyzed, c.unassigned, c.remaining
+FROM matches mt
+CROSS JOIN LATERAL (
+    SELECT count(*)::int AS total,
+           count(*) FILTER (WHERE x.analyzed)::int AS analyzed,
+           count(*) FILTER (WHERE x.analyzed AND NOT x.owned)::int AS unassigned,
+           count(*) FILTER (WHERE NOT x.analyzed AND NOT x.parked)::int AS remaining
+    FROM (
+        SELECT EXISTS (SELECT 1 FROM frl.frl_join_images_camera_movements cm
+                       WHERE cm.imageid = i.idnum) AS analyzed,
+               EXISTS (SELECT 1 FROM frl.frl_camera_movement_image_owner o
+                       WHERE o.imageid = i.idnum) AS owned,
+               EXISTS (SELECT 1 FROM frl.frl_camera_movement_failures f
+                       WHERE f.imageid = i.idnum AND f.attempts >= {MaxFailedAttempts}) AS parked
+        FROM frl.frl_images i
+        INNER JOIN frl.frl_image_scene_boundaries sb
+            ON sb.movieid = i.movieid AND sb.filename = i.randid
+        WHERE i.movieid = mt.idnum AND i.status = 'live'
+    ) x
+) c
+WHERE c.total > 0
+ORDER BY (lower(mt.title) = lower(@q)) DESC, (mt.title ILIKE @q || '%') DESC, mt.title, mt.year;";
+
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@q", term);
+            var list = new List<MovieFetchCandidate>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                list.Add(new MovieFetchCandidate
+                {
+                    MovieId = reader.GetInt32(0),
+                    Title = reader.GetString(1),
+                    Year = reader.IsDBNull(2) ? null : Convert.ToInt32(reader.GetValue(2)),
+                    MediaType = reader.IsDBNull(3) ? null : reader.GetString(3),
+                    Total = reader.GetInt32(4),
+                    Analyzed = reader.GetInt32(5),
+                    Unassigned = reader.GetInt32(6),
+                    Remaining = reader.GetInt32(7),
+                });
+            }
+            return Ok(list);
+        }
+
+        // POST /api/admin/camera-movements/movie-fetch
+        // Assigns a title's already-analysed, unowned images to the reviewer
+        // straight away and queues the rest for server-side analysis. A
+        // non-admin may only fetch for themselves.
+        [HttpPost("movie-fetch")]
+        [ProducesResponseType(typeof(MovieFetchJob), StatusCodes.Status200OK)]
+        public async Task<ActionResult<MovieFetchJob>> StartMovieFetch(
+            [FromBody] MovieFetchRequest request,
+            CancellationToken ct = default)
+        {
+            if (request.MovieId <= 0)
+                return BadRequest(new { error = "movieId is required." });
+            var actingUser = (request.ActingUser ?? "").Trim();
+            var owner = (request.Owner ?? "").Trim();
+            if (owner.Length == 0) owner = actingUser;
+
+            await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            await _analysis.EnsureTablesAsync(ct);
+
+            if (!await UserExistsAsync(actingUser, ct))
+                return BadRequest(new { error = "actingUser must be a known reviewer." });
+            if (!await UserExistsAsync(owner, ct))
+                return BadRequest(new { error = $"Unknown reviewer '{owner}'." });
+            if (!string.Equals(owner, actingUser, StringComparison.OrdinalIgnoreCase)
+                && !await IsAdminAsync(actingUser, ct))
+                return StatusCode(403, new { error = "Only an admin can fetch a title for another reviewer." });
+
+            // Store the roster's spelling of the name so owner filters match.
+            const string nameSql = "SELECT name FROM frl.frl_camera_movement_users WHERE lower(name) = lower(@name) LIMIT 1;";
+            await using (var nameCmd = new NpgsqlCommand(nameSql, _connection))
+            {
+                nameCmd.Parameters.AddWithValue("@name", owner);
+                owner = (string?)await nameCmd.ExecuteScalarAsync(ct) ?? owner;
+            }
+
+            var activeSql = $@"
+SELECT owner FROM frl.frl_camera_movement_movie_jobs
+WHERE movie_id = @movieId AND {CameraMovementAnalysisService.MovieJobActiveSql}
+LIMIT 1;";
+            await using (var activeCmd = new NpgsqlCommand(activeSql, _connection))
+            {
+                activeCmd.Parameters.AddWithValue("@movieId", request.MovieId);
+                if (await activeCmd.ExecuteScalarAsync(ct) is string busyOwner)
+                    return Conflict(new { error = $"This title is already being fetched for {busyOwner}." });
+            }
+
+            var assigned = await _analysis.AssignAnalyzedMovieImagesAsync(request.MovieId, owner, ct);
+            var remaining = await _analysis.CountMovieRemainingAsync(request.MovieId, ct);
+            if (assigned == 0 && remaining == 0)
+                return BadRequest(new { error = "Nothing to fetch: every analysed image of this title is already assigned." });
+
+            const string insertSql = @"
+INSERT INTO frl.frl_camera_movement_movie_jobs
+    (movie_id, owner, requested_by, claim_id, status, assigned, to_analyze, finished_at)
+VALUES
+    (@movieId, @owner, @requestedBy, @claimId, @status, @assigned, @toAnalyze,
+     CASE WHEN @status = 'done' THEN now() END)
+RETURNING id;";
+            int jobId;
+            await using (var insertCmd = new NpgsqlCommand(insertSql, _connection))
+            {
+                insertCmd.Parameters.AddWithValue("@movieId", request.MovieId);
+                insertCmd.Parameters.AddWithValue("@owner", owner);
+                insertCmd.Parameters.AddWithValue("@requestedBy", actingUser);
+                insertCmd.Parameters.AddWithValue("@claimId", Guid.NewGuid());
+                insertCmd.Parameters.AddWithValue("@status", remaining == 0 ? "done" : "queued");
+                insertCmd.Parameters.AddWithValue("@assigned", assigned);
+                insertCmd.Parameters.AddWithValue("@toAnalyze", remaining);
+                jobId = (int)(await insertCmd.ExecuteScalarAsync(ct) ?? 0);
+            }
+
+            var jobs = await LoadMovieFetchJobsAsync(null, ct);
+            return Ok(jobs.First(j => j.Id == jobId));
+        }
+
+        // GET /api/admin/camera-movements/movie-fetch/jobs?owner=
+        // Queued/running jobs (with ETA) plus those finished in the last 7 days.
+        [HttpGet("movie-fetch/jobs")]
+        [ProducesResponseType(typeof(List<MovieFetchJob>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<List<MovieFetchJob>>> GetMovieFetchJobs(
+            [FromQuery] string? owner = null,
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await _analysis.EnsureTablesAsync(ct);
+            return Ok(await LoadMovieFetchJobsAsync(owner, ct));
+        }
+
+        // POST /api/admin/camera-movements/movie-fetch/jobs/{id}/cancel?actingUser=
+        // Stops further analysis. Images analysed so far stay assigned.
+        [HttpPost("movie-fetch/jobs/{id:int}/cancel")]
+        public async Task<IActionResult> CancelMovieFetch(
+            int id,
+            [FromQuery] string? actingUser = null,
+            CancellationToken ct = default)
+        {
+            await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            await _analysis.EnsureTablesAsync(ct);
+
+            if (!await UserExistsAsync(actingUser, ct))
+                return BadRequest(new { error = "actingUser must be a known reviewer." });
+
+            var isAdmin = await IsAdminAsync(actingUser, ct);
+            var sql = $@"
+UPDATE frl.frl_camera_movement_movie_jobs
+SET status = 'cancelled', finished_at = now(), updated_at = now()
+WHERE id = @id AND {CameraMovementAnalysisService.MovieJobActiveSql}
+  AND (@isAdmin OR lower(owner) = lower(@acting) OR lower(requested_by) = lower(@acting));";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@id", id);
+            cmd.Parameters.AddWithValue("@isAdmin", isAdmin);
+            cmd.Parameters.AddWithValue("@acting", actingUser!.Trim());
+            if (await cmd.ExecuteNonQueryAsync(ct) == 0)
+                return NotFound(new { error = "No active fetch you can cancel with that id." });
+            return Ok(new { cancelled = id });
+        }
+
+        private async Task<List<MovieFetchJob>> LoadMovieFetchJobsAsync(string? owner, CancellationToken ct)
+        {
+            var sql = $@"
+SELECT j.id, j.movie_id, COALESCE(m.title, ''), m.year, j.owner, j.requested_by, j.status,
+       j.assigned, j.to_analyze, j.processed, j.failed, j.created_at, j.finished_at,
+       EXTRACT(EPOCH FROM (COALESCE(j.finished_at, now()) - j.created_at))::float8 AS elapsed,
+       EXTRACT(EPOCH FROM (j.updated_at - j.started_at))::float8 AS run_seconds
+FROM frl.frl_camera_movement_movie_jobs j
+LEFT JOIN frl.frl_movies m ON m.idnum = j.movie_id
+WHERE j.{CameraMovementAnalysisService.MovieJobActiveSql}
+   OR j.finished_at > now() - INTERVAL '7 days'
+ORDER BY j.created_at, j.id;";
+
+            var jobs = new List<MovieFetchJob>();
+            var runSeconds = new Dictionary<int, double?>();
+            await using (var cmd = new NpgsqlCommand(sql, _connection))
+            await using (var reader = await cmd.ExecuteReaderAsync(ct))
+            {
+                while (await reader.ReadAsync(ct))
+                {
+                    var job = new MovieFetchJob
+                    {
+                        Id = reader.GetInt32(0),
+                        MovieId = reader.GetInt32(1),
+                        Title = reader.GetString(2),
+                        Year = reader.IsDBNull(3) ? null : Convert.ToInt32(reader.GetValue(3)),
+                        Owner = reader.GetString(4),
+                        RequestedBy = reader.GetString(5),
+                        Status = reader.GetString(6),
+                        Assigned = reader.GetInt32(7),
+                        ToAnalyze = reader.GetInt32(8),
+                        Processed = reader.GetInt32(9),
+                        Failed = reader.GetInt32(10),
+                        CreatedAt = reader.GetDateTime(11),
+                        FinishedAt = reader.IsDBNull(12) ? null : reader.GetDateTime(12),
+                        ElapsedSeconds = (int)Math.Round(reader.GetDouble(13)),
+                    };
+                    runSeconds[job.Id] = reader.IsDBNull(14) ? null : reader.GetDouble(14);
+                    jobs.Add(job);
+                }
+            }
+
+            // Jobs run one at a time, oldest first, so a job's ETA includes
+            // the remaining work of every active job ahead of it.
+            double secondsAhead = 0;
+            var position = 0;
+            foreach (var job in jobs.Where(j => j.Status is "queued" or "running"))
+            {
+                job.QueuePosition = position++;
+                var remaining = await _analysis.CountMovieRemainingAsync(job.MovieId, ct);
+                job.Remaining = remaining;
+                var rate = job.Processed >= 10 && runSeconds[job.Id] is double run && run > 0
+                    ? run / job.Processed
+                    : DefaultMovieSecondsPerImage;
+                secondsAhead += remaining * rate;
+                job.EtaSeconds = (int)Math.Ceiling(secondsAhead);
+            }
+
+            var filtered = string.IsNullOrWhiteSpace(owner) || owner.Trim().Equals("all", StringComparison.OrdinalIgnoreCase)
+                ? jobs
+                : jobs.Where(j => j.Owner.Equals(owner.Trim(), StringComparison.OrdinalIgnoreCase)).ToList();
+
+            // Active first (in run order), then the most recently finished.
+            return filtered
+                .OrderByDescending(j => j.Status is "queued" or "running")
+                .ThenBy(j => j.Status is "queued" or "running" ? j.CreatedAt.Ticks : -(j.FinishedAt ?? j.CreatedAt).Ticks)
+                .ToList();
+        }
+
         // ── GET /api/admin/camera-movements/tags/{movement}/clips ──────
         // Returns clips tagged with a specific movement, with R2 URLs.
         [HttpGet("tags/{movement}/clips")]
@@ -2722,6 +2985,54 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string Name { get; set; } = "";
             public bool IsAdmin { get; set; }
             public bool HasPassword { get; set; }
+        }
+
+        public sealed class MovieFetchCandidate
+        {
+            public int MovieId { get; set; }
+            public string Title { get; set; } = "";
+            public int? Year { get; set; }
+            public string? MediaType { get; set; }
+            // Live images with a clip.
+            public int Total { get; set; }
+            public int Analyzed { get; set; }
+            // Analysed but not yet owned by anyone — assigned instantly on fetch.
+            public int Unassigned { get; set; }
+            // Still to be analysed (excludes images parked after repeated failures).
+            public int Remaining { get; set; }
+        }
+
+        public sealed class MovieFetchRequest
+        {
+            public int MovieId { get; set; }
+            public string? Owner { get; set; }
+            public string? ActingUser { get; set; }
+        }
+
+        public sealed class MovieFetchJob
+        {
+            public int Id { get; set; }
+            public int MovieId { get; set; }
+            public string Title { get; set; } = "";
+            public int? Year { get; set; }
+            public string Owner { get; set; } = "";
+            public string RequestedBy { get; set; } = "";
+            // queued | running | done | cancelled
+            public string Status { get; set; } = "";
+            // Already-analysed images assigned without needing analysis.
+            public int Assigned { get; set; }
+            // Images that needed analysis when the job was queued.
+            public int ToAnalyze { get; set; }
+            public int Processed { get; set; }
+            public int Failed { get; set; }
+            // Active jobs only: images still to analyse, place in the run
+            // queue (0 = running now) and seconds until the title is ready.
+            public int? Remaining { get; set; }
+            public int? QueuePosition { get; set; }
+            public int? EtaSeconds { get; set; }
+            public int ElapsedSeconds { get; set; }
+            public DateTime CreatedAt { get; set; }
+            public DateTime? FinishedAt { get; set; }
         }
 
         public sealed class QcMovie
