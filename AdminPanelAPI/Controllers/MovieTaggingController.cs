@@ -600,6 +600,30 @@ RETURNING id, created_at;";
         }
 
         /// <summary>
+        /// How the background cutting of picked frames' pictures is getting on,
+        /// which the table alone cannot say.
+        /// </summary>
+        [HttpGet("key-images/still-queue")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> KeyImageStillQueue(CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            var waiting = await KeyImageStillService.PendingAsync(_connection, 100, ct);
+            return Ok(new
+            {
+                enabled = KeyImageStillWorker.Progress.Enabled,
+                waiting = waiting.Count,
+                waitingIds = waiting.Select(f => f.Id),
+                passes = KeyImageStillWorker.Progress.Passes,
+                cuts = KeyImageStillWorker.Progress.Cuts,
+                lastPassAt = KeyImageStillWorker.Progress.LastPassAt,
+                lastCutAt = KeyImageStillWorker.Progress.LastCutAt,
+                lastError = KeyImageStillWorker.Progress.LastError
+            });
+        }
+
+        /// <summary>
         /// The kept frame's own picture in R2. A proposal already has one, cut
         /// from the movie's proxy by the analysis; a frame picked while watching
         /// has only the browser's preview, so its picture is cut here and

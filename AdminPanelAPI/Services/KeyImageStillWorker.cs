@@ -34,6 +34,39 @@ namespace AdminPanelAPI.Services
 
         private static readonly ConcurrentDictionary<long, int> Failures = new();
 
+        /// <summary>
+        /// What the worker has been doing, read by the still-queue endpoint: a
+        /// picture in the table does not say whether the worker cut it or a
+        /// tagger's click did, and a pass that dies leaves only a log line.
+        /// </summary>
+        public static class Progress
+        {
+            private static long _passes;
+            private static long _cuts;
+
+            public static long Passes => Interlocked.Read(ref _passes);
+            public static long Cuts => Interlocked.Read(ref _cuts);
+            public static DateTime? LastPassAt { get; private set; }
+            public static DateTime? LastCutAt { get; private set; }
+            public static string? LastError { get; private set; }
+            public static bool Enabled { get; internal set; }
+
+            internal static void Pass()
+            {
+                Interlocked.Increment(ref _passes);
+                LastPassAt = DateTime.UtcNow;
+            }
+
+            internal static void Cut()
+            {
+                Interlocked.Increment(ref _cuts);
+                LastCutAt = DateTime.UtcNow;
+            }
+
+            internal static void Failed(Exception ex) =>
+                LastError = $"{DateTime.UtcNow:O} {ex.GetType().Name}: {ex.Message}";
+        }
+
         public KeyImageStillWorker(
             IServiceScopeFactory scopeFactory,
             IConfiguration configuration,
@@ -42,6 +75,7 @@ namespace AdminPanelAPI.Services
             _scopeFactory = scopeFactory;
             _logger = logger;
             _enabled = configuration.GetValue("MovieFiles:AutoCutKeyImageStills", true);
+            Progress.Enabled = _enabled;
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -73,6 +107,7 @@ namespace AdminPanelAPI.Services
                 }
                 catch (Exception ex)
                 {
+                    Progress.Failed(ex);
                     _logger.LogError(ex, "Cutting picked frames' pictures failed.");
                 }
 
@@ -94,7 +129,9 @@ namespace AdminPanelAPI.Services
             var connection = services.GetRequiredService<NpgsqlConnection>();
             var stills = services.GetRequiredService<IKeyImageStillService>();
 
-            await connection.OpenAsync(ct);
+            await connection.EnsureOpenAsync(ct);
+
+            Progress.Pass();
 
             var waiting = await KeyImageStillService.PendingAsync(connection, PassLimit, ct);
             foreach (var frame in waiting)
@@ -108,6 +145,7 @@ namespace AdminPanelAPI.Services
                     if (pictureKey != null)
                     {
                         Failures.TryRemove(frame.Id, out _);
+                        Progress.Cut();
                         continue;
                     }
 
@@ -120,6 +158,7 @@ namespace AdminPanelAPI.Services
                     // The frame is worth keeping without its picture: opening
                     // it asks for the cut again, and so does the next pass.
                     Failures[frame.Id] = Failures.GetValueOrDefault(frame.Id) + 1;
+                    Progress.Failed(ex);
                     _logger.LogWarning(
                         ex, "Cutting the picture of key image {Id} failed.", frame.Id);
                 }
