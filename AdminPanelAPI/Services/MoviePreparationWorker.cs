@@ -8,7 +8,7 @@ namespace AdminPanelAPI.Services
     /// proxy for key images against the film's plot, without anybody asking, so
     /// a tagger who finishes watching finds the proposals already there.
     ///
-    /// Under `MovieFiles:PrepareWalkthrough` the movie is instead described shot
+    /// Under `MovieFiles:Walkthrough` the movie is instead described shot
     /// by shot first and those descriptions rated for the moments worth a still,
     /// with the analysis judging the story half on the ratings; the three run in
     /// that order because each reads the one before, and a film whose
@@ -53,7 +53,7 @@ namespace AdminPanelAPI.Services
             _scopeFactory = scopeFactory;
             _logger = logger;
             _enabled = configuration.GetValue("MovieFiles:AutoPrepare", true);
-            _walkthrough = configuration.GetValue("MovieFiles:PrepareWalkthrough", false);
+            _walkthrough = configuration.GetValue("MovieFiles:Walkthrough", false);
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
