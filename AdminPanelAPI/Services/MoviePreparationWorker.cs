@@ -119,7 +119,7 @@ namespace AdminPanelAPI.Services
             var connection = services.GetRequiredService<NpgsqlConnection>();
             var storage = services.GetRequiredService<IMovieFileStorageService>();
 
-            await connection.OpenAsync(ct);
+            await connection.EnsureOpenAsync(ct);
             await MoviePreparationStore.EnsureTableAsync(connection, ct);
 
             var inFlight = (await MoviePreparationStore.ListRunningAsync(connection, ct)).Count;
@@ -267,7 +267,7 @@ namespace AdminPanelAPI.Services
             var services = scope.ServiceProvider;
             var connection = services.GetRequiredService<NpgsqlConnection>();
 
-            await connection.OpenAsync(ct);
+            await connection.EnsureOpenAsync(ct);
             await MoviePreparationStore.EnsureTableAsync(connection, ct);
 
             var running = await MoviePreparationStore.ListRunningAsync(connection, ct);

@@ -110,7 +110,7 @@ namespace AdminPanelAPI.Services
             var storage = services.GetRequiredService<IMovieFileStorageService>();
             var tagger = services.GetRequiredService<IImageTechnicalTagService>();
 
-            await connection.OpenAsync(ct);
+            await connection.EnsureOpenAsync(ct);
             await EnsureSchemaAsync(connection, ct);
 
             // Keep going while there are frames waiting rather than taking one
