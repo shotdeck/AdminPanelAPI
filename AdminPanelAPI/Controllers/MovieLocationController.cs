@@ -21,6 +21,9 @@ namespace AdminPanelAPI.Controllers
 
         private readonly NpgsqlConnection _connection;
         private readonly ILogger<MovieLocationController> _logger;
+        private readonly string _imageServerBaseUrl;
+        private readonly string _imageServerLogin;
+        private readonly string _imageServerPassword;
 
         static MovieLocationController()
         {
@@ -32,10 +35,17 @@ namespace AdminPanelAPI.Controllers
 
         public MovieLocationController(
             NpgsqlConnection connection,
-            ILogger<MovieLocationController> logger)
+            ILogger<MovieLocationController> logger,
+            IConfiguration configuration)
         {
             _connection = connection;
             _logger = logger;
+
+            _imageServerBaseUrl = configuration["CaptionEmbedding:ImageServerBaseUrl"]
+                                  ?? "https://crunch.shotdeck.com/assets/images/stills/smthumb";
+
+            _imageServerLogin = configuration["CaptionEmbedding:ImageServerLogin"] ?? "";
+            _imageServerPassword = configuration["CaptionEmbedding:ImageServerPassword"] ?? "";
         }
 
         // ── GET all movie locations ─────────────────────────────────
@@ -374,11 +384,16 @@ LIMIT 200;";
             if (string.IsNullOrWhiteSpace(filename) || filename.Contains("..") || filename.Contains("/"))
                 return BadRequest("Invalid filename");
 
-            var url = $"http://35.89.51.60:8889/file/small_{filename}";
+            var url = $"{_imageServerBaseUrl.TrimEnd('/')}/small_{filename}";
 
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            var credentials = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes("shotdeck:Q9EN6W27"));
-            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", credentials);
+
+            if (!string.IsNullOrWhiteSpace(_imageServerLogin))
+            {
+                var credentials = Convert.ToBase64String(
+                    System.Text.Encoding.ASCII.GetBytes($"{_imageServerLogin}:{_imageServerPassword}"));
+                request.Headers.Authorization = new AuthenticationHeaderValue("Basic", credentials);
+            }
 
             try
             {

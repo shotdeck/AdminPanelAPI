@@ -35,7 +35,7 @@ namespace AdminPanelAPI.Services
                 ?? throw new InvalidOperationException("Missing connection string: Default");
 
             _imageServerBaseUrl = _configuration["CaptionEmbedding:ImageServerBaseUrl"]
-                                  ?? "http://35.89.51.60:8889";
+                                  ?? "https://crunch.shotdeck.com/assets/images/stills/smthumb";
 
             _imageServerLogin = _configuration["CaptionEmbedding:ImageServerLogin"] ?? "";
             _imageServerPassword = _configuration["CaptionEmbedding:ImageServerPassword"] ?? "";
@@ -459,7 +459,7 @@ namespace AdminPanelAPI.Services
             string filename,
             CancellationToken cancellationToken)
         {
-            var imageUrl = $"{_imageServerBaseUrl.TrimEnd('/')}/file/small_{filename}";
+            var imageUrl = $"{_imageServerBaseUrl.TrimEnd('/')}/small_{filename}";
 
             var request = new HttpRequestMessage(HttpMethod.Get, imageUrl);
 
