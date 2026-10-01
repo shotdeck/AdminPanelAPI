@@ -79,6 +79,14 @@ namespace ShotDeckSearch.Controllers
         private readonly IKeyImageStillService _stills;
         private readonly ILogger<MovieTaggingController> _logger;
 
+        /// <summary>
+        /// Whether describing a movie shot by shot is part of the process at
+        /// all, under `MovieFiles:Walkthrough`. Switched off, a movie's story
+        /// half is judged against its plot and nothing starts a walkthrough;
+        /// the ones already made can still be read.
+        /// </summary>
+        private readonly bool _walkthroughOn;
+
         public MovieTaggingController(
             NpgsqlConnection connection,
             IMovieFileStorageService storage,
@@ -87,8 +95,10 @@ namespace ShotDeckSearch.Controllers
             IWalkthroughService walkthrough,
             IImageTechnicalTagService imageTags,
             IKeyImageStillService stills,
+            IConfiguration configuration,
             ILogger<MovieTaggingController> logger)
         {
+            _walkthroughOn = configuration.GetValue("MovieFiles:Walkthrough", false);
             _connection = connection;
             _storage = storage;
             _analysis = analysis;
@@ -742,6 +752,8 @@ WHERE id = @id;";
                 description = (await MovieDescriptionAsync(request.MovieId, ct)).Description ?? "";
 
             var storyFrom = (request.StoryFrom ?? "").Trim().ToLowerInvariant();
+            if (!_walkthroughOn)
+                storyFrom = "description";
             if (storyFrom is not ("" or "walkthrough" or "description"))
                 return BadRequest(new
                 {
@@ -859,6 +871,12 @@ WHERE id = @id;";
             var actingUser = (request.ActingUser ?? "").Trim();
             if (string.IsNullOrWhiteSpace(actingUser))
                 return BadRequest(new { error = "actingUser is required." });
+
+            if (!_walkthroughOn)
+                return Conflict(new
+                {
+                    error = "Describing a movie shot by shot is switched off."
+                });
 
             await EnsureReadyAsync(ct);
             if (!await CanCaptureAsync(request.MovieId, actingUser, ct))
