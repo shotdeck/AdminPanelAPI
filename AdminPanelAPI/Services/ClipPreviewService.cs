@@ -12,12 +12,14 @@ namespace AdminPanelAPI.Services
 {
     /// <summary>
     /// Asks the Modal clip-preview app for 480p silent previews of the scene inside
-    /// each 9 second clip. Previews land in R2 at clip_previews/v1/{movieId}/{randid}.mp4.
+    /// each 9 second clip. Previews land in R2 beside their source clip, at
+    /// clips_9s/{movieId}/{randid}_short.mp4.
     /// </summary>
     public class ClipPreviewService : IClipPreviewService
     {
         private const int BatchSize = 250;
-        private const string PreviewPrefix = "clip_previews/v1/";
+        private const string ClipPrefix = "clips_9s/";
+        private const string PreviewSuffix = "_short.mp4";
 
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<ClipPreviewService> _logger;
@@ -196,8 +198,8 @@ namespace AdminPanelAPI.Services
                 });
 
             var prefix = movieId.HasValue
-                ? $"{PreviewPrefix}{movieId.Value}/"
-                : PreviewPrefix;
+                ? $"{ClipPrefix}{movieId.Value}/"
+                : ClipPrefix;
 
             long count = 0;
             string? continuationToken = null;
@@ -218,7 +220,7 @@ namespace AdminPanelAPI.Services
 
                 foreach (var obj in response.S3Objects ?? new List<S3Object>())
                 {
-                    if (obj.Key?.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase) == true)
+                    if (obj.Key?.EndsWith(PreviewSuffix, StringComparison.OrdinalIgnoreCase) == true)
                     {
                         count++;
                     }
