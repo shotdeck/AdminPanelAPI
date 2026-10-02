@@ -13,6 +13,7 @@ namespace AdminPanelAPI.Controllers
         private readonly IMovieJobQueue _jobQueue;
         private readonly IMovieProcessingService _processingService;
         private readonly IClipPreviewService _clipPreviewService;
+        private readonly IClipPreviewMotionRunner _clipPreviewRunner;
         private readonly IConfiguration _configuration;
         private readonly NpgsqlConnection _connection;
 
@@ -21,6 +22,7 @@ namespace AdminPanelAPI.Controllers
             IMovieJobQueue jobQueue,
             IMovieProcessingService processingService,
             IClipPreviewService clipPreviewService,
+            IClipPreviewMotionRunner clipPreviewRunner,
             NpgsqlConnection connection,
             IConfiguration configuration)
         {
@@ -28,6 +30,7 @@ namespace AdminPanelAPI.Controllers
             _jobQueue = jobQueue;
             _processingService = processingService;
             _clipPreviewService = clipPreviewService;
+            _clipPreviewRunner = clipPreviewRunner;
             _configuration = configuration;
             _connection = connection;
         }
@@ -219,6 +222,53 @@ SELECT
                 cancellationToken);
 
             return Ok(result);
+        }
+
+        /// <summary>
+        /// Temporary: previews every motion-tagged clip in one go. Returns as soon as the
+        /// run starts and keeps going in the background, so nothing has to be re-triggered.
+        /// Watch it with GET clip-previews-motion-all.
+        /// </summary>
+        [HttpPost("clip-previews-motion-all")]
+        public IActionResult StartMotionClipPreviewRun(
+            [FromQuery] int afterImageId = 0,
+            [FromQuery] int batchSize = 2000,
+            [FromQuery] bool overwrite = false)
+        {
+            if (batchSize <= 0 || batchSize > 20000)
+                return BadRequest(new { error = "batchSize must be between 1 and 20000" });
+
+            var (started, status) = _clipPreviewRunner.Start(afterImageId, batchSize, overwrite);
+
+            if (!started)
+            {
+                return Conflict(new
+                {
+                    error = "A clip preview run is already going. Stop it first, or wait for it to finish.",
+                    status
+                });
+            }
+
+            return Accepted(status);
+        }
+
+        /// <summary>
+        /// State of the background motion preview run, including the batch it is on.
+        /// </summary>
+        [HttpGet("clip-previews-motion-all")]
+        public IActionResult GetMotionClipPreviewRun()
+        {
+            return Ok(_clipPreviewRunner.GetStatus());
+        }
+
+        /// <summary>
+        /// Stops the background run after the batch it is on. Restarting it later from
+        /// the reported cursor (or from 0) picks up where it left off.
+        /// </summary>
+        [HttpPost("clip-previews-motion-all/stop")]
+        public IActionResult StopMotionClipPreviewRun()
+        {
+            return Ok(_clipPreviewRunner.Stop());
         }
 
         /// <summary>

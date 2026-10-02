@@ -73,6 +73,40 @@ namespace AdminPanelAPI.Models
         public double? PreviewCountSeconds { get; set; }
     }
 
+    /// <summary>
+    /// State of the unattended motion preview run, which walks every eligible clip
+    /// in batches until none are left.
+    /// </summary>
+    public class ClipPreviewRunStatus
+    {
+        public bool Running { get; set; }
+        public bool StopRequested { get; set; }
+        public DateTime? StartedAtUtc { get; set; }
+        public DateTime? FinishedAtUtc { get; set; }
+        public double? ElapsedMinutes { get; set; }
+
+        public int StartedAfterImageId { get; set; }
+        public int BatchSize { get; set; }
+        public bool Overwrite { get; set; }
+
+        /// <summary>Cursor the next batch will start after.</summary>
+        public int Cursor { get; set; }
+
+        public int Batches { get; set; }
+        public int Requested { get; set; }
+        public int Created { get; set; }
+        public int Exists { get; set; }
+        public int Skipped { get; set; }
+        public int Errors { get; set; }
+
+        /// <summary>Set when the run reached the end of the eligible clips.</summary>
+        public bool CompletedAll { get; set; }
+
+        /// <summary>Last failure, if any. The run keeps going after one.</summary>
+        public string? LastError { get; set; }
+        public DateTime? LastErrorAtUtc { get; set; }
+    }
+
     public class ClipPreviewBatchResponse
     {
         public int Total { get; set; }
