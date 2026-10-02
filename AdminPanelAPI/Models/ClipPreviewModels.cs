@@ -6,6 +6,7 @@ namespace AdminPanelAPI.Models
         public string Filename { get; set; } = "";
         public double StartTime { get; set; }
         public double EndTime { get; set; }
+        public int ImageId { get; set; }
     }
 
     public class ClipPreviewResult
@@ -28,6 +29,16 @@ namespace AdminPanelAPI.Models
         public int Errors { get; set; }
         public int? NextAfterMovieId { get; set; }
         public List<ClipPreviewResult> Movies { get; set; } = new();
+    }
+
+    public class ClipPreviewMotionResult
+    {
+        public int Requested { get; set; }
+        public int Created { get; set; }
+        public int Exists { get; set; }
+        public int Skipped { get; set; }
+        public int Errors { get; set; }
+        public int? NextAfterImageId { get; set; }
     }
 
     public class ClipPreviewBatchResponse
