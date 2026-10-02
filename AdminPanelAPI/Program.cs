@@ -1,3 +1,4 @@
+using AdminPanelAPI.Interfaces;
 using AdminPanelAPI.Services;
 using Microsoft.AspNetCore.Diagnostics;
 using Npgsql;
@@ -65,6 +66,7 @@ builder.Services.AddHttpClient("HighConcurrency")
 builder.Services.AddSingleton<IMovieJobQueue, MovieJobQueue>();
 
 builder.Services.AddScoped<IMovieProcessingJobRepository, MovieProcessingJobRepository>();
+builder.Services.AddScoped<IClipPreviewService, ClipPreviewService>();
 builder.Services.AddScoped<IMovieProcessingService, MovieProcessingService>();
 
 builder.Services.AddHostedService<MovieProcessingWorker>();
