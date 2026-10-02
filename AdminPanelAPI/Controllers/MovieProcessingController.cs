@@ -162,7 +162,7 @@ SELECT
 
         /// <summary>
         /// Cuts a 480p silent preview of each detected scene for one movie into
-        /// R2 at clip_previews/v1/{movieId}/{randid}.mp4.
+        /// R2 at clips_9s/{movieId}/{randid}_short.mp4.
         /// </summary>
         [HttpPost("clip-previews/{movieId:int}")]
         public async Task<IActionResult> GenerateClipPreviews(
