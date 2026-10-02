@@ -28,6 +28,8 @@ public interface IMovieProcessingJobRepository
 
     Task<List<int>> GetMovieIdsWithSceneBoundariesAsync(int limit, int afterMovieId, CancellationToken cancellationToken);
 
+    Task<List<ClipPreviewBoundary>> GetMotionTaggedSceneBoundariesAsync(int limit, int afterImageId, CancellationToken cancellationToken);
+
     Task<MovieMissingClipSummaryResponse> GetMissingClipSummaryAsync(int limit, CancellationToken cancellationToken);
 }
 
@@ -354,6 +356,59 @@ WHERE movieid = @movieid
                 Filename = reader.GetString(0),
                 StartTime = reader.GetDouble(1),
                 EndTime = reader.GetDouble(2)
+            });
+        }
+
+        return boundaries;
+    }
+
+    public async Task<List<ClipPreviewBoundary>> GetMotionTaggedSceneBoundariesAsync(
+    int limit,
+    int afterImageId,
+    CancellationToken cancellationToken)
+    {
+        if (limit <= 0)
+            return new List<ClipPreviewBoundary>();
+
+        const string sql = @"
+SELECT i.idnum, i.movieid, i.randid, sb.start_time, sb.end_time
+FROM frl.frl_images i
+JOIN frl.frl_image_scene_boundaries sb
+  ON sb.movieid = i.movieid
+ AND sb.filename = i.randid
+WHERE i.idnum > @after_idnum
+  AND i.status = 'live'
+  AND sb.start_time IS NOT NULL
+  AND sb.end_time IS NOT NULL
+  AND sb.end_time > sb.start_time
+  AND EXISTS (
+        SELECT 1
+        FROM frl.frl_join_images_camera_movements cm
+        WHERE cm.imageid = i.idnum)
+ORDER BY i.idnum
+LIMIT @limit;";
+
+        var boundaries = new List<ClipPreviewBoundary>();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 300;
+        cmd.Parameters.AddWithValue("after_idnum", afterImageId);
+        cmd.Parameters.AddWithValue("limit", limit);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            boundaries.Add(new ClipPreviewBoundary
+            {
+                ImageId = reader.GetInt32(0),
+                MovieId = reader.GetInt32(1),
+                Filename = reader.GetString(2),
+                StartTime = reader.GetDouble(3),
+                EndTime = reader.GetDouble(4)
             });
         }
 

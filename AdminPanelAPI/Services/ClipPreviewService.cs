@@ -71,6 +71,44 @@ namespace AdminPanelAPI.Services
             return result;
         }
 
+        /// <summary>
+        /// Temporary helper for the motion-autoplay rollout: previews only the clips
+        /// a Motion filter can select, i.e. images carrying a camera-movement tag.
+        /// </summary>
+        public async Task<ClipPreviewMotionResult> GenerateMotionTaggedPreviewsAsync(
+            int limit,
+            int afterImageId,
+            bool overwrite,
+            CancellationToken cancellationToken)
+        {
+            var boundaries = await _repo.GetMotionTaggedSceneBoundariesAsync(
+                Math.Clamp(limit, 1, 20000),
+                afterImageId,
+                cancellationToken);
+
+            var result = new ClipPreviewMotionResult
+            {
+                Requested = boundaries.Count
+            };
+
+            for (var i = 0; i < boundaries.Count; i += BatchSize)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var batch = boundaries.Skip(i).Take(BatchSize).ToList();
+
+                var summary = await SendBatchAsync(batch, overwrite, cancellationToken);
+
+                result.Created += summary.GetValueOrDefault("created");
+                result.Exists += summary.GetValueOrDefault("exists");
+                result.Skipped += summary.GetValueOrDefault("skipped");
+                result.Errors += summary.GetValueOrDefault("error");
+                result.NextAfterImageId = batch[^1].ImageId;
+            }
+
+            return result;
+        }
+
         public async Task<ClipPreviewBackfillResult> BackfillAsync(
             int movieLimit,
             int afterMovieId,

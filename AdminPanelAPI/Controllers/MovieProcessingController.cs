@@ -199,6 +199,29 @@ SELECT
         }
 
         /// <summary>
+        /// Temporary: previews only the clips a Motion filter can select (images with
+        /// a camera-movement tag), oldest image first. Call repeatedly with nextAfterImageId.
+        /// </summary>
+        [HttpPost("clip-previews-motion")]
+        public async Task<IActionResult> GenerateMotionClipPreviews(
+            [FromQuery] int limit = 2000,
+            [FromQuery] int afterImageId = 0,
+            [FromQuery] bool overwrite = false,
+            CancellationToken cancellationToken = default)
+        {
+            if (limit <= 0)
+                return BadRequest(new { error = "limit must be greater than 0" });
+
+            var result = await _clipPreviewService.GenerateMotionTaggedPreviewsAsync(
+                limit,
+                afterImageId,
+                overwrite,
+                cancellationToken);
+
+            return Ok(result);
+        }
+
+        /// <summary>
         /// Queues movies that completed the pipeline but still have images without
         /// a scene boundary, so only the missed clips get scene detection.
         /// </summary>
