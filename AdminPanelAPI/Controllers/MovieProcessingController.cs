@@ -1,4 +1,5 @@
-﻿using Microsoft.AspNetCore.Mvc;
+﻿using AdminPanelAPI.Interfaces;
+using Microsoft.AspNetCore.Mvc;
 using Npgsql;
 using System.Data.Common;
 
@@ -11,6 +12,7 @@ namespace AdminPanelAPI.Controllers
         private readonly IMovieProcessingJobRepository _jobRepository;
         private readonly IMovieJobQueue _jobQueue;
         private readonly IMovieProcessingService _processingService;
+        private readonly IClipPreviewService _clipPreviewService;
         private readonly IConfiguration _configuration;
         private readonly NpgsqlConnection _connection;
 
@@ -18,12 +20,14 @@ namespace AdminPanelAPI.Controllers
             IMovieProcessingJobRepository jobRepository,
             IMovieJobQueue jobQueue,
             IMovieProcessingService processingService,
+            IClipPreviewService clipPreviewService,
             NpgsqlConnection connection,
             IConfiguration configuration)
         {
             _jobRepository = jobRepository;
             _jobQueue = jobQueue;
             _processingService = processingService;
+            _clipPreviewService = clipPreviewService;
             _configuration = configuration;
             _connection = connection;
         }
@@ -151,6 +155,47 @@ SELECT
             var summary = await _jobRepository.GetMissingClipSummaryAsync(limit, cancellationToken);
 
             return Ok(summary);
+        }
+
+        /// <summary>
+        /// Cuts a 480p silent preview of each detected scene for one movie into
+        /// R2 at clip_previews/v1/{movieId}/{randid}.mp4.
+        /// </summary>
+        [HttpPost("clip-previews/{movieId:int}")]
+        public async Task<IActionResult> GenerateClipPreviews(
+            int movieId,
+            [FromQuery] bool overwrite = false,
+            CancellationToken cancellationToken = default)
+        {
+            var result = await _clipPreviewService.GeneratePreviewsForMovieAsync(
+                movieId,
+                overwrite,
+                cancellationToken);
+
+            return Ok(result);
+        }
+
+        /// <summary>
+        /// Walks movies with scene boundaries in movieid order and cuts any preview
+        /// that is not in R2 yet. Call repeatedly, passing back nextAfterMovieId.
+        /// </summary>
+        [HttpPost("clip-previews-backfill")]
+        public async Task<IActionResult> BackfillClipPreviews(
+            [FromQuery] int movieCount = 20,
+            [FromQuery] int afterMovieId = 0,
+            [FromQuery] bool overwrite = false,
+            CancellationToken cancellationToken = default)
+        {
+            if (movieCount <= 0)
+                return BadRequest(new { error = "movieCount must be greater than 0" });
+
+            var result = await _clipPreviewService.BackfillAsync(
+                movieCount,
+                afterMovieId,
+                overwrite,
+                cancellationToken);
+
+            return Ok(result);
         }
 
         /// <summary>

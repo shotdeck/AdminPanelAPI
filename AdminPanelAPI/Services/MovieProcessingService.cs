@@ -1,7 +1,9 @@
 ﻿using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
+using AdminPanelAPI.Interfaces;
 using AdminPanelAPI.Models;
+using System.Collections.Concurrent;
 using Npgsql;
 using NpgsqlTypes;
 using System.Globalization;
@@ -16,6 +18,7 @@ namespace AdminPanelAPI.Services
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<MovieProcessingService> _logger;
         private readonly IMovieProcessingJobRepository _repo;
+        private readonly IClipPreviewService _clipPreviews;
 
         private readonly int _maxParallelSceneJobs;
 
@@ -34,12 +37,14 @@ namespace AdminPanelAPI.Services
             IConfiguration configuration,
             IHttpClientFactory httpClientFactory,
             ILogger<MovieProcessingService> logger,
-            IMovieProcessingJobRepository repo)
+            IMovieProcessingJobRepository repo,
+            IClipPreviewService clipPreviews)
         {
             _configuration = configuration;
             _httpClientFactory = httpClientFactory;
             _logger = logger;
             _repo = repo;
+            _clipPreviews = clipPreviews;
 
             _connectionString = _configuration.GetConnectionString("Default")
                 ?? throw new InvalidOperationException("Missing connection string: Default");
@@ -165,6 +170,7 @@ namespace AdminPanelAPI.Services
            
             var processedCount = 0;
             var failedCount = 0;
+            var detected = new ConcurrentBag<ClipPreviewBoundary>();
 
             await Parallel.ForEachAsync(
                 clipFiles,
@@ -196,6 +202,20 @@ namespace AdminPanelAPI.Services
                             timeoutCts.Token);
 
                         await InsertSceneBoundaryAsync(boundary, ct);
+
+                        if (boundary.StartTime.HasValue &&
+                            boundary.EndTime.HasValue &&
+                            boundary.EndTime > boundary.StartTime &&
+                            !string.IsNullOrWhiteSpace(boundary.Filename))
+                        {
+                            detected.Add(new ClipPreviewBoundary
+                            {
+                                MovieId = movieId,
+                                Filename = boundary.Filename,
+                                StartTime = boundary.StartTime.Value,
+                                EndTime = boundary.EndTime.Value
+                            });
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -218,6 +238,36 @@ namespace AdminPanelAPI.Services
                         return;
                     }
                 });
+
+            if (!detected.IsEmpty)
+            {
+                await _repo.UpdateProgressAsync(jobId, "Generating clip previews", total, total, cancellationToken);
+
+                try
+                {
+                    var previews = await _clipPreviews.GeneratePreviewsAsync(
+                        movieId,
+                        detected.ToList(),
+                        overwrite,
+                        cancellationToken);
+
+                    _logger.LogInformation(
+                        "Clip previews for movie {MovieId}: created={Created}, exists={Exists}, skipped={Skipped}, errors={Errors}",
+                        movieId,
+                        previews.Created,
+                        previews.Exists,
+                        previews.Skipped,
+                        previews.Errors);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Clip preview generation failed. JobId={JobId}, MovieId={MovieId}",
+                        jobId,
+                        movieId);
+                }
+            }
 
             await _repo.UpdateProgressAsync(
                 jobId,

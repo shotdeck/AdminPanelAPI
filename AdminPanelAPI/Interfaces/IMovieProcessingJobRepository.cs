@@ -24,6 +24,10 @@ public interface IMovieProcessingJobRepository
 
     Task<List<string>> GetLiveImageFilenamesAsync(int movieId, CancellationToken cancellationToken);
 
+    Task<List<ClipPreviewBoundary>> GetSceneBoundariesAsync(int movieId, CancellationToken cancellationToken);
+
+    Task<List<int>> GetMovieIdsWithSceneBoundariesAsync(int limit, int afterMovieId, CancellationToken cancellationToken);
+
     Task<MovieMissingClipSummaryResponse> GetMissingClipSummaryAsync(int limit, CancellationToken cancellationToken);
 }
 
@@ -316,6 +320,81 @@ WHERE i.movieid = @movieid
   AND i.randid IS NOT NULL;";
 
         return await ReadFilenamesAsync(sql, movieId, cancellationToken);
+    }
+
+    public async Task<List<ClipPreviewBoundary>> GetSceneBoundariesAsync(
+    int movieId,
+    CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT filename, start_time, end_time
+FROM frl.frl_image_scene_boundaries
+WHERE movieid = @movieid
+  AND filename IS NOT NULL
+  AND start_time IS NOT NULL
+  AND end_time IS NOT NULL
+  AND end_time > start_time;";
+
+        var boundaries = new List<ClipPreviewBoundary>();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 180;
+        cmd.Parameters.AddWithValue("movieid", movieId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            boundaries.Add(new ClipPreviewBoundary
+            {
+                MovieId = movieId,
+                Filename = reader.GetString(0),
+                StartTime = reader.GetDouble(1),
+                EndTime = reader.GetDouble(2)
+            });
+        }
+
+        return boundaries;
+    }
+
+    public async Task<List<int>> GetMovieIdsWithSceneBoundariesAsync(
+    int limit,
+    int afterMovieId,
+    CancellationToken cancellationToken)
+    {
+        if (limit <= 0)
+            return new List<int>();
+
+        const string sql = @"
+SELECT DISTINCT movieid
+FROM frl.frl_image_scene_boundaries
+WHERE movieid > @after_movieid
+  AND start_time IS NOT NULL
+  AND end_time IS NOT NULL
+ORDER BY movieid
+LIMIT @limit;";
+
+        var movieIds = new List<int>();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 180;
+        cmd.Parameters.AddWithValue("after_movieid", afterMovieId);
+        cmd.Parameters.AddWithValue("limit", limit);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            movieIds.Add(reader.GetInt32(0));
+        }
+
+        return movieIds;
     }
 
     private async Task<List<string>> ReadFilenamesAsync(
