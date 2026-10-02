@@ -1,7 +1,7 @@
 """Modal app that cuts 480p silent preview clips out of the 9s clips in R2.
 
 Source : clips_9s/<movie_id>/<randid>.mp4
-Output : clip_previews/v1/<movie_id>/<randid>.mp4
+Output : clips_9s/<movie_id>/<randid>_short.mp4
 
 The scene window (start_time/end_time, seconds inside the 9s clip) comes from
 frl.frl_image_scene_boundaries and is supplied by the caller.
@@ -18,7 +18,7 @@ image = (
 )
 
 SOURCE_PREFIX = "clips_9s"
-PREVIEW_PREFIX = "clip_previews/v1"
+PREVIEW_SUFFIX = "_short"
 PREVIEW_WIDTH = 480
 MIN_PREVIEW_SECONDS = 0.5
 MAX_PREVIEW_SECONDS = 12.0
@@ -97,7 +97,7 @@ def generate_preview(item: dict) -> dict:
         return result | {"status": "skipped", "reason": "scene shorter than minimum"}
 
     source_key = f"{SOURCE_PREFIX}/{movie_id}/{filename}.mp4"
-    preview_key = f"{PREVIEW_PREFIX}/{movie_id}/{filename}.mp4"
+    preview_key = f"{SOURCE_PREFIX}/{movie_id}/{filename}{PREVIEW_SUFFIX}.mp4"
     result["key"] = preview_key
 
     r2 = connect_r2()
