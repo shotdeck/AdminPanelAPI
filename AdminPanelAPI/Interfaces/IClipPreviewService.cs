@@ -21,6 +21,13 @@ namespace AdminPanelAPI.Interfaces
             bool overwrite,
             CancellationToken cancellationToken);
 
+        Task<ClipPreviewProgress> GetMotionProgressAsync(
+            int afterImageId,
+            int? movieId,
+            bool countR2,
+            long maxObjectsToCount,
+            CancellationToken cancellationToken);
+
         Task<ClipPreviewResult> GeneratePreviewsAsync(
             int movieId,
             IReadOnlyCollection<ClipPreviewBoundary> boundaries,

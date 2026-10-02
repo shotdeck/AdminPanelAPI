@@ -41,6 +41,38 @@ namespace AdminPanelAPI.Models
         public int? NextAfterImageId { get; set; }
     }
 
+    public class ClipPreviewMotionCounts
+    {
+        public long Total { get; set; }
+        public long AtOrBeforeCursor { get; set; }
+        public int? FirstImageId { get; set; }
+        public int? LastImageId { get; set; }
+    }
+
+    public class ClipPreviewProgress
+    {
+        public int? MovieId { get; set; }
+
+        /// <summary>Motion-tagged clips eligible for a preview.</summary>
+        public long MotionTaggedTotal { get; set; }
+
+        /// <summary>Eligible clips the cursor has already passed.</summary>
+        public long PassedCursor { get; set; }
+        public long RemainingAfterCursor { get; set; }
+        public double PercentPassedCursor { get; set; }
+        public int AfterImageId { get; set; }
+        public int? LastEligibleImageId { get; set; }
+
+        /// <summary>
+        /// Preview objects in R2. Counts every preview, including ones made by the
+        /// movie-level backfill for clips without a motion tag, so it is not a
+        /// subset of MotionTaggedTotal.
+        /// </summary>
+        public long? PreviewsInR2 { get; set; }
+        public bool PreviewCountTruncated { get; set; }
+        public double? PreviewCountSeconds { get; set; }
+    }
+
     public class ClipPreviewBatchResponse
     {
         public int Total { get; set; }

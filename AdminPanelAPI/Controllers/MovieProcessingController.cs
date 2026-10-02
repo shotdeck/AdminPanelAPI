@@ -222,6 +222,32 @@ SELECT
         }
 
         /// <summary>
+        /// Coverage of the clip-preview run: motion-tagged clips eligible for a preview,
+        /// how many the given cursor has passed, and how many previews are in R2.
+        /// Pass countR2=false for a database-only answer that returns instantly.
+        /// </summary>
+        [HttpGet("clip-previews-progress")]
+        public async Task<IActionResult> GetClipPreviewProgress(
+            [FromQuery] int afterImageId = 0,
+            [FromQuery] int? movieId = null,
+            [FromQuery] bool countR2 = true,
+            [FromQuery] long maxObjectsToCount = 2_000_000,
+            CancellationToken cancellationToken = default)
+        {
+            if (maxObjectsToCount <= 0)
+                return BadRequest(new { error = "maxObjectsToCount must be greater than 0" });
+
+            var progress = await _clipPreviewService.GetMotionProgressAsync(
+                afterImageId,
+                movieId,
+                countR2,
+                maxObjectsToCount,
+                cancellationToken);
+
+            return Ok(progress);
+        }
+
+        /// <summary>
         /// Queues movies that completed the pipeline but still have images without
         /// a scene boundary, so only the missed clips get scene detection.
         /// </summary>

@@ -1,5 +1,9 @@
 using AdminPanelAPI.Interfaces;
 using AdminPanelAPI.Models;
+using Amazon.Runtime;
+using Amazon.S3;
+using Amazon.S3.Model;
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -13,12 +17,17 @@ namespace AdminPanelAPI.Services
     public class ClipPreviewService : IClipPreviewService
     {
         private const int BatchSize = 250;
+        private const string PreviewPrefix = "clip_previews/v1/";
 
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<ClipPreviewService> _logger;
         private readonly IMovieProcessingJobRepository _repo;
 
         private readonly string _clipPreviewBaseUrl;
+        private readonly string _r2AccountId;
+        private readonly string _r2AccessKey;
+        private readonly string _r2SecretKey;
+        private readonly string _r2BucketName;
 
         public ClipPreviewService(
             IConfiguration configuration,
@@ -32,6 +41,11 @@ namespace AdminPanelAPI.Services
 
             _clipPreviewBaseUrl = configuration["MoviePipeline:ClipPreviewBaseUrl"]
                                   ?? "https://semanticsearch--clip-previews-batch.modal.run";
+
+            _r2AccountId = (configuration["R2:AccountId"] ?? "").Trim();
+            _r2AccessKey = (configuration["R2:AccessKey"] ?? "").Trim();
+            _r2SecretKey = (configuration["R2:SecretKey"] ?? "").Trim();
+            _r2BucketName = (configuration["R2:BucketName"] ?? "").Trim();
         }
 
         public async Task<ClipPreviewResult> GeneratePreviewsForMovieAsync(
@@ -107,6 +121,121 @@ namespace AdminPanelAPI.Services
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// How far the motion preview run has got: eligible clips from the database
+        /// against previews present in R2.
+        /// </summary>
+        public async Task<ClipPreviewProgress> GetMotionProgressAsync(
+            int afterImageId,
+            int? movieId,
+            bool countR2,
+            long maxObjectsToCount,
+            CancellationToken cancellationToken)
+        {
+            var counts = await _repo.GetMotionTaggedCountsAsync(afterImageId, movieId, cancellationToken);
+
+            var progress = new ClipPreviewProgress
+            {
+                MovieId = movieId,
+                AfterImageId = afterImageId,
+                MotionTaggedTotal = counts.Total,
+                PassedCursor = counts.AtOrBeforeCursor,
+                RemainingAfterCursor = counts.Total - counts.AtOrBeforeCursor,
+                PercentPassedCursor = counts.Total == 0
+                    ? 100
+                    : Math.Round(counts.AtOrBeforeCursor * 100.0 / counts.Total, 2),
+                LastEligibleImageId = counts.LastImageId
+            };
+
+            if (!countR2)
+            {
+                return progress;
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+
+            var (previews, truncated) = await CountPreviewObjectsAsync(
+                movieId,
+                maxObjectsToCount,
+                cancellationToken);
+
+            stopwatch.Stop();
+
+            progress.PreviewsInR2 = previews;
+            progress.PreviewCountTruncated = truncated;
+            progress.PreviewCountSeconds = Math.Round(stopwatch.Elapsed.TotalSeconds, 1);
+
+            return progress;
+        }
+
+        private async Task<(long Count, bool Truncated)> CountPreviewObjectsAsync(
+            int? movieId,
+            long maxObjects,
+            CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(_r2AccountId) ||
+                string.IsNullOrWhiteSpace(_r2AccessKey) ||
+                string.IsNullOrWhiteSpace(_r2SecretKey) ||
+                string.IsNullOrWhiteSpace(_r2BucketName))
+            {
+                throw new InvalidOperationException(
+                    "R2 settings are missing. Check R2:AccountId, AccessKey, SecretKey, BucketName.");
+            }
+
+            using var client = new AmazonS3Client(
+                new BasicAWSCredentials(_r2AccessKey, _r2SecretKey),
+                new AmazonS3Config
+                {
+                    ServiceURL = $"https://{_r2AccountId}.r2.cloudflarestorage.com",
+                    ForcePathStyle = true,
+                    UseAccelerateEndpoint = false,
+                    UseDualstackEndpoint = false,
+                    EndpointDiscoveryEnabled = false
+                });
+
+            var prefix = movieId.HasValue
+                ? $"{PreviewPrefix}{movieId.Value}/"
+                : PreviewPrefix;
+
+            long count = 0;
+            string? continuationToken = null;
+
+            do
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var response = await client.ListObjectsV2Async(
+                    new ListObjectsV2Request
+                    {
+                        BucketName = _r2BucketName,
+                        Prefix = prefix,
+                        MaxKeys = 1000,
+                        ContinuationToken = continuationToken
+                    },
+                    cancellationToken);
+
+                foreach (var obj in response.S3Objects ?? new List<S3Object>())
+                {
+                    if (obj.Key?.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase) == true)
+                    {
+                        count++;
+                    }
+                }
+
+                if (count >= maxObjects)
+                {
+                    return (count, true);
+                }
+
+                continuationToken = response.IsTruncated == true
+                    ? response.NextContinuationToken
+                    : null;
+
+            } while (!string.IsNullOrEmpty(continuationToken));
+
+            return (count, false);
         }
 
         public async Task<ClipPreviewBackfillResult> BackfillAsync(

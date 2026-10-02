@@ -30,6 +30,8 @@ public interface IMovieProcessingJobRepository
 
     Task<List<ClipPreviewBoundary>> GetMotionTaggedSceneBoundariesAsync(int limit, int afterImageId, CancellationToken cancellationToken);
 
+    Task<ClipPreviewMotionCounts> GetMotionTaggedCountsAsync(int afterImageId, int? movieId, CancellationToken cancellationToken);
+
     Task<MovieMissingClipSummaryResponse> GetMissingClipSummaryAsync(int limit, CancellationToken cancellationToken);
 }
 
@@ -413,6 +415,52 @@ LIMIT @limit;";
         }
 
         return boundaries;
+    }
+
+    public async Task<ClipPreviewMotionCounts> GetMotionTaggedCountsAsync(
+    int afterImageId,
+    int? movieId,
+    CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE i.idnum <= @after_idnum) AS at_or_before_cursor,
+       min(i.idnum) AS first_idnum,
+       max(i.idnum) AS last_idnum
+FROM frl.frl_images i
+JOIN frl.frl_image_scene_boundaries sb
+  ON sb.movieid = i.movieid
+ AND sb.filename = i.randid
+WHERE i.status = 'live'
+  AND sb.start_time IS NOT NULL
+  AND sb.end_time IS NOT NULL
+  AND sb.end_time > sb.start_time
+  AND (@movieid::int IS NULL OR i.movieid = @movieid)
+  AND EXISTS (
+        SELECT 1
+        FROM frl.frl_join_images_camera_movements cm
+        WHERE cm.imageid = i.idnum);";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.CommandTimeout = 300;
+        cmd.Parameters.AddWithValue("after_idnum", afterImageId);
+        cmd.Parameters.AddWithValue("movieid", movieId.HasValue ? movieId.Value : DBNull.Value);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        if (!await reader.ReadAsync(cancellationToken))
+            return new ClipPreviewMotionCounts();
+
+        return new ClipPreviewMotionCounts
+        {
+            Total = reader.GetInt64(0),
+            AtOrBeforeCursor = reader.GetInt64(1),
+            FirstImageId = reader.IsDBNull(2) ? null : reader.GetInt32(2),
+            LastImageId = reader.IsDBNull(3) ? null : reader.GetInt32(3)
+        };
     }
 
     public async Task<List<int>> GetMovieIdsWithSceneBoundariesAsync(
