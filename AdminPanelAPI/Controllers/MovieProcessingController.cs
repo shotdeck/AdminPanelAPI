@@ -202,43 +202,48 @@ SELECT
         }
 
         /// <summary>
-        /// Temporary: previews only the clips a Motion filter can select (images with
-        /// a camera-movement tag), oldest image first. Call repeatedly with nextAfterImageId.
+        /// One batch of previews, oldest image first. Call repeatedly with nextAfterImageId.
+        /// motionOnly=true limits it to the clips a Motion filter can select (images with a
+        /// camera-movement tag); motionOnly=false covers every clip with a scene boundary.
         /// </summary>
         [HttpPost("clip-previews-motion")]
         public async Task<IActionResult> GenerateMotionClipPreviews(
             [FromQuery] int limit = 2000,
             [FromQuery] int afterImageId = 0,
             [FromQuery] bool overwrite = false,
+            [FromQuery] bool motionOnly = true,
             CancellationToken cancellationToken = default)
         {
             if (limit <= 0)
                 return BadRequest(new { error = "limit must be greater than 0" });
 
-            var result = await _clipPreviewService.GenerateMotionTaggedPreviewsAsync(
+            var result = await _clipPreviewService.GeneratePreviewBatchAsync(
                 limit,
                 afterImageId,
                 overwrite,
+                motionOnly,
                 cancellationToken);
 
             return Ok(result);
         }
 
         /// <summary>
-        /// Temporary: previews every motion-tagged clip in one go. Returns as soon as the
-        /// run starts and keeps going in the background, so nothing has to be re-triggered.
-        /// Watch it with GET clip-previews-motion-all.
+        /// Previews every eligible clip in one go. Returns as soon as the run starts and
+        /// keeps going in the background, so nothing has to be re-triggered. Watch it with
+        /// GET clip-previews-motion-all. motionOnly=false runs the whole library instead of
+        /// just the motion-tagged clips, which is a much longer and more expensive run.
         /// </summary>
         [HttpPost("clip-previews-motion-all")]
         public IActionResult StartMotionClipPreviewRun(
             [FromQuery] int afterImageId = 0,
             [FromQuery] int batchSize = 2000,
-            [FromQuery] bool overwrite = false)
+            [FromQuery] bool overwrite = false,
+            [FromQuery] bool motionOnly = true)
         {
             if (batchSize <= 0 || batchSize > 20000)
                 return BadRequest(new { error = "batchSize must be between 1 and 20000" });
 
-            var (started, status) = _clipPreviewRunner.Start(afterImageId, batchSize, overwrite);
+            var (started, status) = _clipPreviewRunner.Start(afterImageId, batchSize, overwrite, motionOnly);
 
             if (!started)
             {
@@ -253,7 +258,7 @@ SELECT
         }
 
         /// <summary>
-        /// State of the background motion preview run, including the batch it is on.
+        /// State of the background preview run, including the batch it is on.
         /// </summary>
         [HttpGet("clip-previews-motion-all")]
         public IActionResult GetMotionClipPreviewRun()
@@ -272,9 +277,10 @@ SELECT
         }
 
         /// <summary>
-        /// Coverage of the clip-preview run: motion-tagged clips eligible for a preview,
-        /// how many the given cursor has passed, and how many previews are in R2.
-        /// Pass countR2=false for a database-only answer that returns instantly.
+        /// Coverage of the clip-preview run: clips eligible for a preview, how many the
+        /// given cursor has passed, and how many previews are in R2. Pass countR2=false
+        /// for a database-only answer that returns instantly, and motionOnly=false to
+        /// count against the whole library rather than the motion-tagged clips.
         /// </summary>
         [HttpGet("clip-previews-progress")]
         public async Task<IActionResult> GetClipPreviewProgress(
@@ -282,16 +288,18 @@ SELECT
             [FromQuery] int? movieId = null,
             [FromQuery] bool countR2 = true,
             [FromQuery] long maxObjectsToCount = 2_000_000,
+            [FromQuery] bool motionOnly = true,
             CancellationToken cancellationToken = default)
         {
             if (maxObjectsToCount <= 0)
                 return BadRequest(new { error = "maxObjectsToCount must be greater than 0" });
 
-            var progress = await _clipPreviewService.GetMotionProgressAsync(
+            var progress = await _clipPreviewService.GetPreviewProgressAsync(
                 afterImageId,
                 movieId,
                 countR2,
                 maxObjectsToCount,
+                motionOnly,
                 cancellationToken);
 
             return Ok(progress);

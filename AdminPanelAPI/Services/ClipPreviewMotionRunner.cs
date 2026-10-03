@@ -4,7 +4,7 @@ using AdminPanelAPI.Models;
 namespace AdminPanelAPI.Services
 {
     /// <summary>
-    /// Walks the motion-tagged clips in batches on a background task so the whole
+    /// Walks the clips needing a preview in batches on a background task so the whole
     /// backfill runs from a single call. Progress lives in memory only: an app
     /// restart loses it, and the run is simply started again — previews already in
     /// R2 come back as "exists" rather than being cut twice.
@@ -33,7 +33,8 @@ namespace AdminPanelAPI.Services
         public (bool Started, ClipPreviewRunStatus Status) Start(
             int afterImageId,
             int batchSize,
-            bool overwrite)
+            bool overwrite,
+            bool motionOnly)
         {
             lock (_gate)
             {
@@ -49,11 +50,12 @@ namespace AdminPanelAPI.Services
                     StartedAfterImageId = afterImageId,
                     BatchSize = batchSize,
                     Overwrite = overwrite,
+                    MotionOnly = motionOnly,
                     Cursor = afterImageId
                 };
 
                 _cts = new CancellationTokenSource();
-                _run = Task.Run(() => RunAsync(batchSize, overwrite, _cts.Token));
+                _run = Task.Run(() => RunAsync(batchSize, overwrite, motionOnly, _cts.Token));
 
                 return (true, Snapshot());
             }
@@ -81,7 +83,11 @@ namespace AdminPanelAPI.Services
             }
         }
 
-        private async Task RunAsync(int batchSize, bool overwrite, CancellationToken cancellationToken)
+        private async Task RunAsync(
+            int batchSize,
+            bool overwrite,
+            bool motionOnly,
+            CancellationToken cancellationToken)
         {
             var consecutiveFailures = 0;
 
@@ -102,10 +108,11 @@ namespace AdminPanelAPI.Services
                         using var scope = _scopeFactory.CreateScope();
                         var previews = scope.ServiceProvider.GetRequiredService<IClipPreviewService>();
 
-                        result = await previews.GenerateMotionTaggedPreviewsAsync(
+                        result = await previews.GeneratePreviewBatchAsync(
                             batchSize,
                             cursor,
                             overwrite,
+                            motionOnly,
                             cancellationToken);
 
                         consecutiveFailures = 0;
@@ -203,6 +210,7 @@ namespace AdminPanelAPI.Services
                 StartedAfterImageId = _status.StartedAfterImageId,
                 BatchSize = _status.BatchSize,
                 Overwrite = _status.Overwrite,
+                MotionOnly = _status.MotionOnly,
                 Cursor = _status.Cursor,
                 Batches = _status.Batches,
                 Requested = _status.Requested,

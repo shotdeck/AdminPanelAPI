@@ -53,7 +53,10 @@ namespace AdminPanelAPI.Models
     {
         public int? MovieId { get; set; }
 
-        /// <summary>Motion-tagged clips eligible for a preview.</summary>
+        /// <summary>False when the totals cover every clip, not just motion-tagged ones.</summary>
+        public bool MotionOnly { get; set; }
+
+        /// <summary>Clips eligible for a preview.</summary>
         public long MotionTaggedTotal { get; set; }
 
         /// <summary>Eligible clips the cursor has already passed.</summary>
@@ -74,8 +77,8 @@ namespace AdminPanelAPI.Models
     }
 
     /// <summary>
-    /// State of the unattended motion preview run, which walks every eligible clip
-    /// in batches until none are left.
+    /// State of the unattended preview run, which walks every eligible clip in
+    /// batches until none are left.
     /// </summary>
     public class ClipPreviewRunStatus
     {
@@ -88,6 +91,9 @@ namespace AdminPanelAPI.Models
         public int StartedAfterImageId { get; set; }
         public int BatchSize { get; set; }
         public bool Overwrite { get; set; }
+
+        /// <summary>False when the run covers every clip, not just motion-tagged ones.</summary>
+        public bool MotionOnly { get; set; }
 
         /// <summary>Cursor the next batch will start after.</summary>
         public int Cursor { get; set; }
