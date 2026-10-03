@@ -88,18 +88,21 @@ namespace AdminPanelAPI.Services
         }
 
         /// <summary>
-        /// Temporary helper for the motion-autoplay rollout: previews only the clips
-        /// a Motion filter can select, i.e. images carrying a camera-movement tag.
+        /// Previews clips in image order. With motionOnly the set is limited to the
+        /// clips a Motion filter can select (images carrying a camera-movement tag);
+        /// otherwise it is every clip with a usable scene boundary.
         /// </summary>
-        public async Task<ClipPreviewMotionResult> GenerateMotionTaggedPreviewsAsync(
+        public async Task<ClipPreviewMotionResult> GeneratePreviewBatchAsync(
             int limit,
             int afterImageId,
             bool overwrite,
+            bool motionOnly,
             CancellationToken cancellationToken)
         {
-            var boundaries = await _repo.GetMotionTaggedSceneBoundariesAsync(
+            var boundaries = await _repo.GetPreviewCandidateBoundariesAsync(
                 Math.Clamp(limit, 1, 20000),
                 afterImageId,
+                motionOnly,
                 cancellationToken);
 
             var result = new ClipPreviewMotionResult
@@ -126,21 +129,27 @@ namespace AdminPanelAPI.Services
         }
 
         /// <summary>
-        /// How far the motion preview run has got: eligible clips from the database
-        /// against previews present in R2.
+        /// How far a preview run has got: eligible clips from the database against
+        /// previews present in R2.
         /// </summary>
-        public async Task<ClipPreviewProgress> GetMotionProgressAsync(
+        public async Task<ClipPreviewProgress> GetPreviewProgressAsync(
             int afterImageId,
             int? movieId,
             bool countR2,
             long maxObjectsToCount,
+            bool motionOnly,
             CancellationToken cancellationToken)
         {
-            var counts = await _repo.GetMotionTaggedCountsAsync(afterImageId, movieId, cancellationToken);
+            var counts = await _repo.GetPreviewCandidateCountsAsync(
+                afterImageId,
+                movieId,
+                motionOnly,
+                cancellationToken);
 
             var progress = new ClipPreviewProgress
             {
                 MovieId = movieId,
+                MotionOnly = motionOnly,
                 AfterImageId = afterImageId,
                 MotionTaggedTotal = counts.Total,
                 PassedCursor = counts.AtOrBeforeCursor,

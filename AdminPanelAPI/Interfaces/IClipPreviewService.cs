@@ -15,17 +15,19 @@ namespace AdminPanelAPI.Interfaces
             bool overwrite,
             CancellationToken cancellationToken);
 
-        Task<ClipPreviewMotionResult> GenerateMotionTaggedPreviewsAsync(
+        Task<ClipPreviewMotionResult> GeneratePreviewBatchAsync(
             int limit,
             int afterImageId,
             bool overwrite,
+            bool motionOnly,
             CancellationToken cancellationToken);
 
-        Task<ClipPreviewProgress> GetMotionProgressAsync(
+        Task<ClipPreviewProgress> GetPreviewProgressAsync(
             int afterImageId,
             int? movieId,
             bool countR2,
             long maxObjectsToCount,
+            bool motionOnly,
             CancellationToken cancellationToken);
 
         Task<ClipPreviewResult> GeneratePreviewsAsync(

@@ -28,15 +28,22 @@ public interface IMovieProcessingJobRepository
 
     Task<List<int>> GetMovieIdsWithSceneBoundariesAsync(int limit, int afterMovieId, CancellationToken cancellationToken);
 
-    Task<List<ClipPreviewBoundary>> GetMotionTaggedSceneBoundariesAsync(int limit, int afterImageId, CancellationToken cancellationToken);
+    Task<List<ClipPreviewBoundary>> GetPreviewCandidateBoundariesAsync(int limit, int afterImageId, bool motionOnly, CancellationToken cancellationToken);
 
-    Task<ClipPreviewMotionCounts> GetMotionTaggedCountsAsync(int afterImageId, int? movieId, CancellationToken cancellationToken);
+    Task<ClipPreviewMotionCounts> GetPreviewCandidateCountsAsync(int afterImageId, int? movieId, bool motionOnly, CancellationToken cancellationToken);
 
     Task<MovieMissingClipSummaryResponse> GetMissingClipSummaryAsync(int limit, CancellationToken cancellationToken);
 }
 
 public class MovieProcessingJobRepository : IMovieProcessingJobRepository
 {
+    /// <summary>Limits preview candidates to images a Motion filter can select.</summary>
+    private const string MotionTagPredicate = @"
+  AND EXISTS (
+        SELECT 1
+        FROM frl.frl_join_images_camera_movements cm
+        WHERE cm.imageid = i.idnum)";
+
     private readonly string _connectionString;
 
     public MovieProcessingJobRepository(IConfiguration configuration)
@@ -364,15 +371,16 @@ WHERE movieid = @movieid
         return boundaries;
     }
 
-    public async Task<List<ClipPreviewBoundary>> GetMotionTaggedSceneBoundariesAsync(
+    public async Task<List<ClipPreviewBoundary>> GetPreviewCandidateBoundariesAsync(
     int limit,
     int afterImageId,
+    bool motionOnly,
     CancellationToken cancellationToken)
     {
         if (limit <= 0)
             return new List<ClipPreviewBoundary>();
 
-        const string sql = @"
+        var sql = $@"
 SELECT i.idnum, i.movieid, i.randid, sb.start_time, sb.end_time
 FROM frl.frl_images i
 JOIN frl.frl_image_scene_boundaries sb
@@ -383,10 +391,7 @@ WHERE i.idnum > @after_idnum
   AND sb.start_time IS NOT NULL
   AND sb.end_time IS NOT NULL
   AND sb.end_time > sb.start_time
-  AND EXISTS (
-        SELECT 1
-        FROM frl.frl_join_images_camera_movements cm
-        WHERE cm.imageid = i.idnum)
+  {(motionOnly ? MotionTagPredicate : "")}
 ORDER BY i.idnum
 LIMIT @limit;";
 
@@ -417,12 +422,13 @@ LIMIT @limit;";
         return boundaries;
     }
 
-    public async Task<ClipPreviewMotionCounts> GetMotionTaggedCountsAsync(
+    public async Task<ClipPreviewMotionCounts> GetPreviewCandidateCountsAsync(
     int afterImageId,
     int? movieId,
+    bool motionOnly,
     CancellationToken cancellationToken)
     {
-        const string sql = @"
+        var sql = $@"
 SELECT count(*) AS total,
        count(*) FILTER (WHERE i.idnum <= @after_idnum) AS at_or_before_cursor,
        min(i.idnum) AS first_idnum,
@@ -436,10 +442,7 @@ WHERE i.status = 'live'
   AND sb.end_time IS NOT NULL
   AND sb.end_time > sb.start_time
   AND (@movieid::int IS NULL OR i.movieid = @movieid)
-  AND EXISTS (
-        SELECT 1
-        FROM frl.frl_join_images_camera_movements cm
-        WHERE cm.imageid = i.idnum);";
+  {(motionOnly ? MotionTagPredicate : "")};";
 
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);

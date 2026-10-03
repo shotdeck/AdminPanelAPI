@@ -77,7 +77,7 @@ with image.imports():
 
 
 @app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials")],
-              timeout=900, max_containers=200)
+              timeout=900, max_containers=1000)
 def generate_preview(item: dict) -> dict:
     """Cut one preview. `item` needs movie_id, filename, start_time, end_time."""
     movie_id = item["movie_id"]
