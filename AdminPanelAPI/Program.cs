@@ -74,6 +74,7 @@ builder.Services.AddSingleton<IClipPreviewMotionRunner, ClipPreviewMotionRunner>
 
 builder.Services.AddScoped<IMovieProcessingService, MovieProcessingService>();
 
+builder.Services.AddSingleton<MovieWorkerDiagnostics>();
 builder.Services.AddHostedService<MovieProcessingWorker>();
 
 // Caption embedding batch processing
