@@ -12,6 +12,8 @@ namespace AdminPanelAPI.Services
 
         private readonly int _maxParallelMovieJobs;
 
+        private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(10);
+
         public MovieProcessingWorker(
             IServiceProvider serviceProvider,
             IMovieJobQueue queue,
@@ -56,26 +58,20 @@ namespace AdminPanelAPI.Services
 
                 try
                 {
-                    jobId = await _queue.DequeueAsync(stoppingToken);
-
                     using var scope = _serviceProvider.CreateScope();
 
                     var repo = scope.ServiceProvider.GetRequiredService<IMovieProcessingJobRepository>();
                     var service = scope.ServiceProvider.GetRequiredService<IMovieProcessingService>();
 
-                    var job = await repo.GetJobAsync(jobId, stoppingToken);
+                    var job = await repo.ClaimNextQueuedJobAsync(stoppingToken);
 
                     if (job == null)
                     {
-                        _logger.LogWarning(
-                            "Worker {WorkerNumber}: Job {JobId} not found.",
-                            workerNumber,
-                            jobId);
-
+                        await WaitForWorkAsync(stoppingToken);
                         continue;
                     }
 
-                    await repo.MarkRunningAsync(jobId, stoppingToken);
+                    jobId = job.JobId;
 
                     _logger.LogInformation(
                         "Worker {WorkerNumber}: Processing job {JobId}, movie {MovieId}",
@@ -99,8 +95,11 @@ namespace AdminPanelAPI.Services
                         jobId,
                         job.MovieId);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
+                    if (jobId > 0)
+                        await RequeueAsync(workerNumber, jobId);
+
                     break;
                 }
                 catch (Exception ex)
@@ -136,6 +135,44 @@ namespace AdminPanelAPI.Services
             }
 
             _logger.LogInformation("Movie worker {WorkerNumber} stopped.", workerNumber);
+        }
+
+        /// <summary>
+        /// Sleeps until a job is queued in this process, or the poll interval
+        /// elapses so jobs queued elsewhere (another instance, or before a restart)
+        /// are still picked up.
+        /// </summary>
+        private async Task WaitForWorkAsync(CancellationToken stoppingToken)
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            timeout.CancelAfter(PollInterval);
+
+            try
+            {
+                await _queue.DequeueAsync(timeout.Token);
+            }
+            catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+            {
+            }
+        }
+
+        private async Task RequeueAsync(int workerNumber, long jobId)
+        {
+            try
+            {
+                using var scope = _serviceProvider.CreateScope();
+                var repo = scope.ServiceProvider.GetRequiredService<IMovieProcessingJobRepository>();
+
+                await repo.RequeueJobAsync(jobId, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Worker {WorkerNumber}: Failed to requeue job {JobId} on shutdown.",
+                    workerNumber,
+                    jobId);
+            }
         }
     }
 }

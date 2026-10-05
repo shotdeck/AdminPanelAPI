@@ -417,5 +417,33 @@ SELECT
 
             return Ok(job);
         }
+
+        /// <summary>
+        /// Puts a job back in the queue, for one left Running by a crashed or
+        /// restarted worker.
+        /// </summary>
+        [HttpPost("requeue/{jobId:long}")]
+        public async Task<IActionResult> RequeueJob(
+            long jobId,
+            CancellationToken cancellationToken = default)
+        {
+            var requeued = await _jobRepository.RequeueJobAsync(jobId, cancellationToken);
+
+            if (!requeued)
+            {
+                return NotFound(new
+                {
+                    message = $"Job {jobId} not found."
+                });
+            }
+
+            await _jobQueue.QueueJobAsync(jobId, cancellationToken);
+
+            return Ok(new
+            {
+                jobId,
+                status = "Queued"
+            });
+        }
     }
 }
