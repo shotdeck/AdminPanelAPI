@@ -9,6 +9,16 @@ public interface IMovieProcessingJobRepository
     Task MarkCompletedAsync(long jobId, CancellationToken cancellationToken);
     Task MarkFailedAsync(long jobId, string error, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Moves the oldest queued job to Running and returns it, so a worker owns a
+    /// job that outlives the process that created it. Returns null when nothing
+    /// is queued.
+    /// </summary>
+    Task<MovieProcessingJobStatusResponse?> ClaimNextQueuedJobAsync(CancellationToken cancellationToken);
+
+    /// <summary>Puts a job back in the queue, whatever state it is in.</summary>
+    Task<bool> RequeueJobAsync(long jobId, CancellationToken cancellationToken);
+
     Task UpdateProgressAsync(
         long jobId,
         string step,
@@ -559,6 +569,11 @@ WHERE id = @id;";
         if (!await reader.ReadAsync(cancellationToken))
             return null;
 
+        return ReadJob(reader);
+    }
+
+    private static MovieProcessingJobStatusResponse ReadJob(NpgsqlDataReader reader)
+    {
         return new MovieProcessingJobStatusResponse
         {
             JobId = reader.GetInt64(0),
@@ -575,6 +590,73 @@ WHERE id = @id;";
             CompletedAt = reader.IsDBNull(11) ? null : reader.GetDateTime(11),
             Error = reader.IsDBNull(12) ? null : reader.GetString(12)
         };
+    }
+
+    public async Task<MovieProcessingJobStatusResponse?> ClaimNextQueuedJobAsync(CancellationToken cancellationToken)
+    {
+        // SKIP LOCKED keeps concurrent workers, and concurrent app instances, off
+        // each other's job.
+        const string sql = @"
+UPDATE frl.frl_movie_processing_jobs
+SET status = 'Running',
+    started_at = now(),
+    error = null
+WHERE id = (
+    SELECT id
+    FROM frl.frl_movie_processing_jobs
+    WHERE status = 'Queued'
+    ORDER BY id
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+RETURNING
+    id,
+    movieid,
+    threshold,
+    overwrite,
+    missing_only,
+    status,
+    current_step,
+    progress_current,
+    progress_total,
+    created_at,
+    started_at,
+    completed_at,
+    error;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        if (!await reader.ReadAsync(cancellationToken))
+            return null;
+
+        return ReadJob(reader);
+    }
+
+    public async Task<bool> RequeueJobAsync(long jobId, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+UPDATE frl.frl_movie_processing_jobs
+SET status = 'Queued',
+    started_at = null,
+    completed_at = null,
+    current_step = null,
+    progress_current = null,
+    progress_total = null,
+    error = null
+WHERE id = @id;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("id", jobId);
+
+        return await cmd.ExecuteNonQueryAsync(cancellationToken) > 0;
     }
 
     public async Task MarkRunningAsync(long jobId, CancellationToken cancellationToken)
