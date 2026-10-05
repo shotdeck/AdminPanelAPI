@@ -1,4 +1,5 @@
 ﻿using AdminPanelAPI.Interfaces;
+using AdminPanelAPI.Services;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
 using System.Data.Common;
@@ -16,6 +17,7 @@ namespace AdminPanelAPI.Controllers
         private readonly IClipPreviewMotionRunner _clipPreviewRunner;
         private readonly IConfiguration _configuration;
         private readonly NpgsqlConnection _connection;
+        private readonly MovieWorkerDiagnostics _workerDiagnostics;
 
         public MovieProcessingController(
             IMovieProcessingJobRepository jobRepository,
@@ -24,7 +26,8 @@ namespace AdminPanelAPI.Controllers
             IClipPreviewService clipPreviewService,
             IClipPreviewMotionRunner clipPreviewRunner,
             NpgsqlConnection connection,
-            IConfiguration configuration)
+            IConfiguration configuration,
+            MovieWorkerDiagnostics workerDiagnostics)
         {
             _jobRepository = jobRepository;
             _jobQueue = jobQueue;
@@ -33,6 +36,17 @@ namespace AdminPanelAPI.Controllers
             _clipPreviewRunner = clipPreviewRunner;
             _configuration = configuration;
             _connection = connection;
+            _workerDiagnostics = workerDiagnostics;
+        }
+
+        /// <summary>
+        /// Reports whether the movie worker loops are alive and what their last
+        /// claim attempt did.
+        /// </summary>
+        [HttpGet("worker-health")]
+        public IActionResult GetWorkerHealth()
+        {
+            return Ok(_workerDiagnostics.Snapshot());
         }
         [HttpGet("db-info")]
         public async Task<IActionResult> GetDatabaseInfo(
