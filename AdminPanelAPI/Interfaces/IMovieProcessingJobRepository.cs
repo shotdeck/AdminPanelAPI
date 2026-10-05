@@ -19,6 +19,17 @@ public interface IMovieProcessingJobRepository
     /// <summary>Puts a job back in the queue, whatever state it is in.</summary>
     Task<bool> RequeueJobAsync(long jobId, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Requeues failed jobs and/or jobs left Running by a crashed worker, which
+    /// no worker would otherwise touch again.
+    /// </summary>
+    Task<MovieJobRequeueResult> RequeueJobsAsync(
+        bool includeFailed,
+        int? staleRunningMinutes,
+        int limit,
+        bool dryRun,
+        CancellationToken cancellationToken);
+
     Task UpdateProgressAsync(
         long jobId,
         string step,
@@ -657,6 +668,93 @@ WHERE id = @id;";
         cmd.Parameters.AddWithValue("id", jobId);
 
         return await cmd.ExecuteNonQueryAsync(cancellationToken) > 0;
+    }
+
+    public async Task<MovieJobRequeueResult> RequeueJobsAsync(
+        bool includeFailed,
+        int? staleRunningMinutes,
+        int limit,
+        bool dryRun,
+        CancellationToken cancellationToken)
+    {
+        const string selectSql = @"
+SELECT id, status, error
+FROM frl.frl_movie_processing_jobs
+WHERE (@include_failed AND status = 'Failed')
+   OR (@stale_minutes::int IS NOT NULL
+       AND status = 'Running'
+       AND started_at IS NOT NULL
+       AND started_at < now() - make_interval(mins => @stale_minutes))
+ORDER BY id
+LIMIT @limit;";
+
+        const string updateSql = @"
+UPDATE frl.frl_movie_processing_jobs
+SET status = 'Queued',
+    started_at = null,
+    completed_at = null,
+    current_step = null,
+    progress_current = null,
+    progress_total = null,
+    error = null
+WHERE id = ANY(@ids);";
+
+        var result = new MovieJobRequeueResult { DryRun = dryRun };
+        var errorCounts = new Dictionary<string, int>();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using (var cmd = new NpgsqlCommand(selectSql, conn))
+        {
+            cmd.CommandTimeout = 180;
+            cmd.Parameters.AddWithValue("include_failed", includeFailed);
+            cmd.Parameters.AddWithValue(
+                "stale_minutes",
+                staleRunningMinutes.HasValue ? staleRunningMinutes.Value : DBNull.Value);
+            cmd.Parameters.AddWithValue("limit", limit);
+
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                result.JobIds.Add(reader.GetInt64(0));
+
+                if (reader.GetString(1) == "Failed")
+                {
+                    result.Failed++;
+
+                    var error = reader.IsDBNull(2) ? "(none)" : reader.GetString(2);
+                    errorCounts[error] = errorCounts.GetValueOrDefault(error) + 1;
+                }
+                else
+                {
+                    result.StaleRunning++;
+                }
+            }
+        }
+
+        result.Errors = errorCounts
+            .OrderByDescending(entry => entry.Value)
+            .Select(entry => new MovieJobRequeueErrorGroup
+            {
+                Error = entry.Key,
+                Count = entry.Value
+            })
+            .ToList();
+
+        if (dryRun || result.JobIds.Count == 0)
+            return result;
+
+        await using (var cmd = new NpgsqlCommand(updateSql, conn))
+        {
+            cmd.CommandTimeout = 180;
+            cmd.Parameters.AddWithValue("ids", result.JobIds.ToArray());
+
+            result.Requeued = await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        return result;
     }
 
     public async Task MarkRunningAsync(long jobId, CancellationToken cancellationToken)
