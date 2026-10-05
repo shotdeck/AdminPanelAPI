@@ -459,5 +459,41 @@ SELECT
                 status = "Queued"
             });
         }
+
+        /// <summary>
+        /// Requeues failed jobs in bulk, and optionally jobs left Running by a
+        /// crashed worker. Call with dryRun=true first to see what it would touch.
+        /// </summary>
+        [HttpPost("requeue-failed")]
+        public async Task<IActionResult> RequeueFailedJobs(
+            bool includeFailed = true,
+            int? staleRunningMinutes = 60,
+            int limit = 500,
+            bool dryRun = false,
+            CancellationToken cancellationToken = default)
+        {
+            if (!includeFailed && !staleRunningMinutes.HasValue)
+            {
+                return BadRequest(new
+                {
+                    message = "Nothing selected: set includeFailed=true and/or staleRunningMinutes."
+                });
+            }
+
+            var result = await _jobRepository.RequeueJobsAsync(
+                includeFailed,
+                staleRunningMinutes,
+                Math.Clamp(limit, 1, 5000),
+                dryRun,
+                cancellationToken);
+
+            if (!dryRun)
+            {
+                foreach (var jobId in result.JobIds)
+                    await _jobQueue.QueueJobAsync(jobId, cancellationToken);
+            }
+
+            return Ok(result);
+        }
     }
 }
