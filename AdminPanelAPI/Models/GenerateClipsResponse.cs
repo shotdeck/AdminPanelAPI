@@ -18,5 +18,9 @@ namespace AdminPanelAPI.Models
 
         [JsonPropertyName("skipped_download")]
         public bool? SkippedDownload { get; set; }
+
+        /// <summary>The Modal generator answers 200 with this set when it fails.</summary>
+        [JsonPropertyName("error")]
+        public string? Error { get; set; }
     }
 }

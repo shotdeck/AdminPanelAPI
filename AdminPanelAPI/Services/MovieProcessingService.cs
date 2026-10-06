@@ -400,7 +400,25 @@ VALUES (
     @file_size_bytes,
     @file_size_mb
 )
-ON CONFLICT (movieid) DO NOTHING;";
+ON CONFLICT (movieid) DO UPDATE SET
+    duration = excluded.duration,
+    fps = excluded.fps,
+    frame_count = excluded.frame_count,
+    width = excluded.width,
+    height = excluded.height,
+    aspect_ratio = excluded.aspect_ratio,
+    aspect_ratio_str = excluded.aspect_ratio_str,
+    dar = excluded.dar,
+    sar = excluded.sar,
+    codec = excluded.codec,
+    profile = excluded.profile,
+    pix_fmt = excluded.pix_fmt,
+    bit_depth = excluded.bit_depth,
+    file_size_bytes = excluded.file_size_bytes,
+    file_size_mb = excluded.file_size_mb
+WHERE frl_movie_info.duration IS NULL
+   OR frl_movie_info.fps IS NULL
+   OR frl_movie_info.frame_count IS NULL;";
 
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync(cancellationToken);
@@ -451,7 +469,7 @@ ON CONFLICT (movieid) DO NOTHING;";
                     return true;
                 }
 
-                Console.WriteLine($"Movie info already exists for movieId {movieId}; insert skipped.");
+                Console.WriteLine($"Movie info already complete for movieId {movieId}; insert skipped.");
                 return false;
             }
             catch
@@ -483,6 +501,11 @@ ON CONFLICT (movieid) DO NOTHING;";
             }
 
             var result = JsonSerializer.Deserialize<GenerateClipsResponse>(content, JsonOptions());
+
+            if (!string.IsNullOrWhiteSpace(result?.Error))
+            {
+                throw new Exception($"Generate clips API reported an error for movie {movieId}: {result.Error}");
+            }
 
             if (result == null)
             {
