@@ -1002,6 +1002,152 @@ ORDER BY u.is_admin DESC, lower(u.name);";
             return Ok(stats);
         }
 
+        // ── GET /api/admin/camera-movements/users/history ──────────────
+        // One reviewer's whole camera movement record, for their profile:
+        // lifetime totals, a day-by-day count for streaks and a heat map, and
+        // the movies they worked on with the movie's poster. Read-only.
+        [HttpGet("users/history")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetUserHistory(
+            [FromQuery] string? owner = null,
+            [FromQuery] int days = 400,
+            [FromQuery] int limit = 200,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(owner))
+                return BadRequest(new { error = "owner is required." });
+
+            await EnsureOpenAsync(ct);
+            await EnsureTimestampColumnsAsync(ct);
+
+            days = Math.Clamp(days, 7, 1000);
+            limit = Math.Clamp(limit, 1, 500);
+
+            var totalsSql = $@"
+SELECT
+  (SELECT COUNT(*) FROM frl.frl_camera_movement_image_owner o
+     WHERE lower(o.owner) = lower(@owner)) AS pulled,
+  (SELECT COUNT(*) FROM frl.frl_join_images_camera_movements cm
+     WHERE {OwnerWhereSql}) AS tags_added,
+  (SELECT COUNT(*) FROM frl.frl_camera_movement_image_owner o
+     WHERE lower(o.owner) = lower(@owner)
+       AND EXISTS (SELECT 1 FROM frl.frl_join_images_camera_movements e
+                   WHERE e.imageid = o.imageid)
+       AND NOT EXISTS (SELECT 1 FROM frl.frl_join_images_camera_movements n
+                   WHERE n.imageid = o.imageid AND n.status NOT IN ('ok','bad')
+                     AND n.camera_movements NOT IN ({NonQcMovementsSql}))) AS completed,
+  (SELECT COUNT(*) FROM frl.frl_join_images_camera_movements cm
+     WHERE cm.status = 'ok' AND {OwnerWhereSql}) AS confirmed_tags,
+  (SELECT COUNT(*) FROM frl.frl_join_images_camera_movements cm
+     WHERE cm.status IN ('ok','bad') AND {OwnerWhereSql}) AS reviewed_tags,
+  (SELECT MIN(o.assigned_at) FROM frl.frl_camera_movement_image_owner o
+     WHERE lower(o.owner) = lower(@owner)) AS first_at,
+  (SELECT MAX(cm.updated_at) FROM frl.frl_join_images_camera_movements cm
+     WHERE cm.status IN ('ok','bad') AND {OwnerWhereSql}) AS last_at;";
+
+            int pulled = 0, tagsAdded = 0, completed = 0, confirmedTags = 0, reviewedTags = 0;
+            DateTime? firstAt = null, lastAt = null;
+            await using (var cmd = new NpgsqlCommand(totalsSql, _connection))
+            {
+                cmd.Parameters.AddWithValue("@owner", owner.Trim());
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                {
+                    pulled = Convert.ToInt32(reader.GetInt64(0));
+                    tagsAdded = Convert.ToInt32(reader.GetInt64(1));
+                    completed = Convert.ToInt32(reader.GetInt64(2));
+                    confirmedTags = Convert.ToInt32(reader.GetInt64(3));
+                    reviewedTags = Convert.ToInt32(reader.GetInt64(4));
+                    firstAt = reader.IsDBNull(5) ? null : reader.GetDateTime(5);
+                    lastAt = reader.IsDBNull(6) ? null : reader.GetDateTime(6);
+                }
+            }
+
+            var daysSql = $@"
+SELECT cm.updated_at::date AS day,
+       COUNT(*) FILTER (WHERE cm.status IN ('ok','bad')) AS reviewed,
+       COUNT(*) FILTER (WHERE cm.status = 'ok')          AS confirmed
+FROM frl.frl_join_images_camera_movements cm
+WHERE cm.updated_at IS NOT NULL
+  AND cm.updated_at >= (CURRENT_DATE - @days::int)
+  AND cm.status IN ('ok','bad')
+  AND {OwnerWhereSql}
+GROUP BY 1
+ORDER BY 1;";
+
+            var dayRows = new List<object>();
+            await using (var cmd = new NpgsqlCommand(daysSql, _connection))
+            {
+                cmd.Parameters.AddWithValue("@owner", owner.Trim());
+                cmd.Parameters.AddWithValue("@days", days);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                    dayRows.Add(new
+                    {
+                        day = reader.GetDateTime(0).ToString("yyyy-MM-dd"),
+                        reviewed = Convert.ToInt32(reader.GetInt64(1)),
+                        confirmed = Convert.ToInt32(reader.GetInt64(2))
+                    });
+            }
+
+            var moviesSql = $@"
+SELECT i.movieid,
+       COALESCE(m.title, '') AS title,
+       m.year,
+       m.poster,
+       COUNT(DISTINCT cm.imageid) AS images,
+       COUNT(*) FILTER (WHERE cm.status = 'ok')          AS confirmed_tags,
+       COUNT(*) FILTER (WHERE cm.status IN ('ok','bad')) AS reviewed_tags,
+       MAX(cm.updated_at) AS last_at
+FROM frl.frl_join_images_camera_movements cm
+INNER JOIN frl.frl_images i ON i.idnum = cm.imageid
+LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
+WHERE {OwnerWhereSql}
+GROUP BY 1, 2, 3, 4
+ORDER BY images DESC, title
+LIMIT @limit;";
+
+            var movies = new List<object>();
+            await using (var cmd = new NpgsqlCommand(moviesSql, _connection))
+            {
+                cmd.Parameters.AddWithValue("@owner", owner.Trim());
+                cmd.Parameters.AddWithValue("@limit", limit);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                    movies.Add(new
+                    {
+                        movieId = reader.GetInt32(0),
+                        title = reader.IsDBNull(1) ? "" : reader.GetString(1),
+                        year = reader.IsDBNull(2) ? (int?)null : reader.GetInt32(2),
+                        poster = reader.IsDBNull(3) ? null : QcPosterBaseUrl + reader.GetString(3),
+                        images = Convert.ToInt32(reader.GetInt64(4)),
+                        confirmedTags = Convert.ToInt32(reader.GetInt64(5)),
+                        reviewedTags = Convert.ToInt32(reader.GetInt64(6)),
+                        lastActive = reader.IsDBNull(7) ? (DateTime?)null : reader.GetDateTime(7)
+                    });
+            }
+
+            return Ok(new
+            {
+                owner = owner.Trim(),
+                totals = new
+                {
+                    pulled,
+                    tagsAdded,
+                    completed,
+                    confirmedTags,
+                    reviewedTags,
+                    movies = movies.Count,
+                    firstAt,
+                    lastAt
+                },
+                days = dayRows,
+                movies
+            });
+        }
+
+        private const string QcPosterBaseUrl = "https://image.tmdb.org/t/p/w342";
+
         private static string DateRangeSql(string column, DateTime? from, DateTime? to)
         {
             var sb = new System.Text.StringBuilder();
