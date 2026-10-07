@@ -54,6 +54,15 @@ public interface IMovieProcessingJobRepository
     Task<ClipPreviewMotionCounts> GetPreviewCandidateCountsAsync(int afterImageId, int? movieId, bool motionOnly, CancellationToken cancellationToken);
 
     Task<MovieMissingClipSummaryResponse> GetMissingClipSummaryAsync(int limit, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Records where the clip preview run has got to, so a recycled app picks the
+    /// run up again instead of leaving the backfill half done.
+    /// </summary>
+    Task SaveClipPreviewRunAsync(ClipPreviewRunStatus status, CancellationToken cancellationToken);
+
+    /// <summary>The stored run, or null when no run has ever been recorded.</summary>
+    Task<ClipPreviewRunStatus?> GetClipPreviewRunAsync(CancellationToken cancellationToken);
 }
 
 public class MovieProcessingJobRepository : IMovieProcessingJobRepository
@@ -791,6 +800,149 @@ SET status = 'Failed',
 WHERE id = @id;";
 
         await ExecuteNonQueryAsync(sql, jobId, error, cancellationToken);
+    }
+
+    /// <summary>Mirrors migrations/049.</summary>
+    private const string ClipPreviewRunSchema = @"
+CREATE TABLE IF NOT EXISTS frl.frl_clip_preview_run (
+    id                     INTEGER      PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    running                BOOLEAN      NOT NULL DEFAULT FALSE,
+    started_after_image_id INTEGER      NOT NULL DEFAULT 0,
+    batch_size             INTEGER      NOT NULL DEFAULT 2000,
+    overwrite              BOOLEAN      NOT NULL DEFAULT FALSE,
+    motion_only            BOOLEAN      NOT NULL DEFAULT TRUE,
+    cursor_image_id        INTEGER      NOT NULL DEFAULT 0,
+    batches                INTEGER      NOT NULL DEFAULT 0,
+    requested              BIGINT       NOT NULL DEFAULT 0,
+    created                BIGINT       NOT NULL DEFAULT 0,
+    exists_count           BIGINT       NOT NULL DEFAULT 0,
+    skipped                BIGINT       NOT NULL DEFAULT 0,
+    errors                 BIGINT       NOT NULL DEFAULT 0,
+    completed_all          BOOLEAN      NOT NULL DEFAULT FALSE,
+    last_error             TEXT,
+    last_error_at          TIMESTAMPTZ,
+    started_at             TIMESTAMPTZ,
+    finished_at            TIMESTAMPTZ,
+    updated_at             TIMESTAMPTZ  NOT NULL DEFAULT now()
+);";
+
+    private static int _clipPreviewRunTableReady;
+
+    public async Task SaveClipPreviewRunAsync(ClipPreviewRunStatus status, CancellationToken cancellationToken)
+    {
+        const string sql = @"
+INSERT INTO frl.frl_clip_preview_run (
+    id, running, started_after_image_id, batch_size, overwrite, motion_only,
+    cursor_image_id, batches, requested, created, exists_count, skipped, errors,
+    completed_all, last_error, last_error_at, started_at, finished_at, updated_at)
+VALUES (
+    1, @running, @startedAfter, @batchSize, @overwrite, @motionOnly,
+    @cursor, @batches, @requested, @created, @exists, @skipped, @errors,
+    @completedAll, @lastError, @lastErrorAt, @startedAt, @finishedAt, now())
+ON CONFLICT (id) DO UPDATE SET
+    running                = excluded.running,
+    started_after_image_id = excluded.started_after_image_id,
+    batch_size             = excluded.batch_size,
+    overwrite              = excluded.overwrite,
+    motion_only            = excluded.motion_only,
+    cursor_image_id        = excluded.cursor_image_id,
+    batches                = excluded.batches,
+    requested              = excluded.requested,
+    created                = excluded.created,
+    exists_count           = excluded.exists_count,
+    skipped                = excluded.skipped,
+    errors                 = excluded.errors,
+    completed_all          = excluded.completed_all,
+    last_error             = excluded.last_error,
+    last_error_at          = excluded.last_error_at,
+    started_at             = excluded.started_at,
+    finished_at            = excluded.finished_at,
+    updated_at             = now();";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await EnsureClipPreviewRunTableAsync(conn, cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("running", status.Running);
+        cmd.Parameters.AddWithValue("startedAfter", status.StartedAfterImageId);
+        cmd.Parameters.AddWithValue("batchSize", status.BatchSize);
+        cmd.Parameters.AddWithValue("overwrite", status.Overwrite);
+        cmd.Parameters.AddWithValue("motionOnly", status.MotionOnly);
+        cmd.Parameters.AddWithValue("cursor", status.Cursor);
+        cmd.Parameters.AddWithValue("batches", status.Batches);
+        cmd.Parameters.AddWithValue("requested", (long)status.Requested);
+        cmd.Parameters.AddWithValue("created", (long)status.Created);
+        cmd.Parameters.AddWithValue("exists", (long)status.Exists);
+        cmd.Parameters.AddWithValue("skipped", (long)status.Skipped);
+        cmd.Parameters.AddWithValue("errors", (long)status.Errors);
+        cmd.Parameters.AddWithValue("completedAll", status.CompletedAll);
+        cmd.Parameters.AddWithValue("lastError", (object?)status.LastError ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("lastErrorAt", (object?)ToUtc(status.LastErrorAtUtc) ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("startedAt", (object?)ToUtc(status.StartedAtUtc) ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("finishedAt", (object?)ToUtc(status.FinishedAtUtc) ?? DBNull.Value);
+
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<ClipPreviewRunStatus?> GetClipPreviewRunAsync(CancellationToken cancellationToken)
+    {
+        const string sql = @"
+SELECT running, started_after_image_id, batch_size, overwrite, motion_only,
+       cursor_image_id, batches, requested, created, exists_count, skipped, errors,
+       completed_all, last_error, last_error_at, started_at, finished_at
+FROM frl.frl_clip_preview_run
+WHERE id = 1;";
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await EnsureClipPreviewRunTableAsync(conn, cancellationToken);
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        if (!await reader.ReadAsync(cancellationToken))
+            return null;
+
+        return new ClipPreviewRunStatus
+        {
+            Running = reader.GetBoolean(0),
+            StartedAfterImageId = reader.GetInt32(1),
+            BatchSize = reader.GetInt32(2),
+            Overwrite = reader.GetBoolean(3),
+            MotionOnly = reader.GetBoolean(4),
+            Cursor = reader.GetInt32(5),
+            Batches = reader.GetInt32(6),
+            Requested = (int)reader.GetInt64(7),
+            Created = (int)reader.GetInt64(8),
+            Exists = (int)reader.GetInt64(9),
+            Skipped = (int)reader.GetInt64(10),
+            Errors = (int)reader.GetInt64(11),
+            CompletedAll = reader.GetBoolean(12),
+            LastError = reader.IsDBNull(13) ? null : reader.GetString(13),
+            LastErrorAtUtc = reader.IsDBNull(14) ? null : reader.GetDateTime(14),
+            StartedAtUtc = reader.IsDBNull(15) ? null : reader.GetDateTime(15),
+            FinishedAtUtc = reader.IsDBNull(16) ? null : reader.GetDateTime(16)
+        };
+    }
+
+    private static DateTime? ToUtc(DateTime? value) =>
+        value.HasValue ? DateTime.SpecifyKind(value.Value, DateTimeKind.Utc) : null;
+
+    private static async Task EnsureClipPreviewRunTableAsync(
+        NpgsqlConnection conn, CancellationToken cancellationToken)
+    {
+        if (Interlocked.CompareExchange(ref _clipPreviewRunTableReady, 1, 1) == 1)
+            return;
+
+        await using (var cmd = new NpgsqlCommand(ClipPreviewRunSchema, conn))
+        {
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        Interlocked.Exchange(ref _clipPreviewRunTableReady, 1);
     }
 
     private async Task ExecuteNonQueryAsync(string sql, long jobId, string? error, CancellationToken cancellationToken)

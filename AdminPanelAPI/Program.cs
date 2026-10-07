@@ -71,6 +71,7 @@ builder.Services.AddScoped<IClipPreviewService, ClipPreviewService>();
 // Singleton so one start call can keep cutting previews in the background while
 // the status endpoint reports on it.
 builder.Services.AddSingleton<IClipPreviewMotionRunner, ClipPreviewMotionRunner>();
+builder.Services.AddHostedService<ClipPreviewRunResumeService>();
 
 builder.Services.AddScoped<IMovieProcessingService, MovieProcessingService>();
 
