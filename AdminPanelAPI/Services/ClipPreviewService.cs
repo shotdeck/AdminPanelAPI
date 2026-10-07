@@ -18,6 +18,7 @@ namespace AdminPanelAPI.Services
     public class ClipPreviewService : IClipPreviewService
     {
         private const int BatchSize = 250;
+        private const int DefaultBatchConcurrency = 4;
         private const string ClipPrefix = "clips_9s/";
         private const string PreviewSuffix = "_short.mp4";
 
@@ -26,6 +27,7 @@ namespace AdminPanelAPI.Services
         private readonly IMovieProcessingJobRepository _repo;
 
         private readonly string _clipPreviewBaseUrl;
+        private readonly int _batchConcurrency;
         private readonly string _r2AccountId;
         private readonly string _r2AccessKey;
         private readonly string _r2SecretKey;
@@ -43,6 +45,11 @@ namespace AdminPanelAPI.Services
 
             _clipPreviewBaseUrl = configuration["MoviePipeline:ClipPreviewBaseUrl"]
                                   ?? "https://semanticsearch--clip-previews-batch.modal.run";
+
+            _batchConcurrency = Math.Clamp(
+                configuration.GetValue("MoviePipeline:ClipPreviewBatchConcurrency", DefaultBatchConcurrency),
+                1,
+                16);
 
             _r2AccountId = (configuration["R2:AccountId"] ?? "").Trim();
             _r2AccessKey = (configuration["R2:AccessKey"] ?? "").Trim();
@@ -72,17 +79,12 @@ namespace AdminPanelAPI.Services
                 Requested = boundaries.Count
             };
 
-            for (var i = 0; i < boundaries.Count; i += BatchSize)
-            {
-                var batch = boundaries.Skip(i).Take(BatchSize).ToList();
+            var totals = await SendBatchesAsync(boundaries, overwrite, cancellationToken);
 
-                var summary = await SendBatchAsync(batch, overwrite, cancellationToken);
-
-                result.Created += summary.GetValueOrDefault("created");
-                result.Exists += summary.GetValueOrDefault("exists");
-                result.Skipped += summary.GetValueOrDefault("skipped");
-                result.Errors += summary.GetValueOrDefault("error");
-            }
+            result.Created = totals.GetValueOrDefault("created");
+            result.Exists = totals.GetValueOrDefault("exists");
+            result.Skipped = totals.GetValueOrDefault("skipped");
+            result.Errors = totals.GetValueOrDefault("error");
 
             return result;
         }
@@ -110,22 +112,74 @@ namespace AdminPanelAPI.Services
                 Requested = boundaries.Count
             };
 
-            for (var i = 0; i < boundaries.Count; i += BatchSize)
+            if (boundaries.Count == 0)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var batch = boundaries.Skip(i).Take(BatchSize).ToList();
-
-                var summary = await SendBatchAsync(batch, overwrite, cancellationToken);
-
-                result.Created += summary.GetValueOrDefault("created");
-                result.Exists += summary.GetValueOrDefault("exists");
-                result.Skipped += summary.GetValueOrDefault("skipped");
-                result.Errors += summary.GetValueOrDefault("error");
-                result.NextAfterImageId = batch[^1].ImageId;
+                return result;
             }
 
+            var totals = await SendBatchesAsync(boundaries, overwrite, cancellationToken);
+
+            result.Created = totals.GetValueOrDefault("created");
+            result.Exists = totals.GetValueOrDefault("exists");
+            result.Skipped = totals.GetValueOrDefault("skipped");
+            result.Errors = totals.GetValueOrDefault("error");
+            result.NextAfterImageId = boundaries.Max(b => b.ImageId);
+
             return result;
+        }
+
+        /// <summary>
+        /// Splits the clips into Modal-sized batches and keeps several of them in
+        /// flight, since one batch at a time leaves most of Modal's containers idle.
+        /// </summary>
+        private async Task<Dictionary<string, int>> SendBatchesAsync(
+            IReadOnlyCollection<ClipPreviewBoundary> boundaries,
+            bool overwrite,
+            CancellationToken cancellationToken)
+        {
+            var batches = new Queue<List<ClipPreviewBoundary>>(
+                boundaries
+                    .Select((boundary, index) => (boundary, index))
+                    .GroupBy(pair => pair.index / BatchSize)
+                    .Select(group => group.Select(pair => pair.boundary).ToList()));
+
+            var totals = new Dictionary<string, int>();
+            var gate = new object();
+
+            async Task WorkerAsync()
+            {
+                while (true)
+                {
+                    List<ClipPreviewBoundary> batch;
+
+                    lock (gate)
+                    {
+                        if (batches.Count == 0) return;
+                        batch = batches.Dequeue();
+                    }
+
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var summary = await SendBatchAsync(batch, overwrite, cancellationToken);
+
+                    lock (gate)
+                    {
+                        foreach (var entry in summary)
+                        {
+                            totals[entry.Key] = totals.GetValueOrDefault(entry.Key) + entry.Value;
+                        }
+                    }
+                }
+            }
+
+            var workers = Enumerable
+                .Range(0, Math.Min(_batchConcurrency, batches.Count))
+                .Select(_ => WorkerAsync())
+                .ToList();
+
+            await Task.WhenAll(workers);
+
+            return totals;
         }
 
         /// <summary>

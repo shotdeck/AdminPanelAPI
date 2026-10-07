@@ -5,9 +5,10 @@ namespace AdminPanelAPI.Services
 {
     /// <summary>
     /// Walks the clips needing a preview in batches on a background task so the whole
-    /// backfill runs from a single call. Progress lives in memory only: an app
-    /// restart loses it, and the run is simply started again — previews already in
-    /// R2 come back as "exists" rather than being cut twice.
+    /// backfill runs from a single call. Progress is written to
+    /// frl.frl_clip_preview_run after every batch, so a recycled app picks the run
+    /// up again from its cursor; previews already in R2 come back as "exists"
+    /// rather than being cut twice.
     /// </summary>
     public class ClipPreviewMotionRunner : IClipPreviewMotionRunner
     {
@@ -57,7 +58,10 @@ namespace AdminPanelAPI.Services
                 _cts = new CancellationTokenSource();
                 _run = Task.Run(() => RunAsync(batchSize, overwrite, motionOnly, _cts.Token));
 
-                return (true, Snapshot());
+                var snapshot = Snapshot();
+                _ = PersistAsync(snapshot);
+
+                return (true, snapshot);
             }
         }
 
@@ -146,6 +150,8 @@ namespace AdminPanelAPI.Services
                         continue;
                     }
 
+                    ClipPreviewRunStatus snapshot;
+
                     lock (_gate)
                     {
                         _status.Batches++;
@@ -159,7 +165,11 @@ namespace AdminPanelAPI.Services
                         {
                             _status.Cursor = result.NextAfterImageId.Value;
                         }
+
+                        snapshot = Snapshot();
                     }
+
+                    await PersistAsync(snapshot);
 
                     // Nothing eligible past the cursor, so every clip is done.
                     if (result.Requested == 0 || !result.NextAfterImageId.HasValue)
@@ -179,17 +189,41 @@ namespace AdminPanelAPI.Services
             }
             finally
             {
+                ClipPreviewRunStatus finalStatus;
+
                 lock (_gate)
                 {
                     _status.Running = false;
                     _status.FinishedAtUtc = DateTime.UtcNow;
+                    finalStatus = Snapshot();
                 }
+
+                await PersistAsync(finalStatus);
 
                 _logger.LogInformation(
                     "Clip preview run finished: {Created} created, {Exists} already present, {Errors} errors",
                     _status.Created,
                     _status.Exists,
                     _status.Errors);
+            }
+        }
+
+        /// <summary>
+        /// Stores the run so it survives the process. A write failure must not stop
+        /// the backfill, which is why it only logs.
+        /// </summary>
+        private async Task PersistAsync(ClipPreviewRunStatus status)
+        {
+            try
+            {
+                using var scope = _scopeFactory.CreateScope();
+                var repo = scope.ServiceProvider.GetRequiredService<IMovieProcessingJobRepository>();
+
+                await repo.SaveClipPreviewRunAsync(status, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not store clip preview run progress");
             }
         }
 
