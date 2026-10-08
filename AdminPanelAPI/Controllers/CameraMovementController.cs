@@ -2519,7 +2519,7 @@ WHERE imageid = @imageid AND camera_movements = @movement AND status = 'ok';";
             const string sql = @"
 UPDATE frl.frl_images SET clip_nsfw_violence = @value WHERE idnum = @imageid;";
             await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@value", value);
+            cmd.Parameters.AddWithValue("@value", (short)(value ? 1 : 0));
             cmd.Parameters.AddWithValue("@imageid", imageId);
             try
             {
