@@ -630,13 +630,15 @@ WHERE c.job_id = j.claim_id AND j.{MovieJobActiveSql};";
 
                 await ClearFailureAsync(r.Image.ImageId, ct);
 
-                if (r.Movements == null || r.Movements.Count == 0)
+                // quick_cuts is retired (the clip-length detector covers it).
+                var movements = r.Movements?.Where(m => m.Label != "quick_cuts").ToList();
+                if (movements == null || movements.Count == 0)
                 {
                     await InsertMovementAsync(r.Image.ImageId, "hold", 0, ct);
                 }
                 else
                 {
-                    foreach (var movement in r.Movements)
+                    foreach (var movement in movements)
                     {
                         if (movement.Label == "too_short") continue;
                         await InsertMovementAsync(r.Image.ImageId, movement.Label, movement.Confidence, ct);

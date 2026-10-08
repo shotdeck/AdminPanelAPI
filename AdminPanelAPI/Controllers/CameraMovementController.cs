@@ -482,13 +482,21 @@ ORDER BY started_at;";
         {
             await EnsureOpenAsync(ct);
             await EnsureJobTablesAsync(ct);
+            await _analysis.EnsureTablesAsync(ct);
 
             if (limit < 1) limit = 1;
             if (limit > 200) limit = 200;
 
+            // Batch fetches and Fetch Movie (title) jobs live in separate tables.
             const string sql = @"
-SELECT job_id, started_by, requested, processed, failed, status, started_at, updated_at
+SELECT job_id, started_by, requested, processed, failed, status, started_at, updated_at,
+       NULL::text AS title, NULL::text AS owner
 FROM frl.frl_camera_movement_jobs
+UNION ALL
+SELECT mj.claim_id, mj.requested_by, mj.assigned + mj.to_analyze, mj.assigned + mj.processed,
+       mj.failed, mj.status, mj.created_at, mj.updated_at, mv.title, mj.owner
+FROM frl.frl_camera_movement_movie_jobs mj
+LEFT JOIN frl.frl_movies mv ON mv.idnum = mj.movie_id
 ORDER BY started_at DESC
 LIMIT @limit;";
 
@@ -509,6 +517,8 @@ LIMIT @limit;";
                     Status = reader.GetString(5),
                     StartedAt = reader.GetDateTime(6),
                     UpdatedAt = reader.GetDateTime(7),
+                    Title = reader.IsDBNull(8) ? null : reader.GetString(8),
+                    Owner = reader.IsDBNull(9) ? null : reader.GetString(9),
                 });
             }
 
@@ -938,6 +948,7 @@ ORDER BY is_admin DESC, lower(name);";
         {
             await EnsureOpenAsync(ct);
             await EnsureTimestampColumnsAsync(ct);
+            await EnsureBouncedColumnAsync(ct);
             await EnsureUsersTablesAsync(ct);
 
             DateTime? fromDt = null, toExclusive = null;
@@ -1019,6 +1030,7 @@ ORDER BY u.is_admin DESC, lower(u.name);";
 
             await EnsureOpenAsync(ct);
             await EnsureTimestampColumnsAsync(ct);
+            await EnsureBouncedColumnAsync(ct);
 
             days = Math.Clamp(days, 7, 1000);
             limit = Math.Clamp(limit, 1, 500);
@@ -1669,6 +1681,7 @@ ORDER BY j.created_at, j.id;";
 
             await EnsureOpenAsync(ct);
             await EnsureTimestampColumnsAsync(ct);
+            await EnsureBouncedColumnAsync(ct);
             await EnsureUsersTablesAsync(ct);
 
             var orderBy = ResolveClipSort(sort);
@@ -1723,6 +1736,7 @@ SELECT cm.imageid,
        cm.camera_movements AS movement,
        cm.confidence,
        cm.status,
+       (cm.bounced_at IS NOT NULL) AS bounced,
        i.movieid,
        i.randid,
        i.filename AS image_filename,
@@ -1764,6 +1778,7 @@ LIMIT @limit OFFSET @offset;";
                     Movement = reader.GetString(reader.GetOrdinal("movement")),
                     Confidence = reader.GetFloat(reader.GetOrdinal("confidence")),
                     Status = reader.GetString(reader.GetOrdinal("status")),
+                    Bounced = reader.GetBoolean(reader.GetOrdinal("bounced")),
                     MovieId = reader.GetInt32(reader.GetOrdinal("movieid")),
                     RandId = reader.GetString(reader.GetOrdinal("randid")),
                     Filename = reader.IsDBNull(reader.GetOrdinal("image_filename"))
@@ -1868,6 +1883,7 @@ WHERE imageid IN ({idParams});";
                         TargetFrame = row.TargetFrame,
                         Confidence = row.Confidence,
                         Status = row.Status,
+                        Bounced = row.Bounced,
                         AllMovements = allMovements.GetValueOrDefault(row.ImageId)
                             ?? new List<ImageMovementInfo>(),
                         Segments = allSegments.GetValueOrDefault(row.ImageId),
@@ -1905,6 +1921,7 @@ WHERE imageid IN ({idParams});";
 
             await EnsureOpenAsync(ct);
             await EnsureTimestampColumnsAsync(ct);
+            await EnsureBouncedColumnAsync(ct);
             await EnsureUsersTablesAsync(ct);
 
             var orderBy = ResolveClipSort(request.Sort);
@@ -1986,6 +2003,7 @@ SELECT cm.imageid,
        cm.camera_movements AS movement,
        cm.confidence,
        cm.status,
+       (cm.bounced_at IS NOT NULL) AS bounced,
        i.movieid,
        i.randid,
        i.filename AS image_filename,
@@ -2031,6 +2049,7 @@ LIMIT @limit OFFSET @offset;";
                     Movement = reader.GetString(reader.GetOrdinal("movement")),
                     Confidence = reader.GetFloat(reader.GetOrdinal("confidence")),
                     Status = reader.GetString(reader.GetOrdinal("status")),
+                    Bounced = reader.GetBoolean(reader.GetOrdinal("bounced")),
                     MovieId = reader.GetInt32(reader.GetOrdinal("movieid")),
                     RandId = reader.GetString(reader.GetOrdinal("randid")),
                     Filename = reader.IsDBNull(reader.GetOrdinal("image_filename"))
@@ -2134,6 +2153,7 @@ WHERE imageid IN ({idParams});";
                         TargetFrame = row.TargetFrame,
                         Confidence = row.Confidence,
                         Status = row.Status,
+                        Bounced = row.Bounced,
                         AllMovements = allMovements.GetValueOrDefault(row.ImageId)
                             ?? new List<ImageMovementInfo>(),
                         Segments = allSegments.GetValueOrDefault(row.ImageId),
@@ -2174,6 +2194,7 @@ WHERE imageid IN ({idParams});";
 
             await EnsureOpenAsync(ct);
             await EnsureUsersTablesAsync(ct);
+            await EnsureBouncedColumnAsync(ct);
             var denied = await CheckImageEditAsync(
                 request.ActingUser, request.Items.Select(i => i.ImageId), ct);
             if (denied != null) return denied;
@@ -2186,7 +2207,8 @@ WHERE imageid IN ({idParams});";
 
                 const string sql = @"
 UPDATE frl.frl_join_images_camera_movements
-SET status = @status, updated_at = now()
+SET status = @status, updated_at = now(),
+    bounced_at = CASE WHEN @status = 'not_checked' THEN bounced_at END
 WHERE imageid = @imageid AND camera_movements = @movement;";
 
                 await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -2216,6 +2238,11 @@ WHERE imageid = @imageid AND camera_movements = @movement;";
                     if (item.Status == "ok")
                     {
                         await PromoteToSubMovementsAsync(item.ImageId, item.Movement, ct);
+                    }
+
+                    if (item.Movement == NsfwViolenceMovement && item.Status is "ok" or "bad")
+                    {
+                        await SetClipNsfwAsync(item.ImageId, item.Status == "ok", ct);
                     }
                 }
             }
@@ -2392,6 +2419,9 @@ WHERE imageid = @imageid AND camera_movements = @movement;";
                 await LogQcActionAsync(
                     request.ImageId, "deleted", request.Movement, null,
                     confidence, ct);
+
+                if (request.Movement == NsfwViolenceMovement)
+                    await SetClipNsfwAsync(request.ImageId, false, ct);
             }
 
             return Ok(new DeleteTagResponse { Deleted = rows > 0 });
@@ -2434,9 +2464,70 @@ ON CONFLICT (imageid, camera_movements) DO NOTHING;";
                 // A manually added tag is confirmed ('ok'), so queue its
                 // sub-variants for review just like a QC-confirmed parent.
                 await PromoteToSubMovementsAsync(request.ImageId, request.Movement, ct);
+
+                if (request.Movement == NsfwViolenceMovement)
+                    await SetClipNsfwAsync(request.ImageId, true, ct);
             }
 
             return Ok(new AddTagResponse { Added = rows > 0 });
+        }
+
+        // ── POST /api/admin/camera-movements/unconfirm ────────────────
+        // Admin (Motion Browse): sends a confirmed tag back to the image
+        // owner's Not Checked list, marked as bounced until re-reviewed.
+        [HttpPost("unconfirm")]
+        [ProducesResponseType(typeof(ReviewResponse), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ReviewResponse>> Unconfirm(
+            [FromBody] UnconfirmRequest request,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(request.Movement))
+                return BadRequest(new { error = "movement is required." });
+
+            await EnsureOpenAsync(ct);
+            await EnsureUsersTablesAsync(ct);
+            await EnsureBouncedColumnAsync(ct);
+            if (!await IsAdminAsync(request.ActingUser, ct))
+                return StatusCode(403, new { error = "Only admins can send tags back." });
+
+            const string sql = @"
+UPDATE frl.frl_join_images_camera_movements
+SET status = 'not_checked', bounced_at = now(), updated_at = now()
+WHERE imageid = @imageid AND camera_movements = @movement AND status = 'ok';";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@imageid", request.ImageId);
+            cmd.Parameters.AddWithValue("@movement", request.Movement);
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+
+            if (rows > 0)
+            {
+                await LogQcActionAsync(
+                    request.ImageId, "bounced", request.Movement, null, null, ct);
+                if (request.Movement == NsfwViolenceMovement)
+                    await SetClipNsfwAsync(request.ImageId, false, ct);
+            }
+
+            return Ok(new ReviewResponse { Updated = rows });
+        }
+
+        private const string NsfwViolenceMovement = "nsfw_violence";
+
+        // frl_images.clip_nsfw_violence is added by migration 050; until it
+        // has been run the update is skipped.
+        private async Task SetClipNsfwAsync(int imageId, bool value, CancellationToken ct)
+        {
+            const string sql = @"
+UPDATE frl.frl_images SET clip_nsfw_violence = @value WHERE idnum = @imageid;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            cmd.Parameters.AddWithValue("@value", value);
+            cmd.Parameters.AddWithValue("@imageid", imageId);
+            try
+            {
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+            {
+            }
         }
 
         // ── GET /api/admin/camera-movements/training-export ──────────
@@ -2783,6 +2874,22 @@ ALTER TABLE frl.frl_join_images_camera_movements ALTER COLUMN updated_at SET DEF
             _timestampColumnsReady = true;
         }
 
+        private static bool _bouncedColumnReady;
+
+        // Metadata-only add. The short lock timeout stops it queueing behind
+        // long-running queries; it just retries on the next request.
+        private async Task EnsureBouncedColumnAsync(CancellationToken ct)
+        {
+            if (_bouncedColumnReady) return;
+            const string sql = @"
+SET lock_timeout = '5s';
+ALTER TABLE frl.frl_join_images_camera_movements ADD COLUMN IF NOT EXISTS bounced_at TIMESTAMPTZ;
+RESET lock_timeout;";
+            await using var cmd = new NpgsqlCommand(sql, _connection);
+            await cmd.ExecuteNonQueryAsync(ct);
+            _bouncedColumnReady = true;
+        }
+
         private static bool _auditLogTableReady;
 
         private async Task EnsureAuditLogTableAsync(CancellationToken ct)
@@ -2971,6 +3078,9 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string Status { get; set; } = "";
             public DateTime StartedAt { get; set; }
             public DateTime UpdatedAt { get; set; }
+            // Set for Fetch Movie jobs only.
+            public string? Title { get; set; }
+            public string? Owner { get; set; }
         }
 
         public sealed class ActiveJobsResponse
@@ -3004,6 +3114,7 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string Movement { get; set; } = "";
             public float Confidence { get; set; }
             public string Status { get; set; } = "";
+            public bool Bounced { get; set; }
             public int MovieId { get; set; }
             public string RandId { get; set; } = "";
             public string Filename { get; set; } = "";
@@ -3036,6 +3147,8 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public int? TargetFrame { get; set; }
             public float Confidence { get; set; }
             public string Status { get; set; } = "";
+            // Unconfirmed from Motion Browse and sent back to the owner.
+            public bool Bounced { get; set; }
             public List<ImageMovementInfo> AllMovements { get; set; } = new();
             public List<SegmentDto>? Segments { get; set; }
         }
@@ -3097,6 +3210,13 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
         public sealed class DeleteTagResponse
         {
             public bool Deleted { get; set; }
+        }
+
+        public sealed class UnconfirmRequest
+        {
+            public int ImageId { get; set; }
+            public string Movement { get; set; } = "";
+            public string? ActingUser { get; set; }
         }
 
         public sealed class AddTagRequest
