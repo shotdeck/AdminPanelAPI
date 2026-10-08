@@ -2512,14 +2512,14 @@ WHERE imageid = @imageid AND camera_movements = @movement AND status = 'ok';";
 
         private const string NsfwViolenceMovement = "nsfw_violence";
 
-        // frl_images.clip_nsfw_violence is added by migration 050; until it
+        // frl_images.clip_nsfw_violence is added by migration 051; until it
         // has been run the update is skipped.
         private async Task SetClipNsfwAsync(int imageId, bool value, CancellationToken ct)
         {
             const string sql = @"
 UPDATE frl.frl_images SET clip_nsfw_violence = @value WHERE idnum = @imageid;";
             await using var cmd = new NpgsqlCommand(sql, _connection);
-            cmd.Parameters.AddWithValue("@value", value);
+            cmd.Parameters.AddWithValue("@value", (short)(value ? 1 : 0));
             cmd.Parameters.AddWithValue("@imageid", imageId);
             try
             {
