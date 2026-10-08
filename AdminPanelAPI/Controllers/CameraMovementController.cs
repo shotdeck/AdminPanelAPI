@@ -2512,7 +2512,7 @@ WHERE imageid = @imageid AND camera_movements = @movement AND status = 'ok';";
 
         private const string NsfwViolenceMovement = "nsfw_violence";
 
-        // frl_images.clip_nsfw_violence is added by migration 050; until it
+        // frl_images.clip_nsfw_violence is added by migration 051; until it
         // has been run the update is skipped.
         private async Task SetClipNsfwAsync(int imageId, bool value, CancellationToken ct)
         {
