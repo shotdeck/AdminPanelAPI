@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <meta name="robots" content="noindex, nofollow">
+    <title>BTS Admin · ShotDeck</title>
+    <link rel="stylesheet" href="css/bts.css?v=2">
+</head>
+<body>
+<header class="top">
+    <img src="assets/shotdeck_logo.png" alt="ShotDeck" class="logo-img">
+    <span class="product">BTS <span class="muted">Admin</span></span>
+    <span class="spacer"></span>
+    <span id="who" class="muted"></span>
+    <button id="logout" type="button" class="hidden">Sign out</button>
+</header>
+<main>
+    <form id="login" class="card center-card stack hidden">
+        <img src="assets/shotdeck_logo.png" alt="ShotDeck" class="logo-img">
+        <h2>Sign in to BTS</h2>
+        <input id="login-name" placeholder="Name" autocomplete="username" required>
+        <input id="login-password" type="password" placeholder="Password" autocomplete="current-password" required>
+        <div id="login-error" class="error"></div>
+        <button type="submit" class="primary">Sign in</button>
+    </form>
+
+    <section id="spaces" class="hidden">
+        <div class="toolbar">
+            <h2 class="crumbs">Customer spaces</h2>
+            <input id="filter" placeholder="Search">
+            <button id="new-space" type="button" class="primary">New space</button>
+        </div>
+        <div class="card">
+            <table class="list">
+                <thead><tr><th>Name</th><th>Status</th><th>Expires</th><th>Created</th><th>Notes</th></tr></thead>
+                <tbody id="space-rows"></tbody>
+            </table>
+            <div id="spaces-empty" class="muted hidden">No spaces yet. Create one for a customer to get their link.</div>
+        </div>
+    </section>
+
+    <section id="space" class="hidden">
+        <div class="toolbar">
+            <button id="back" type="button">&larr; All spaces</button>
+            <h2 id="space-title" class="crumbs"></h2>
+            <span id="space-usage" class="usage"></span>
+        </div>
+        <div class="card stack">
+            <div class="row">
+                <span id="space-status" class="badge"></span>
+                <span id="space-meta" class="muted"></span>
+            </div>
+            <div class="row">
+                <button id="share-link" type="button" class="primary">Share link</button>
+                <button id="edit-space" type="button">Edit</button>
+                <button id="rotate-link" type="button">New link</button>
+                <button id="revoke-link" type="button" class="danger">Turn off link</button>
+            </div>
+            <div id="share-box" class="stack hidden">
+                <div class="muted">Send this link to the customer. Anyone with it can open this space.</div>
+                <div class="linkbox">
+                    <input id="space-link" readonly>
+                    <button id="copy-link" type="button">Copy link</button>
+                </div>
+            </div>
+        </div>
+        <div class="tabs">
+            <button type="button" data-tab="files" class="active">Files</button>
+            <button type="button" data-tab="trash">Trash</button>
+            <button type="button" data-tab="activity">Activity</button>
+        </div>
+        <div id="tab-files"></div>
+        <div id="tab-trash" class="card hidden"></div>
+        <div id="tab-activity" class="card hidden"></div>
+    </section>
+</main>
+<script src="js/common.js?v=1"></script>
+<script src="js/browser.js?v=1"></script>
+<script src="js/admin.js?v=2"></script>
+</body>
+</html>

@@ -20,4 +20,13 @@
     <Folder Include="Properties\PublishProfiles\" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="AdminPanelAPI.Tests" />
+  </ItemGroup>
+
+  <!-- The test project sits inside the repo folder but is built on its own. -->
+  <ItemGroup>
+    <Compile Remove="..\AdminPanelAPI.Tests\**" />
+  </ItemGroup>
+
 </Project>

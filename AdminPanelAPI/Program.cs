@@ -1,3 +1,4 @@
+using AdminPanelAPI.Bts;
 using AdminPanelAPI.Interfaces;
 using AdminPanelAPI.Services;
 using Microsoft.AspNetCore.Diagnostics;
@@ -141,6 +142,9 @@ builder.Services.AddHostedService<GeocodeBackgroundService>();
 // Background movie location populate service
 builder.Services.AddHostedService<MovieLocationBackgroundService>();
 
+// BTS: customer behind-the-scenes media spaces (/bts pages, /api/bts routes)
+builder.AddBts();
+
 builder.Services.AddCors(opt =>
 {
     opt.AddPolicy("AllowAll", p =>
@@ -178,6 +182,8 @@ app.UseExceptionHandler(errors => errors.Run(async context =>
     });
 }));
 
+// Before static files so the BTS pages get their security headers.
+app.UseBts();
 app.UseStaticFiles();
 app.UseSwagger();
 
