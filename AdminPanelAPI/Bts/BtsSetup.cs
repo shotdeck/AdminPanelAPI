@@ -13,10 +13,24 @@ namespace AdminPanelAPI.Bts;
 /// </summary>
 public static class BtsSetup
 {
+    public const string CorsPolicy = "bts";
+
     public static void AddBts(this WebApplicationBuilder builder)
     {
         var services = builder.Services;
         services.AddMemoryCache();
+
+        // Only the hosted BTS pages may call /api/bts from another origin (Bts:AllowedOrigins,
+        // comma-separated); the API-wide allow-any-origin policy doesn't apply to BTS routes.
+        var origins = (builder.Configuration["Bts:AllowedOrigins"] ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(o => o.TrimEnd('/'))
+            .ToArray();
+        services.AddCors(o => o.AddPolicy(CorsPolicy, p => p
+            .WithOrigins(origins)
+            .WithHeaders("Authorization", "Content-Type", "Accept")
+            .WithMethods("GET", "POST", "PUT", "PATCH", "DELETE")
+            .SetPreflightMaxAge(TimeSpan.FromHours(1))));
 
         services.AddSingleton<BtsDataSource>(_ =>
         {

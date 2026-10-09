@@ -19,7 +19,12 @@ Customer file spaces for behind-the-scenes images and videos. Lives in AdminPane
 | `Bts:AdminPassword` | optional shared admin password, in addition to the existing admin roster |
 | `Bts:PublicSiteUrl` | origin used in customer links, e.g. `https://adminpanelapi...` |
 | `Bts:MaxFileBytes` | per-file limit, default 50 GB |
+| `Bts:AllowedOrigins` | comma-separated origins allowed to call `/api/bts` cross-origin (the hosted static site). BTS routes don't use the API-wide allow-any-origin policy |
 
-The bucket needs a CORS rule allowing `PUT`/`GET` from `Bts:PublicSiteUrl` with `ETag` exposed, and lifecycle rules to purge `trash/` after 30 days and abort incomplete multipart uploads after 7 days.
+## Hosting the pages separately
+
+`wwwroot/bts/` also works as a static site: copy it to `<site>/bts/`, set `window.BTS_API_BASE` in `bts/js/config.js` to the API origin, add the site origin to `Bts:AllowedOrigins`, and set `Bts:PublicSiteUrl` to the site so customer links point at `<site>/bts/space.html#...`.
+
+The bucket needs a CORS rule allowing `PUT`/`GET` from the origin(s) serving the pages with `ETag` exposed, and lifecycle rules to purge `trash/` after 30 days and abort incomplete multipart uploads after 7 days.
 
 Tests: `dotnet test AdminPanelAPI.Tests` (path rules, tokens).

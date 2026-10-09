@@ -8,7 +8,7 @@ namespace AdminPanelAPI.Bts.Controllers;
 
 [ApiController]
 [Route("api/bts/admin")]
-[DisableCors]
+[EnableCors(BtsSetup.CorsPolicy)]
 [EnableRateLimiting("bts")]
 [ServiceFilter(typeof(ErrorFilter))]
 public sealed class BtsAdminLoginController(SpaceStore store, Tokens tokens, IConfiguration configuration) : ControllerBase
@@ -44,7 +44,7 @@ public sealed class BtsAdminLoginController(SpaceStore store, Tokens tokens, ICo
 [ApiController]
 [Route("api/bts/admin/spaces")]
 [ServiceFilter(typeof(AdminFilter))]
-[DisableCors]
+[EnableCors(BtsSetup.CorsPolicy)]
 [EnableRateLimiting("bts")]
 [ServiceFilter(typeof(ErrorFilter))]
 public sealed class BtsAdminSpacesController(

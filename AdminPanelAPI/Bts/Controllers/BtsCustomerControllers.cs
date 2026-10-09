@@ -10,7 +10,7 @@ namespace AdminPanelAPI.Bts.Controllers;
 [ApiController]
 [Route("api/bts/space")]
 [ServiceFilter(typeof(SpaceLinkFilter))]
-[DisableCors]
+[EnableCors(BtsSetup.CorsPolicy)]
 [EnableRateLimiting("bts")]
 [ServiceFilter(typeof(ErrorFilter))]
 public sealed class BtsSpaceController(SpaceFiles files) : ControllerBase
@@ -29,14 +29,14 @@ public sealed class BtsSpaceController(SpaceFiles files) : ControllerBase
 
 [Route("api/bts/space/files")]
 [ServiceFilter(typeof(SpaceLinkFilter))]
-[DisableCors]
+[EnableCors(BtsSetup.CorsPolicy)]
 [EnableRateLimiting("bts")]
 [ServiceFilter(typeof(ErrorFilter))]
 public sealed class BtsCustomerFilesController(SpaceFiles files) : BtsSpaceFilesControllerBase(files);
 
 [Route("api/bts/admin/spaces/{spaceId:long}/files")]
 [ServiceFilter(typeof(AdminFilter))]
-[DisableCors]
+[EnableCors(BtsSetup.CorsPolicy)]
 [EnableRateLimiting("bts")]
 [ServiceFilter(typeof(ErrorFilter))]
 public sealed class BtsAdminFilesController(SpaceFiles files) : BtsSpaceFilesControllerBase(files);

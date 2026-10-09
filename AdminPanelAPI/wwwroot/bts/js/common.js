@@ -18,7 +18,7 @@
 
             var res;
             try {
-                res = await fetch(url, {
+                res = await fetch((window.BTS_API_BASE || "") + url, {
                     method: method,
                     headers: headers,
                     body: body === undefined ? undefined : JSON.stringify(body),
