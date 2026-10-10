@@ -71,12 +71,14 @@
             return !q || s.name.toLowerCase().indexOf(q) >= 0 || (s.notes || "").toLowerCase().indexOf(q) >= 0;
         }).forEach(function (s) {
             rows.appendChild(el("tr", { class: "clickable", onclick: function () { location.hash = "#space/" + s.id; } }, [
-                el("td", { text: s.name }),
+                el("td", { class: "name-cell" }, [
+                    el("div", { text: s.name }),
+                    s.notes ? el("div", { class: "muted", title: s.notes, text: s.notes }) : null
+                ]),
                 el("td", null, [statusBadge(s)]),
-                el("td", { text: s.expiresAt ? Bts.formatDate(s.expiresAt) : "Never" }),
-                el("td", { text: Bts.formatDate(s.createdAt) + " · " + s.createdBy }),
-                el("td", { class: "muted", text: s.notes || "" }),
-                el("td", null, [el("button", { type: "button", class: "small", text: "Download all",
+                el("td", { class: "hide-sm", text: s.expiresAt ? Bts.formatDate(s.expiresAt) : "Never" }),
+                el("td", { class: "hide-sm muted", text: Bts.formatDate(s.createdAt) + " · " + s.createdBy }),
+                el("td", { class: "actions-cell" }, [el("button", { type: "button", class: "small ghost row-action", text: "Download all",
                     title: "Download everything in this space as a zip",
                     onclick: function (e) { e.stopPropagation(); zipSpace(s.id); } })])
             ]));
@@ -158,9 +160,10 @@
         $("space-status").className = badge.className;
         $("space-status").textContent = badge.textContent;
         $("space-meta").textContent = "Created " + Bts.formatDate(s.createdAt) + " by " + s.createdBy +
-            (s.expiresAt ? " · expires " + Bts.formatDate(s.expiresAt) : "") +
-            (s.quotaBytes ? " · limit " + Bts.formatBytes(s.quotaBytes) : "") +
-            (s.notes ? " · " + s.notes : "");
+            " · " + (s.expiresAt ? "Link expires " + Bts.formatDate(s.expiresAt) : "Link never expires") +
+            (s.quotaBytes ? " · Limit " + Bts.formatBytes(s.quotaBytes) : "");
+        $("space-notes").textContent = s.notes || "";
+        $("space-notes").classList.toggle("hidden", !s.notes);
         $("space-link").value = s.active ? (s.link || "") : "Link is off. Create a new link to turn it back on.";
         $("copy-link").disabled = !s.active || !s.link;
         $("share-link").disabled = !s.active || !s.link;

@@ -49,30 +49,33 @@
         });
 
         this.crumbs = el("div", { class: "crumbs" });
-        this.bulkBar = el("div", { class: "row hidden" }, [
-            el("span", { class: "muted", id: "bulk-count" }),
+        this.bulkBar = el("div", { class: "bulkbar hidden" }, [
+            el("span", { class: "count", id: "bulk-count" }),
             this.zipTicketUrl ? el("button", { type: "button", text: "Download zip", onclick: function () { self.downloadZip(Object.keys(self.selected)); } }) : null,
             el("button", { type: "button", text: "Move to…", onclick: function () { self.moveSelected(); } }),
             el("button", { type: "button", class: "danger", text: "Delete", onclick: function () { self.deleteSelected(); } }),
-            el("button", { type: "button", text: "Clear", onclick: function () { self.selected = {}; self.render(); } })
+            el("span", { class: "spacer" }),
+            el("button", { type: "button", class: "link", text: "Clear selection", onclick: function () { self.selected = {}; self.render(); } })
         ]);
 
         var toolbar = el("div", { class: "toolbar" }, [
             this.crumbs,
-            this.bulkBar,
-            this.zipTicketUrl ? el("button", { type: "button", text: "Download all", title: "Download everything in this folder as a zip", onclick: function () { self.downloadZip([]); } }) : null,
-            el("button", { type: "button", text: "New folder", onclick: function () { self.newFolder(); } }),
-            el("button", { type: "button", text: "Upload folder", onclick: function () { self.folderInput.click(); } }),
-            el("button", { type: "button", class: "primary", text: "Upload files", onclick: function () { self.fileInput.click(); } }),
+            el("div", { class: "toolbar-actions" }, [
+                this.zipTicketUrl ? el("button", { type: "button", text: "Download all", title: "Download everything in this folder as a zip", onclick: function () { self.downloadZip([]); } }) : null,
+                el("button", { type: "button", text: "New folder", onclick: function () { self.newFolder(); } }),
+                el("button", { type: "button", text: "Upload folder", onclick: function () { self.folderInput.click(); } }),
+                el("button", { type: "button", class: "primary", text: "Upload files", onclick: function () { self.fileInput.click(); } })
+            ]),
             this.fileInput, this.folderInput
         ]);
 
-        this.drop = el("div", { class: "drop", text: "Drag photos and videos here to upload them into this folder." });
+        this.drop = el("div", { class: "drop", text: "Drag photos and videos anywhere here to upload them into this folder." });
         this.status = el("div", { class: "muted" });
         this.grid = el("div", { class: "grid" });
         this.uploads = el("div", { class: "uploads" });
 
         this.root.appendChild(toolbar);
+        this.root.appendChild(this.bulkBar);
         this.root.appendChild(this.drop);
         this.root.appendChild(this.status);
         this.root.appendChild(this.grid);
@@ -133,6 +136,7 @@
         var count = Object.keys(this.selected).length;
         this.bulkBar.classList.toggle("hidden", count === 0);
         this.bulkBar.querySelector("#bulk-count").textContent = count + " selected";
+        this.grid.classList.toggle("selecting", count > 0);
 
         this.grid.innerHTML = "";
         listing.folders.forEach(function (f) { self.grid.appendChild(self.folderTile(f)); });
@@ -148,7 +152,8 @@
 
     FileBrowser.prototype.checkbox = function (path) {
         var self = this;
-        var box = el("input", { type: "checkbox", class: "check" });
+        var box = el("input", { type: "checkbox", class: "check", "aria-label": "Select" });
+        box.addEventListener("click", function (e) { e.stopPropagation(); });
         box.checked = !!this.selected[path];
         box.addEventListener("change", function () {
             if (box.checked) self.selected[path] = true; else delete self.selected[path];
@@ -157,19 +162,33 @@
         return box;
     };
 
+    FileBrowser.prototype.actionsMenu = function (f, isFolder) {
+        var self = this;
+        var items = [
+            isFolder ? null : { label: "Download", run: function () { self.download(f.path); } },
+            isFolder && this.zipTicketUrl ? { label: "Download zip", run: function () { self.downloadZip([f.path]); } } : null,
+            { label: f.note ? "Edit note" : "Add note", run: function () { self.editNote(f); } },
+            { label: "Rename", run: function () { self.rename(f.path, f.name); } },
+            { label: "Move", run: function () { self.move([f.path]); } },
+            { label: "Delete", danger: true, run: function () { self.remove([f.path]); } }
+        ].filter(Boolean);
+        return el("button", {
+            type: "button", class: "menu-btn", title: "Actions", "aria-label": "Actions for " + f.name, "aria-haspopup": "menu",
+            onclick: function (e) { e.stopPropagation(); Bts.menu(e.currentTarget, items); }
+        }, [el("span"), el("span"), el("span")]);
+    };
+
     FileBrowser.prototype.folderTile = function (f) {
         var self = this;
+        function open() { self.load(f.path); }
         return el("div", { class: "tile folder" + (this.selected[f.path] ? " selected" : "") }, [
-            this.checkbox(f.path),
-            el("div", { class: "thumb", onclick: function () { self.load(f.path); } }, [el("span", { class: "folder-icon" })]),
-            el("div", { class: "meta clickable", onclick: function () { self.load(f.path); } }, [el("div", { class: "name", title: f.name, text: f.name })]),
-            this.noteBlock(f),
-            el("div", { class: "actions" }, [
-                this.noteButton(f),
-                el("button", { type: "button", text: "Rename", onclick: function () { self.rename(f.path, f.name); } }),
-                el("button", { type: "button", text: "Move", onclick: function () { self.move([f.path]); } }),
-                el("button", { type: "button", class: "danger", text: "Delete", onclick: function () { self.remove([f.path]); } })
-            ])
+            el("div", { class: "folder-row", onclick: open }, [
+                this.checkbox(f.path),
+                el("span", { class: "folder-icon" }),
+                el("div", { class: "name", title: f.name, text: f.name }),
+                this.actionsMenu(f, true)
+            ]),
+            this.noteBlock(f)
         ]);
     };
 
@@ -186,22 +205,19 @@
         } else {
             thumb.appendChild(el("span", { class: "icon", text: "FILE" }));
         }
+        if (f.kind === "video") thumb.appendChild(el("span", { class: "kind", text: "Video" }));
 
         return el("div", { class: "tile" + (this.selected[f.path] ? " selected" : "") }, [
             this.checkbox(f.path),
             thumb,
             el("div", { class: "meta" }, [
-                el("div", { class: "name", title: f.name, text: f.name }),
+                el("div", { class: "name-row" }, [
+                    el("div", { class: "name", title: f.name, text: f.name }),
+                    this.actionsMenu(f, false)
+                ]),
                 el("div", { class: "sub", text: Bts.formatBytes(f.sizeBytes) + " · " + Bts.formatDate(f.lastModified) })
             ]),
-            this.noteBlock(f),
-            el("div", { class: "actions" }, [
-                el("button", { type: "button", text: "Download", onclick: function () { self.download(f.path); } }),
-                this.noteButton(f),
-                el("button", { type: "button", text: "Rename", onclick: function () { self.rename(f.path, f.name); } }),
-                el("button", { type: "button", text: "Move", onclick: function () { self.move([f.path]); } }),
-                el("button", { type: "button", class: "danger", text: "Delete", onclick: function () { self.remove([f.path]); } })
-            ])
+            this.noteBlock(f)
         ]);
     };
 
@@ -213,11 +229,6 @@
             el("div", { class: "note-text", text: f.note.text }),
             el("div", { class: "note-by", text: by + " · " + Bts.formatDate(f.note.updatedAt) })
         ]);
-    };
-
-    FileBrowser.prototype.noteButton = function (f) {
-        var self = this;
-        return el("button", { type: "button", text: f.note ? "Edit note" : "Add note", onclick: function () { self.editNote(f); } });
     };
 
     FileBrowser.prototype.editNote = async function (f) {

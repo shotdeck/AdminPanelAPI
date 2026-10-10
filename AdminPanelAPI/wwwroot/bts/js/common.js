@@ -168,7 +168,49 @@
         }
     }
 
+    var openMenu = null;
+
+    function closeMenu() {
+        if (!openMenu) return;
+        openMenu.box.remove();
+        document.removeEventListener("mousedown", openMenu.onDoc, true);
+        document.removeEventListener("keydown", openMenu.onKey, true);
+        window.removeEventListener("resize", closeMenu);
+        window.removeEventListener("scroll", closeMenu, true);
+        openMenu.anchor.setAttribute("aria-expanded", "false");
+        openMenu = null;
+    }
+
+    /** A small dropdown under `anchor`. items: [{label, run, danger}]. Clicking the anchor again closes it. */
+    function menu(anchor, items) {
+        var reopen = !openMenu || openMenu.anchor !== anchor;
+        closeMenu();
+        if (!reopen) return;
+        var box = el("div", { class: "menu", role: "menu" }, items.map(function (it) {
+            return el("button", { type: "button", role: "menuitem", class: it.danger ? "danger" : null, text: it.label,
+                onclick: function () { closeMenu(); it.run(); } });
+        }));
+        document.body.appendChild(box);
+        var r = anchor.getBoundingClientRect();
+        var left = Math.min(window.innerWidth - box.offsetWidth - 8, Math.max(8, r.right - box.offsetWidth));
+        var top = r.bottom + 4;
+        if (top + box.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - box.offsetHeight - 4);
+        box.style.left = left + "px";
+        box.style.top = top + "px";
+        anchor.setAttribute("aria-expanded", "true");
+
+        function onDoc(e) { if (!box.contains(e.target) && !anchor.contains(e.target)) closeMenu(); }
+        function onKey(e) { if (e.key === "Escape") { closeMenu(); anchor.focus(); } }
+        openMenu = { box: box, anchor: anchor, onDoc: onDoc, onKey: onKey };
+        document.addEventListener("mousedown", onDoc, true);
+        document.addEventListener("keydown", onKey, true);
+        window.addEventListener("resize", closeMenu);
+        window.addEventListener("scroll", closeMenu, true);
+        if (box.firstChild) box.firstChild.focus();
+    }
+
     window.Bts = {
+        menu: menu,
         downloadZip: downloadZip,
         ApiError: ApiError,
         makeApi: makeApi,
