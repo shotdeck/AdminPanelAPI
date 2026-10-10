@@ -6,7 +6,7 @@
     <meta name="referrer" content="no-referrer">
     <meta name="robots" content="noindex, nofollow">
     <title>BTS Admin · ShotDeck</title>
-    <link rel="stylesheet" href="css/bts.css?v=2">
+    <link rel="stylesheet" href="css/bts.css?v=3">
 </head>
 <body>
 <header class="top">
@@ -27,14 +27,14 @@
     </form>
 
     <section id="spaces" class="hidden">
-        <div class="toolbar">
-            <h2 class="crumbs">Customer spaces</h2>
-            <input id="filter" placeholder="Search">
+        <div class="page-head">
+            <h2>Customer spaces</h2>
+            <input id="filter" type="search" placeholder="Search by name or notes">
             <button id="new-space" type="button" class="primary">New space</button>
         </div>
-        <div class="card">
+        <div class="card flush">
             <table class="list">
-                <thead><tr><th>Name</th><th>Status</th><th>Expires</th><th>Created</th><th>Notes</th><th></th></tr></thead>
+                <thead><tr><th>Name</th><th>Status</th><th class="hide-sm">Expires</th><th class="hide-sm">Created</th><th></th></tr></thead>
                 <tbody id="space-rows"></tbody>
             </table>
             <div id="spaces-empty" class="muted hidden">No spaces yet. Create one for a customer to get their link.</div>
@@ -42,22 +42,25 @@
     </section>
 
     <section id="space" class="hidden">
-        <div class="toolbar">
-            <button id="back" type="button">&larr; All spaces</button>
-            <h2 id="space-title" class="crumbs"></h2>
-            <span id="space-usage" class="usage"></span>
-        </div>
-        <div class="card stack">
-            <div class="row">
+        <button id="back" type="button" class="link back">&larr; All spaces</button>
+        <div class="card space-head">
+            <div class="title-row">
+                <h2 id="space-title"></h2>
                 <span id="space-status" class="badge"></span>
-                <span id="space-meta" class="muted"></span>
+                <span id="space-usage" class="usage"></span>
             </div>
-            <div class="row">
-                <button id="share-link" type="button" class="primary">Share link</button>
-                <button id="zip-space" type="button" title="Download everything in this space as a zip">Download all</button>
-                <button id="edit-space" type="button">Edit</button>
-                <button id="rotate-link" type="button">New link</button>
-                <button id="revoke-link" type="button" class="danger">Turn off link</button>
+            <div id="space-meta" class="muted"></div>
+            <div id="space-notes" class="notes hidden"></div>
+            <div class="space-actions">
+                <div class="group">
+                    <button id="share-link" type="button" class="primary">Share link</button>
+                    <button id="zip-space" type="button" title="Download everything in this space as a zip">Download all</button>
+                </div>
+                <div class="group secondary">
+                    <button id="edit-space" type="button">Edit details</button>
+                    <button id="rotate-link" type="button" title="Replace the link. The current one stops working.">New link</button>
+                    <button id="revoke-link" type="button" class="danger">Turn off link</button>
+                </div>
             </div>
             <div id="share-box" class="stack hidden">
                 <div class="muted">Send this link to the customer. Anyone with it can open this space.</div>
@@ -78,8 +81,8 @@
     </section>
 </main>
 <script src="js/config.js?v=1"></script>
-<script src="js/common.js?v=2"></script>
-<script src="js/browser.js?v=1"></script>
-<script src="js/admin.js?v=2"></script>
+<script src="js/common.js?v=3"></script>
+<script src="js/browser.js?v=2"></script>
+<script src="js/admin.js?v=3"></script>
 </body>
 </html>
