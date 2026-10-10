@@ -73,12 +73,6 @@ public static class BtsSetup
         forwarded.KnownNetworks.Clear();
         forwarded.KnownProxies.Clear();
 
-        var storageOrigin = new Lazy<string>(() =>
-        {
-            try { return app.Services.GetRequiredService<BucketClient>().Origin; }
-            catch (InvalidOperationException) { return ""; }
-        });
-
         app.UseWhen(IsBts, branch =>
         {
             branch.UseForwardedHeaders(forwarded);
@@ -89,17 +83,7 @@ public static class BtsSetup
                 headers["Referrer-Policy"] = "no-referrer";
                 headers["X-Content-Type-Options"] = "nosniff";
                 headers["X-Frame-Options"] = "DENY";
-                if (ctx.Request.Path.StartsWithSegments("/api"))
-                {
-                    headers.CacheControl = "no-store";
-                }
-                else
-                {
-                    var origin = storageOrigin.Value;
-                    headers.ContentSecurityPolicy =
-                        $"default-src 'self'; img-src 'self' blob: data: {origin}; media-src 'self' blob: {origin}; " +
-                        $"connect-src 'self' {origin}; frame-ancestors 'none'; base-uri 'none'";
-                }
+                headers.CacheControl = "no-store";
                 await next();
             });
         });
@@ -107,8 +91,7 @@ public static class BtsSetup
         app.UseRateLimiter();
     }
 
-    private static bool IsBts(HttpContext ctx) =>
-        ctx.Request.Path.StartsWithSegments("/bts") || ctx.Request.Path.StartsWithSegments("/api/bts");
+    private static bool IsBts(HttpContext ctx) => ctx.Request.Path.StartsWithSegments("/api/bts");
 
     private static RateLimitPartition<string> PerIp(HttpContext ctx, int permits, TimeSpan window) =>
         RateLimitPartition.GetFixedWindowLimiter(
