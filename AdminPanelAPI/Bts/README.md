@@ -28,3 +28,7 @@ Customer file spaces for behind-the-scenes images and videos. Lives in AdminPane
 The bucket needs a CORS rule allowing `PUT`/`GET` from the origin(s) serving the pages with `ETag` exposed, and lifecycle rules to purge `trash/` after 30 days and abort incomplete multipart uploads after 7 days.
 
 Tests: `dotnet test AdminPanelAPI.Tests` (path rules, tokens).
+
+## Zip downloads (admins only)
+
+Admins can zip a whole space (**Download all** on the spaces list or the space header), the current folder, or ticked files and folders. The page asks `POST /api/bts/admin/spaces/{id}/zip-ticket` for a 5-minute signed ticket naming exactly what to include, then submits it as a plain form to `POST /api/bts/zip`. The API streams the objects from R2 straight into the zip (stored, not recompressed), so nothing is buffered in memory or on disk. Each zip download is written to the space's activity log. The form POST is a navigation, so it needs no CORS; an invalid or expired ticket gets `204` and the page stays put.

@@ -75,7 +75,10 @@
                 el("td", null, [statusBadge(s)]),
                 el("td", { text: s.expiresAt ? Bts.formatDate(s.expiresAt) : "Never" }),
                 el("td", { text: Bts.formatDate(s.createdAt) + " · " + s.createdBy }),
-                el("td", { class: "muted", text: s.notes || "" })
+                el("td", { class: "muted", text: s.notes || "" }),
+                el("td", null, [el("button", { type: "button", class: "small", text: "Download all",
+                    title: "Download everything in this space as a zip",
+                    onclick: function (e) { e.stopPropagation(); zipSpace(s.id); } })])
             ]));
         });
         $("spaces-empty").classList.toggle("hidden", spaces.length > 0);
@@ -140,6 +143,7 @@
             api: api,
             base: "/api/bts/admin/spaces/" + id + "/files",
             customerLabel: "Customer",
+            zipTicketUrl: "/api/bts/admin/spaces/" + id + "/zip-ticket",
             onChange: refreshUsage
         });
         selectTab("files");
@@ -201,6 +205,12 @@
             Bts.toast("Press Ctrl+C to copy.");
         }
     });
+
+    function zipSpace(id) {
+        return Bts.downloadZip(api, "/api/bts/admin/spaces/" + id + "/zip-ticket", "", []);
+    }
+
+    $("zip-space").addEventListener("click", function () { zipSpace(current.id); });
 
     $("edit-space").addEventListener("click", async function () {
         var v = await Bts.promptDialog("Edit space", spaceFields(current), "Save");

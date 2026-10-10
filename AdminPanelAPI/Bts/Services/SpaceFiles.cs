@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.IO.Compression;
 using AdminPanelAPI.Bts.Models;
 using Microsoft.Extensions.Caching.Memory;
 
@@ -267,6 +268,68 @@ public sealed class SpaceFiles
     }
 
     /// <summary>Sets the note on a file, or a folder when the path ends with '/'. Blank removes it.</summary>
+    public const int MaxZipSelections = 1000;
+
+    /// <summary>Checks the paths picked for a zip; none means the whole folder.</summary>
+    public static IReadOnlyList<string> ZipSelection(string folder, IReadOnlyCollection<string>? paths)
+    {
+        if (paths is null || paths.Count == 0) return new[] { folder };
+        if (paths.Count > MaxZipSelections)
+            throw new ArgumentException($"Pick up to {MaxZipSelections} items at a time.");
+        return paths.Select(p => p.EndsWith('/') ? PathRules.Folder(p) : PathRules.File(p)).Distinct().ToList();
+    }
+
+    /// <summary>
+    /// Streams the selected files and folders from R2 into a zip written to
+    /// <paramref name="output"/>. Entry names are relative to <paramref name="folder"/>.
+    /// Media is already compressed, so entries are stored as-is.
+    /// </summary>
+    public async Task<int> WriteZipAsync(Space space, string folder, IReadOnlyList<string> paths, Stream output, CancellationToken ct)
+    {
+        var root = space.Root;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var count = 0;
+        using var zip = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: true);
+
+        string EntryName(string rel) => rel.StartsWith(folder, StringComparison.Ordinal) && rel.Length > folder.Length
+            ? rel[folder.Length..]
+            : rel;
+
+        async Task AddFile(string rel, DateTime? modified)
+        {
+            var name = EntryName(rel);
+            if (!seen.Add(name)) return;
+            using var obj = await _bucket.OpenReadAsync(root + rel, ct);
+            if (obj is null) return;
+            var entry = zip.CreateEntry(name, CompressionLevel.NoCompression);
+            entry.LastWriteTime = new DateTimeOffset(DateTime.SpecifyKind(modified ?? obj.LastModified ?? DateTime.UtcNow, DateTimeKind.Utc));
+            await using var target = entry.Open();
+            await obj.ResponseStream.CopyToAsync(target, ct);
+            count++;
+        }
+
+        foreach (var rel in paths)
+        {
+            if (!rel.EndsWith('/') && rel.Length > 0)
+            {
+                await AddFile(rel, null);
+                continue;
+            }
+            await foreach (var o in _bucket.ListAllAsync(root + rel, ct))
+            {
+                var r = o.Key[root.Length..];
+                if (r.EndsWith('/'))
+                {
+                    var dir = EntryName(r);
+                    if (r != folder && seen.Add(dir)) zip.CreateEntry(dir);
+                    continue;
+                }
+                await AddFile(r, o.LastModified);
+            }
+        }
+        return count;
+    }
+
     public async Task<NoteResult> SetNoteAsync(SpaceContext ctx, string? path, string? note, string? ip, CancellationToken ct)
     {
         var isFolder = (path ?? "").TrimEnd().EndsWith('/');

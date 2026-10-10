@@ -247,6 +247,19 @@ public sealed class BucketClient : IDisposable
         return keys.Count;
     }
 
+    /// <summary>Opens an object for streaming through the API (zip downloads), or null when it does not exist.</summary>
+    public async Task<GetObjectResponse?> OpenReadAsync(string key, CancellationToken ct)
+    {
+        try
+        {
+            return await _client.GetObjectAsync(Bucket, key, ct);
+        }
+        catch (AmazonS3Exception e) when (e.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+    }
+
     public Task DeleteAsync(string key, CancellationToken ct) => _client.DeleteObjectAsync(Bucket, key, ct);
 
     public void Dispose() => _client.Dispose();

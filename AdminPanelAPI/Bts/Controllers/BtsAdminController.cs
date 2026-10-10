@@ -119,6 +119,15 @@ public sealed class BtsAdminSpacesController(
         return new FolderEntry(PathRules.LastSegment(path), path);
     }
 
+    [HttpPost("{spaceId:long}/zip-ticket")]
+    public ZipTicketResponse ZipTicket([FromBody] ZipTicketRequest req)
+    {
+        var folder = PathRules.Folder(req.Folder);
+        var paths = SpaceFiles.ZipSelection(folder, req.Paths);
+        var (ticket, expires) = tokens.IssueZipTicket(Context.Space.Id, Admin, folder, paths);
+        return new ZipTicketResponse(ticket, expires);
+    }
+
     private string? ClientIp => HttpContext.Connection.RemoteIpAddress?.ToString();
 
     private static (string Name, string? Notes, long? Quota, DateTimeOffset? Expires) Validate(SpaceRequest req)

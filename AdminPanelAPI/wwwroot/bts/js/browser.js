@@ -19,6 +19,7 @@
         this.base = opts.base;
         this.onChange = opts.onChange || function () {};
         this.customerLabel = opts.customerLabel || "You";
+        this.zipTicketUrl = opts.zipTicketUrl || null;
         this.path = "";
         this.listing = null;
         this.selected = {};
@@ -50,6 +51,7 @@
         this.crumbs = el("div", { class: "crumbs" });
         this.bulkBar = el("div", { class: "row hidden" }, [
             el("span", { class: "muted", id: "bulk-count" }),
+            this.zipTicketUrl ? el("button", { type: "button", text: "Download zip", onclick: function () { self.downloadZip(Object.keys(self.selected)); } }) : null,
             el("button", { type: "button", text: "Move to…", onclick: function () { self.moveSelected(); } }),
             el("button", { type: "button", class: "danger", text: "Delete", onclick: function () { self.deleteSelected(); } }),
             el("button", { type: "button", text: "Clear", onclick: function () { self.selected = {}; self.render(); } })
@@ -58,6 +60,7 @@
         var toolbar = el("div", { class: "toolbar" }, [
             this.crumbs,
             this.bulkBar,
+            this.zipTicketUrl ? el("button", { type: "button", text: "Download all", title: "Download everything in this folder as a zip", onclick: function () { self.downloadZip([]); } }) : null,
             el("button", { type: "button", text: "New folder", onclick: function () { self.newFolder(); } }),
             el("button", { type: "button", text: "Upload folder", onclick: function () { self.folderInput.click(); } }),
             el("button", { type: "button", class: "primary", text: "Upload files", onclick: function () { self.fileInput.click(); } }),
@@ -317,6 +320,10 @@
         } catch (e) {
             Bts.toast(e.message, true);
         }
+    };
+
+    FileBrowser.prototype.downloadZip = function (paths) {
+        return Bts.downloadZip(this.api, this.zipTicketUrl, this.path, paths);
     };
 
     // ── Uploads ────────────────────────────────────────────────
