@@ -207,7 +207,8 @@ button.back:hover { color: var(--text); }
     main { padding: 16px; }
     header.top { padding: 0 16px; gap: 12px; }
     header.top .logo-img { height: 22px; }
-    header.top .usage { display: none; }
+    header.top .product { display: none; }
+    header.top .usage { font-size: 12px; }
     .toolbar-actions, .page-head input { width: 100%; }
     .toolbar-actions button { flex: 1; }
     .space-actions .group.secondary { margin-left: 0; }

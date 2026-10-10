@@ -166,7 +166,7 @@
         var self = this;
         var items = [
             isFolder ? null : { label: "Download", run: function () { self.download(f.path); } },
-            isFolder && this.zipTicketUrl ? { label: "Download zip", run: function () { self.downloadZip([f.path]); } } : null,
+            isFolder && this.zipTicketUrl ? { label: "Download zip", run: function () { Bts.downloadZip(self.api, self.zipTicketUrl, f.path, []); } } : null,
             { label: f.note ? "Edit note" : "Add note", run: function () { self.editNote(f); } },
             { label: "Rename", run: function () { self.rename(f.path, f.name); } },
             { label: "Move", run: function () { self.move([f.path]); } },
