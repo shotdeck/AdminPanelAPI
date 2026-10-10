@@ -81,6 +81,18 @@ public sealed class BtsAdminSpacesController(
         return ToDto(space!);
     }
 
+    [HttpPut("{spaceId:long}/status")]
+    public async Task<AdminSpaceDto> SetStatus([FromBody] SpaceStatusRequest req, CancellationToken ct)
+    {
+        var status = (req.Status ?? "").Trim().ToLowerInvariant();
+        if (!Space.Statuses.Contains(status))
+            throw new ArgumentException("Status must be new, processing or complete.");
+        var space = await store.SetStatusAsync(Context.Space.Id, status, ct);
+        cache.Invalidate(Context.Space.Id);
+        await store.LogAsync(Context.Space.Id, Admin, "set-status", status, null, null, ClientIp);
+        return ToDto(space!);
+    }
+
     /// <summary>Issues a new link; the old one stops working within seconds.</summary>
     [HttpPost("{spaceId:long}/rotate-link")]
     public async Task<AdminSpaceDto> RotateLink(CancellationToken ct)
@@ -155,6 +167,6 @@ public sealed class BtsAdminSpacesController(
             link = null;
         }
         return new AdminSpaceDto(s.Id, s.Name, s.Notes, s.QuotaBytes, s.ExpiresAt, s.RevokedAt, s.IsActive,
-            s.CreatedBy, s.CreatedAt, s.UpdatedAt, link);
+            s.CreatedBy, s.CreatedAt, s.UpdatedAt, link, s.Status, s.LastEditedAt ?? s.UpdatedAt);
     }
 }

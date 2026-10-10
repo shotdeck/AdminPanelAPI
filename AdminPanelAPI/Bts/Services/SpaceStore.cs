@@ -11,7 +11,7 @@ namespace AdminPanelAPI.Bts.Services;
 public sealed class SpaceStore
 {
     private const string SpaceColumns =
-        "id, name, notes, quota_bytes, expires_at, revoked_at, created_by, created_at, updated_at, token_sealed";
+        "id, name, notes, quota_bytes, expires_at, revoked_at, created_by, created_at, updated_at, status, token_sealed";
 
     private readonly NpgsqlDataSource _db;
     private readonly ILogger<SpaceStore> _logger;
@@ -38,11 +38,14 @@ public sealed class SpaceStore
 
     public async Task<IReadOnlyList<Space>> ListAsync(CancellationToken ct)
     {
-        await using var cmd = _db.CreateCommand($"SELECT {SpaceColumns} FROM bts.spaces ORDER BY lower(name), id");
+        // "Last edited" covers changes to the space and its files, but not zip downloads.
+        await using var cmd = _db.CreateCommand(
+            $"SELECT {SpaceColumns}, GREATEST(updated_at, (SELECT max(a.at) FROM bts.activity a " +
+            "WHERE a.space_id = s.id AND a.action <> 'zip-download')) FROM bts.spaces s ORDER BY lower(name), id");
         var spaces = new List<Space>();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
-            spaces.Add(Read(reader));
+            spaces.Add(Read(reader) with { LastEditedAt = reader.GetFieldValue<DateTimeOffset>(11) });
         return spaces;
     }
 
@@ -74,6 +77,15 @@ public sealed class SpaceStore
         cmd.Parameters.AddWithValue("notes", (object?)notes ?? DBNull.Value);
         cmd.Parameters.AddWithValue("quota", (object?)quotaBytes ?? DBNull.Value);
         cmd.Parameters.AddWithValue("expires", (object?)expiresAt?.ToUniversalTime() ?? DBNull.Value);
+        return await ReadOneAsync(cmd, ct);
+    }
+
+    public async Task<Space?> SetStatusAsync(long id, string status, CancellationToken ct)
+    {
+        await using var cmd = _db.CreateCommand(
+            $"UPDATE bts.spaces SET status = @status, updated_at = now() WHERE id = @id RETURNING {SpaceColumns}");
+        cmd.Parameters.AddWithValue("id", id);
+        cmd.Parameters.AddWithValue("status", status);
         return await ReadOneAsync(cmd, ct);
     }
 
@@ -252,5 +264,6 @@ public sealed class SpaceStore
         r.GetString(6),
         r.GetFieldValue<DateTimeOffset>(7),
         r.GetFieldValue<DateTimeOffset>(8),
-        r.GetFieldValue<byte[]>(9));
+        r.GetString(9),
+        r.GetFieldValue<byte[]>(10));
 }
