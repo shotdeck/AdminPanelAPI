@@ -10,8 +10,13 @@ public sealed record Space(
     string CreatedBy,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
-    byte[] TokenSealed)
+    string Status,
+    byte[] TokenSealed,
+    DateTimeOffset? LastEditedAt = null)
 {
+    public static readonly IReadOnlySet<string> Statuses = new HashSet<string>(StringComparer.Ordinal)
+        { "new", "processing", "complete" };
+
     public bool IsActive => RevokedAt is null && (ExpiresAt is null || ExpiresAt > DateTimeOffset.UtcNow);
 
     /// <summary>Where the space's files live in the bucket.</summary>
@@ -66,7 +71,8 @@ public sealed record MoveResult(int Moved);
 
 public sealed record AdminSpaceDto(
     long Id, string Name, string? Notes, long? QuotaBytes, DateTimeOffset? ExpiresAt, DateTimeOffset? RevokedAt,
-    bool Active, string CreatedBy, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, string? Link);
+    bool Active, string CreatedBy, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, string? Link,
+    string Status, DateTimeOffset LastEditedAt);
 
 public sealed record LoginResponse(string Token, string Name, DateTimeOffset ExpiresAt);
 
@@ -141,6 +147,11 @@ public sealed class MoveRequest
 {
     public string? Path { get; set; }
     public string? ToFolder { get; set; }
+}
+
+public sealed class SpaceStatusRequest
+{
+    public string? Status { get; set; }
 }
 
 public sealed class SpaceRequest
