@@ -108,10 +108,49 @@ public sealed class Tokens
         }
     }
 
+    public static readonly TimeSpan ZipTicketLifetime = TimeSpan.FromMinutes(5);
+
+    /// <summary>A short-lived signed ticket that lets a plain form POST download a zip of the listed paths.</summary>
+    public (string Ticket, DateTimeOffset ExpiresAt) IssueZipTicket(long spaceId, string actor, string folder, IReadOnlyList<string> paths)
+    {
+        var expires = DateTimeOffset.UtcNow.Add(ZipTicketLifetime);
+        var payload = JsonSerializer.SerializeToUtf8Bytes(new ZipTicket(spaceId, actor, folder, paths.ToArray(), expires.ToUnixTimeSeconds()));
+        var body = Base64Url(payload);
+        return ($"{body}.{Sign(ZipPurpose + body)}", expires);
+    }
+
+    public ZipTicket? ValidateZipTicket(string? ticket)
+    {
+        if (string.IsNullOrEmpty(ticket)) return null;
+        var dot = ticket.IndexOf('.');
+        if (dot <= 0 || dot == ticket.Length - 1) return null;
+
+        var body = ticket[..dot];
+        if (!CryptographicOperations.FixedTimeEquals(
+                Encoding.ASCII.GetBytes(Sign(ZipPurpose + body)), Encoding.ASCII.GetBytes(ticket[(dot + 1)..])))
+            return null;
+
+        try
+        {
+            var t = JsonSerializer.Deserialize<ZipTicket>(FromBase64Url(body));
+            if (t is null || t.Paths is null || string.IsNullOrWhiteSpace(t.Actor)) return null;
+            return DateTimeOffset.UtcNow.ToUnixTimeSeconds() < t.Exp ? t : null;
+        }
+        catch (Exception ex) when (ex is JsonException or FormatException)
+        {
+            return null;
+        }
+    }
+
+    // Admin tokens are signed over the bare body, which can never contain ':', so neither kind passes as the other.
+    private const string ZipPurpose = "zip:";
+
     private string Sign(string body) =>
         Base64Url(HMACSHA256.HashData(_adminKey, Encoding.ASCII.GetBytes(body)));
 
     private sealed record AdminClaim(string Name, long Exp);
+
+    public sealed record ZipTicket(long SpaceId, string Actor, string Folder, string[] Paths, long Exp);
 
     // ── Helpers ────────────────────────────────────────────────
 

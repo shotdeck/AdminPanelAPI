@@ -120,3 +120,5 @@ table.list tr.clickable:hover { background: var(--panel-2); }
 .tile .note { margin: 0 10px 8px; padding: 6px 8px; border-left: 2px solid var(--accent); background: rgba(255,255,255,.03); border-radius: 0 4px 4px 0; cursor: pointer; font-size: 13px; }
 .tile .note-text { white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 .tile .note-by { color: var(--muted); font-size: 11px; margin-top: 3px; }
+
+button.small { padding: 4px 10px; font-size: 12px; }

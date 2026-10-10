@@ -91,6 +91,14 @@ public sealed class UploadStartRequest
     public long SizeBytes { get; set; }
 }
 
+public sealed class ZipTicketRequest
+{
+    public string? Folder { get; set; }
+    public List<string>? Paths { get; set; }
+}
+
+public sealed record ZipTicketResponse(string Ticket, DateTimeOffset ExpiresAt);
+
 public sealed class PartUrlsRequest
 {
     public string? Path { get; set; }

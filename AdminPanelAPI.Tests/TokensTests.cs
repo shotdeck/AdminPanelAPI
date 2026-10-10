@@ -61,4 +61,31 @@ public class TokensTests
         var (token, _) = tokens.IssueAdmin("Admin");
         Assert.Null(tokens.ValidateAdmin(token));
     }
+
+    [Fact]
+    public void Zip_ticket_round_trips()
+    {
+        var tokens = Make();
+        var (ticket, _) = tokens.IssueZipTicket(7, "Admin", "Day 1/", new[] { "Day 1/a.jpg", "Day 1/Stills/" });
+        var t = tokens.ValidateZipTicket(ticket);
+        Assert.NotNull(t);
+        Assert.Equal(7, t!.SpaceId);
+        Assert.Equal("Day 1/", t.Folder);
+        Assert.Equal(new[] { "Day 1/a.jpg", "Day 1/Stills/" }, t.Paths);
+    }
+
+    [Fact]
+    public void Zip_ticket_rejects_tampering_other_keys_and_admin_tokens()
+    {
+        var tokens = Make();
+        var (ticket, _) = tokens.IssueZipTicket(7, "Admin", "", new[] { "" });
+        var dot = ticket.IndexOf('.');
+        var forged = Tokens.Base64Url(System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(
+            new Tokens.ZipTicket(8, "Admin", "", new[] { "" }, long.MaxValue))) + ticket[dot..];
+        Assert.Null(tokens.ValidateZipTicket(forged));
+        Assert.Null(Make().ValidateZipTicket(ticket));
+        Assert.Null(tokens.ValidateAdmin(ticket));
+        Assert.Null(tokens.ValidateZipTicket(tokens.IssueAdmin("Admin").Token));
+        Assert.Null(tokens.ValidateZipTicket(null));
+    }
 }

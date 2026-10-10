@@ -145,7 +145,31 @@
         box._t = setTimeout(function () { box.style.display = "none"; }, isError ? 6000 : 3000);
     }
 
+    // Zips are streamed by the API. A plain form POST hands the response to the
+    // browser's download manager; the signed ticket is its only authorisation.
+    async function downloadZip(api, ticketUrl, folder, paths) {
+        try {
+            var res = await api.post(ticketUrl, { folder: folder || "", paths: paths || [] });
+            var form = document.createElement("form");
+            form.method = "POST";
+            form.action = (window.BTS_API_BASE || "") + "/api/bts/zip";
+            form.className = "hidden";
+            var input = document.createElement("input");
+            input.type = "hidden";
+            input.name = "ticket";
+            input.value = res.ticket;
+            form.appendChild(input);
+            document.body.appendChild(form);
+            form.submit();
+            form.remove();
+            toast("Preparing the zip. The download will start in a moment.");
+        } catch (e) {
+            toast(e.message, true);
+        }
+    }
+
     window.Bts = {
+        downloadZip: downloadZip,
         ApiError: ApiError,
         makeApi: makeApi,
         formatBytes: formatBytes,
