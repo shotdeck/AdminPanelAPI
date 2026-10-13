@@ -570,8 +570,9 @@ ON CONFLICT (idnum) DO UPDATE SET
 
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync(cancellationToken);
+            await using var tx = await conn.BeginTransactionAsync(cancellationToken);
 
-            await using var cmd = new NpgsqlCommand(sql, conn);
+            await using var cmd = new NpgsqlCommand(sql, conn, tx);
             cmd.Parameters.AddWithValue("idnum", idnum);
             cmd.Parameters.AddWithValue("randid", (object?)randid ?? DBNull.Value);
             cmd.Parameters.AddWithValue("captions", (object?)caption ?? DBNull.Value);
@@ -593,6 +594,19 @@ ON CONFLICT (idnum) DO UPDATE SET
                 (object?)keywordMetadata ?? DBNull.Value);
 
             await cmd.ExecuteNonQueryAsync(cancellationToken);
+
+            // Search reads the first 998 dimensions from the mini table, so keep it in step with the full row.
+            const string miniSql = @"
+DELETE FROM frl.frl_caption_embeddings_qwen3_mini_998 WHERE idnum = @idnum;
+INSERT INTO frl.frl_caption_embeddings_qwen3_mini_998
+SELECT @idnum, subvector(@embeddings::halfvec, 1, 998);";
+
+            await using var miniCmd = new NpgsqlCommand(miniSql, conn, tx);
+            miniCmd.Parameters.AddWithValue("idnum", idnum);
+            miniCmd.Parameters.AddWithValue("embeddings", embeddingString);
+            await miniCmd.ExecuteNonQueryAsync(cancellationToken);
+
+            await tx.CommitAsync(cancellationToken);
         }
     }
 }
