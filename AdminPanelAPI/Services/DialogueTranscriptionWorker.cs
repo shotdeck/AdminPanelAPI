@@ -52,9 +52,10 @@ namespace AdminPanelAPI.Services
                     await service.TranscribeMovieAsync(
                         jobId, job.MovieId, job.R2Key, stoppingToken);
 
-                    var updatedJob = await repo.GetJobAsync(jobId, stoppingToken);
-                    await repo.MarkCompletedAsync(
-                        jobId, updatedJob?.WordCount ?? 0, stoppingToken);
+                    // The service doesn't persist the count mid-run, so read the
+                    // movie's actual word count here for an accurate status.
+                    var wordCount = await repo.GetMovieWordCountAsync(job.MovieId, stoppingToken);
+                    await repo.MarkCompletedAsync(jobId, wordCount, stoppingToken);
 
                     _logger.LogInformation(
                         "Completed dialogue job {JobId}, movie {MovieId}",
