@@ -11,9 +11,10 @@ using System.Text.Json;
 namespace AdminPanelAPI.Services
 {
     /// <summary>
-    /// Asks the Modal clip-preview app for 480p silent previews of the scene inside
+    /// Asks the Modal clip-preview app for silent previews of the scene inside
     /// each 9 second clip. Previews land in R2 beside their source clip, at
-    /// clips_9s/{movieId}/{randid}_short.mp4.
+    /// clips_9s/{movieId}/{randid}_short.mp4 (480 wide), _short_960.mp4 and
+    /// _short_1920.mp4. Only missing sizes are cut unless overwrite is set.
     /// </summary>
     public class ClipPreviewService : IClipPreviewService
     {

@@ -722,8 +722,9 @@ WHERE movieid = @movieid;";
                     if (!obj.Key.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase))
                         continue;
 
-                    // Previews live beside their clip as {randid}_short.mp4 and are not clips.
-                    if (obj.Key.EndsWith("_short.mp4", StringComparison.OrdinalIgnoreCase))
+                    // Previews live beside their clip as {randid}_short.mp4, _short_960.mp4
+                    // and _short_1920.mp4, and are not clips.
+                    if (Path.GetFileNameWithoutExtension(obj.Key).Contains("_short", StringComparison.OrdinalIgnoreCase))
                         continue;
 
                     var fileNameWithExtension = Path.GetFileName(obj.Key);

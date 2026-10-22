@@ -1,7 +1,12 @@
-"""Modal app that cuts 480p silent preview clips out of the 9s clips in R2.
+"""Modal app that cuts silent preview clips out of the 9s clips in R2.
 
 Source : clips_9s/<movie_id>/<randid>.mp4
-Output : clips_9s/<movie_id>/<randid>_short.mp4
+Output : clips_9s/<movie_id>/<randid>_short.mp4       (480 wide, small grid)
+         clips_9s/<movie_id>/<randid>_short_960.mp4   (960 wide, medium grid)
+         clips_9s/<movie_id>/<randid>_short_1920.mp4  (1920 wide, one per page)
+
+Every size is cut from one download of the source; only missing sizes are
+cut unless overwrite is set. Sizes are capped at the source width.
 
 The scene window (start_time/end_time, seconds inside the 9s clip) comes from
 frl.frl_image_scene_boundaries and is supplied by the caller.
@@ -18,8 +23,12 @@ image = (
 )
 
 SOURCE_PREFIX = "clips_9s"
-PREVIEW_SUFFIX = "_short"
-PREVIEW_WIDTH = 480
+# (suffix, width, x264 profile, x264 level)
+PREVIEW_TIERS = [
+    ("_short", 480, "baseline", "3.1"),
+    ("_short_960", 960, "high", "3.1"),
+    ("_short_1920", 1920, "high", "4.1"),
+]
 MIN_PREVIEW_SECONDS = 0.5
 MAX_PREVIEW_SECONDS = 12.0
 
@@ -49,7 +58,18 @@ with image.imports():
         except r2.exceptions.ClientError:
             return False
 
-    def encode_preview(source_path, output_path, start_time, duration):
+    def source_width(path):
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width", "-of", "csv=p=0", path],
+            capture_output=True, text=True, errors="replace",
+        )
+        try:
+            return int(result.stdout.strip().splitlines()[0])
+        except (ValueError, IndexError):
+            return None
+
+    def encode_preview(source_path, output_path, start_time, duration, width, profile, level):
         cmd = [
             "ffmpeg",
             "-nostdin",
@@ -59,12 +79,12 @@ with image.imports():
             "-map", "0:v:0",
             "-map_chapters", "-1",
             "-an", "-dn", "-sn",
-            "-vf", f"scale={PREVIEW_WIDTH}:-2",
+            "-vf", f"scale={width}:-2",
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-crf", "26",
-            "-profile:v", "baseline",
-            "-level", "3.1",
+            "-profile:v", profile,
+            "-level", level,
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             "-y", output_path,
@@ -97,42 +117,58 @@ def generate_preview(item: dict) -> dict:
         return result | {"status": "skipped", "reason": "scene shorter than minimum"}
 
     source_key = f"{SOURCE_PREFIX}/{movie_id}/{filename}.mp4"
-    preview_key = f"{SOURCE_PREFIX}/{movie_id}/{filename}{PREVIEW_SUFFIX}.mp4"
-    result["key"] = preview_key
+    tier_keys = {
+        suffix: f"{SOURCE_PREFIX}/{movie_id}/{filename}{suffix}.mp4"
+        for suffix, _, _, _ in PREVIEW_TIERS
+    }
+    result["key"] = tier_keys["_short"]
 
     r2 = connect_r2()
 
-    if not overwrite and key_exists(r2, preview_key):
+    tiers = PREVIEW_TIERS if overwrite else [
+        tier for tier in PREVIEW_TIERS if not key_exists(r2, tier_keys[tier[0]])
+    ]
+    if not tiers:
         return result | {"status": "exists"}
 
+    created = {}
     with tempfile.TemporaryDirectory() as tmp:
         source_path = os.path.join(tmp, "source.mp4")
-        output_path = os.path.join(tmp, "preview.mp4")
 
         try:
             r2.download_file(BUCKET_NAME, source_key, source_path)
         except Exception as exc:
             return result | {"status": "error", "reason": f"source unavailable: {exc}"}
 
-        try:
-            encode_preview(source_path, output_path, start_time, duration)
-        except Exception as exc:
-            return result | {"status": "error", "reason": str(exc)}
+        max_width = source_width(source_path)
 
-        size = os.path.getsize(output_path)
-        r2.upload_file(
-            output_path,
-            BUCKET_NAME,
-            preview_key,
-            ExtraArgs={
-                "ContentType": "video/mp4",
-                "CacheControl": "public, max-age=31536000, immutable",
-            },
-        )
+        for suffix, width, profile, level in tiers:
+            output_path = os.path.join(tmp, f"preview{suffix}.mp4")
+            # Never upscale, and keep the width even for yuv420p.
+            target_width = min(width, max_width) if max_width else width
+            target_width -= target_width % 2
+
+            try:
+                encode_preview(source_path, output_path, start_time, duration,
+                               target_width, profile, level)
+            except Exception as exc:
+                return result | {"status": "error", "reason": f"{suffix}: {exc}",
+                                 "created": created}
+
+            r2.upload_file(
+                output_path,
+                BUCKET_NAME,
+                tier_keys[suffix],
+                ExtraArgs={
+                    "ContentType": "video/mp4",
+                    "CacheControl": "public, max-age=31536000, immutable",
+                },
+            )
+            created[suffix] = os.path.getsize(output_path)
 
     return result | {
         "status": "created",
-        "bytes": size,
+        "created": created,
         "start_time": start_time,
         "duration": round(duration, 3),
     }
