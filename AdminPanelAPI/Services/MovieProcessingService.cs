@@ -363,6 +363,14 @@ namespace AdminPanelAPI.Services
 DELETE FROM frl.frl_movie_info
 WHERE movieid = @movieid;";
 
+            // fps is kept across an overwrite: shot times are history frame / fps, and
+            // video-info's frame_count / duration can be wrong for a movie (La La Land
+            // reported 23.906 for a 23.976 stream), so a hand-corrected value must stick.
+            const string existingFpsSql = @"
+SELECT fps
+FROM frl.frl_movie_info
+WHERE movieid = @movieid;";
+
             const string insertSql = @"
 INSERT INTO frl.frl_movie_info (
     movieid,
@@ -427,8 +435,28 @@ WHERE frl_movie_info.duration IS NULL
 
             try
             {
+                var fps = info.Fps;
+
                 if (overwrite)
                 {
+                    await using var existingFpsCmd = new NpgsqlCommand(existingFpsSql, conn, tx);
+                    existingFpsCmd.Parameters.AddWithValue("movieid", movieId);
+
+                    if (await existingFpsCmd.ExecuteScalarAsync(cancellationToken) is { } existing
+                        and not DBNull)
+                    {
+                        fps = Convert.ToDouble(existing, CultureInfo.InvariantCulture);
+
+                        if (fps != info.Fps)
+                        {
+                            _logger.LogInformation(
+                                "Keeping stored fps {Fps} for movieId {MovieId} (video info reports {ReportedFps})",
+                                fps,
+                                movieId,
+                                info.Fps);
+                        }
+                    }
+
                     await using var deleteCmd = new NpgsqlCommand(deleteSql, conn, tx);
                     deleteCmd.Parameters.AddWithValue("movieid", movieId);
 
@@ -444,7 +472,7 @@ WHERE frl_movie_info.duration IS NULL
 
                 cmd.Parameters.AddWithValue("movieid", movieId);
                 cmd.Parameters.AddWithValue("duration", (object?)info.Duration ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("fps", (object?)info.Fps ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("fps", (object?)fps ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("frame_count", (object?)info.FrameCount ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("width", (object?)info.Width ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("height", (object?)info.Height ?? DBNull.Value);
