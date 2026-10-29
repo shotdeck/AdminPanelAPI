@@ -18,6 +18,7 @@ namespace AdminPanelAPI.Controllers
         private readonly IConfiguration _configuration;
         private readonly NpgsqlConnection _connection;
         private readonly MovieWorkerDiagnostics _workerDiagnostics;
+        private readonly ClipRelocateService _clipRelocate;
 
         public MovieProcessingController(
             IMovieProcessingJobRepository jobRepository,
@@ -27,7 +28,8 @@ namespace AdminPanelAPI.Controllers
             IClipPreviewMotionRunner clipPreviewRunner,
             NpgsqlConnection connection,
             IConfiguration configuration,
-            MovieWorkerDiagnostics workerDiagnostics)
+            MovieWorkerDiagnostics workerDiagnostics,
+            ClipRelocateService clipRelocate)
         {
             _jobRepository = jobRepository;
             _jobQueue = jobQueue;
@@ -37,6 +39,7 @@ namespace AdminPanelAPI.Controllers
             _configuration = configuration;
             _connection = connection;
             _workerDiagnostics = workerDiagnostics;
+            _clipRelocate = clipRelocate;
         }
 
         /// <summary>
@@ -144,6 +147,51 @@ SELECT
                 missingOnly,
                 status = "Queued"
             });
+        }
+
+        /// <summary>
+        /// Queues a relocate-clips job for one movie, run in the background. Every
+        /// clip is checked against its still; for any still that isn't at its
+        /// clip's centre, the whole film is searched for its real frame. A dry run
+        /// (the default) only reports. With apply the clips are recut (old clip and
+        /// previews backed up in R2), their scene boundaries replaced (old rows
+        /// kept in frl_clip_relocate_boundary_backup) and all 3 preview sizes cut.
+        /// writeHistory (needs apply) also adds a "Shot Time Autodetected" row with
+        /// the found frame to frl_imagehistory. Poll relocate-status/{jobId}.
+        /// </summary>
+        [HttpPost("relocate/{movieId:int}")]
+        public async Task<IActionResult> RelocateClips(
+            int movieId,
+            [FromQuery] bool apply = false,
+            [FromQuery] bool writeHistory = false,
+            CancellationToken cancellationToken = default)
+        {
+            if (writeHistory && !apply)
+                return BadRequest(new { error = "writeHistory needs apply." });
+
+            var jobId = await _clipRelocate.CreateJobAsync(movieId, apply, writeHistory, cancellationToken);
+
+            return Ok(new { jobId, movieId, apply, writeHistory, status = "queued" });
+        }
+
+        /// <summary>
+        /// A relocate-clips job's progress and, once done, its per-image report.
+        /// </summary>
+        [HttpGet("relocate-status/{jobId:long}")]
+        public async Task<IActionResult> GetRelocateStatus(long jobId, CancellationToken cancellationToken = default)
+        {
+            var job = await _clipRelocate.GetJobAsync(jobId, cancellationToken);
+            return job == null ? NotFound() : Ok(job);
+        }
+
+        /// <summary>Recent relocate-clips jobs, newest first, optionally for one movie.</summary>
+        [HttpGet("relocate-jobs")]
+        public async Task<IActionResult> ListRelocateJobs(
+            [FromQuery] int? movieId = null,
+            [FromQuery] int limit = 50,
+            CancellationToken cancellationToken = default)
+        {
+            return Ok(await _clipRelocate.ListJobsAsync(movieId, limit, cancellationToken));
         }
 
         /// <summary>

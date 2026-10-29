@@ -79,6 +79,10 @@ builder.Services.AddScoped<IMovieProcessingService, MovieProcessingService>();
 builder.Services.AddSingleton<MovieWorkerDiagnostics>();
 builder.Services.AddHostedService<MovieProcessingWorker>();
 
+// Relocate-clips jobs: find each still's real frame in the film and recut its clip.
+builder.Services.AddScoped<ClipRelocateService>();
+builder.Services.AddHostedService<ClipRelocateWorker>();
+
 // Caption embedding batch processing
 builder.Services.AddSingleton<ICaptionEmbeddingJobQueue, CaptionEmbeddingJobQueue>();
 builder.Services.AddScoped<ICaptionEmbeddingJobRepository, CaptionEmbeddingJobRepository>();
