@@ -49,8 +49,8 @@ MATCH_MIN = 0.9
 CENTRE_TOLERANCE = 0.5
 # ...unless the centre frame scores within this of it (static shots).
 CENTRE_SLACK = 0.02
-# Parallel /extract-clip calls; the movie server is slow under more.
-MOVIE_SERVER_PARALLEL = 8
+# The :8888 box re-encodes each window; at 8 at once its ffmpeg runs get OOM-killed.
+MOVIE_SERVER_PARALLEL = 4
 
 with image.imports():
     import os
@@ -249,17 +249,27 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         centres = [WINDOW_SECONDS / 2 + WINDOW_SECONDS * k for k in range(int(np.ceil(duration / WINDOW_SECONDS)))]
         set_progress(job_tag, phase="searching film", windows=len(centres), windows_done=0)
         best = {rid: (-1.0, None) for rid in rids}
-        missing = 0
-        for n, w in enumerate(match_window.map([movie_id] * len(centres), centres, [job_tag] * len(centres),
-                                               [S] * len(centres), [len(rids)] * len(centres),
-                                               order_outputs=False, return_exceptions=True)):
-            if isinstance(w, Exception) or "error" in w:
-                missing += 1
-            else:
-                for rid, (s, t) in zip(rids, w["best"]):
-                    if s > best[rid][0]:
-                        best[rid] = (s, t)
-            set_progress(job_tag, windows_done=n + 1, windows_failed=missing)
+        failed_centres = []
+        todo = centres
+        for round_no in range(3):
+            done_before = len(centres) - len(todo)
+            failed_centres = []
+            for n, (c, w) in enumerate(zip(todo, match_window.map([movie_id] * len(todo), todo, [f"{job_tag}r{round_no}"] * len(todo),
+                                                                    [S] * len(todo), [len(rids)] * len(todo),
+                                                                    order_outputs=True, return_exceptions=True))):
+                if isinstance(w, Exception) or "error" in w:
+                    failed_centres.append(c)
+                else:
+                    for rid, (s, t) in zip(rids, w["best"]):
+                        if s > best[rid][0]:
+                            best[rid] = (s, t)
+                set_progress(job_tag, windows_done=done_before + n + 1 - len(failed_centres),
+                             windows_failed=len(failed_centres), retry_round=round_no)
+            if not failed_centres:
+                break
+            todo = failed_centres
+        missing = len(failed_centres)
+        report_meta["windows_failed"] = [round(c, 3) for c in failed_centres]
 
         found = []
         for rid in flagged:
