@@ -10,8 +10,10 @@ trigger:
 # artifact, so every merge deployed twice.
 pr: none
 
+# windows-latest moved to windows-2025-vs2026 (Visual Studio 18), which
+# VSTest@2 can't find, so every build failed at the test step.
 pool:
-  vmImage: 'windows-latest'
+  vmImage: 'windows-2025'
 
 variables:
   solution: '**/*.sln'
