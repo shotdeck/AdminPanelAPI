@@ -241,7 +241,14 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
     set_progress(job_tag, checked=len(images), flagged=len(flagged))
 
     if flagged:
-        info = requests.get(f"{MOVIE_SERVER}/video-info", params=dict(movie_id=movie_id), timeout=300).json()
+        for attempt in range(4):
+            try:
+                info = requests.get(f"{MOVIE_SERVER}/video-info", params=dict(movie_id=movie_id), timeout=300).json()
+                break
+            except requests.RequestException:
+                if attempt == 3:
+                    raise
+                time.sleep(60 * (attempt + 1))
         duration = float(info["duration"])
         feats = {rid: still_feature(rid) for rid in flagged}
         rids = [rid for rid in flagged if feats[rid] is not None]
