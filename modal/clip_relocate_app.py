@@ -8,8 +8,11 @@ matched against a different cut of the film).
    a different grade score low even when the clip is right.
 2. The whole film is pulled from the movie server (:8888 /extract-clip) in 30s
    windows and every frame is matched against every flagged still at once.
-3. Each still found in the film gets a new 9s clip centred on its frame, which
-   must have the still at its centre before it is used. With apply the old
+3. Each still found in the film gets a new 9s clip centred on its frame (or as
+   near as the film's start allows), which must have the still there before it
+   is used. With recut_all every still is searched for and recut, not only the
+   flagged ones; a clip that already matched keeps its clip if its still can't
+   be found or the recut fails. With apply the old
    clip and its 3 previews are copied to clips_9s_backup_<date>/<movie_id>/,
    the new clip is uploaded and the old previews are deleted.
 
@@ -114,19 +117,21 @@ with image.imports():
         cap.release()
         return (np.stack(frames) if frames else None), fps
 
-    def best_in_clip(still, path):
-        """Best-matching time in a clip, its score, and the centre frame's score."""
+    def best_in_clip(still, path, expected=CLIP_CENTRE):
+        """Best-matching time in a clip, its score, and the score at the expected time."""
         F, fps = video_features(path)
         if F is None:
             return None
         sc = F @ still
         i = int(np.argmax(sc))
-        c = min(len(sc) - 1, int(round(CLIP_CENTRE * fps)))
-        return dict(best_t=i / fps, best=float(sc[i]), centre=float(sc[max(0, c - 1):c + 2].max()))
+        c = min(len(sc) - 1, int(round(expected * fps)))
+        return dict(best_t=i / fps, best=float(sc[i]), centre=float(sc[max(0, c - 1):c + 2].max()),
+                    expected_t=expected)
 
     def at_centre(m):
         return m is not None and (
-            abs(m["best_t"] - CLIP_CENTRE) <= CENTRE_TOLERANCE or m["centre"] >= m["best"] - CENTRE_SLACK
+            abs(m["best_t"] - m.get("expected_t", CLIP_CENTRE)) <= CENTRE_TOLERANCE
+            or m["centre"] >= m["best"] - CENTRE_SLACK
         )
 
     def fetch_window(movie_id, centre, tag, path):
@@ -202,7 +207,8 @@ def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup
             "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-profile:v", "main", "-pix_fmt", "yuv420p",
             "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
         ], check=True)
-        m = best_in_clip(still, out)
+        # A still in the film's first 4.5s sits before the centre of its clip.
+        m = best_in_clip(still, out, expected=found_t - base - start)
         if m is None or m["best"] < MATCH_MIN or not at_centre(m):
             return dict(rid=rid, status="failed", reason="verify_failed", **(m or {}))
         if apply:
@@ -220,7 +226,8 @@ def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup
 
 
 @app.function(image=image, timeout=24 * 3600)
-def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag: str) -> dict:
+def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag: str,
+                   recut_all: bool = False) -> dict:
     """images: [{"rid": str, "frame": int | None}]. Returns one entry per image."""
     set_progress(job_tag, phase="checking", images=len(images), checked=0)
     report = {}
@@ -236,11 +243,15 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         e["history_frame"] = i.get("frame")
     if images and all(e["status"] == "no_still" for e in report.values()):
         raise RuntimeError("No still could be downloaded for any image; is crunch reachable?")
-    flagged = [rid for rid, e in report.items() if e["status"] == "flagged"]
+    for e in report.values():
+        e["flagged"] = e["status"] == "flagged"
+    flagged = [rid for rid, e in report.items() if e["flagged"]]
+    # With recut_all, clips that already match are recut too.
+    targets = [rid for rid, e in report.items() if e["flagged"] or (recut_all and e["status"] == "ok")]
     report_meta = {}
-    set_progress(job_tag, checked=len(images), flagged=len(flagged))
+    set_progress(job_tag, checked=len(images), flagged=len(flagged), targets=len(targets))
 
-    if flagged:
+    if targets:
         for attempt in range(4):
             try:
                 info = requests.get(f"{MOVIE_SERVER}/video-info", params=dict(movie_id=movie_id), timeout=300).json()
@@ -250,7 +261,7 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
                     raise
                 time.sleep(60 * (attempt + 1))
         duration = float(info["duration"])
-        feats = {rid: still_feature(rid) for rid in flagged}
+        feats = {rid: still_feature(rid) for rid in targets}
         rids = [rid for rid in flagged if feats[rid] is not None]
         S = np.stack([feats[r] for r in rids]).astype(np.float16).tobytes()
         centres = [WINDOW_SECONDS / 2 + WINDOW_SECONDS * k for k in range(int(np.ceil(duration / WINDOW_SECONDS)))]
@@ -279,12 +290,15 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         report_meta["windows_failed"] = [round(c, 3) for c in failed_centres]
 
         found = []
-        for rid in flagged:
+        for rid in targets:
             e = report[rid]
             s, t = best.get(rid, (-1.0, None))
             e["found_score"] = s if t is not None else None
             if t is None or s < MATCH_MIN:
-                e["status"] = "not_found"
+                if e["flagged"]:
+                    e["status"] = "not_found"
+                else:
+                    e["reason"] = "kept: not found in film"
                 continue
             e["found_time"] = round(t, 3)
             e["found_frame"] = int(round(t * fps))
@@ -298,19 +312,26 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
             if isinstance(r, Exception):
                 continue
             e = report[r["rid"]]
-            e["status"] = "relocated" if r["status"] in ("uploaded", "verified") else "failed"
-            if r["status"] == "failed":
-                e["reason"] = r.get("reason")
             e["recut_score"] = r.get("best")
+            if r["status"] in ("uploaded", "verified"):
+                e["status"] = "relocated"
+            elif e["flagged"]:
+                e.update(status="failed", reason=r.get("reason"))
+            else:
+                e["reason"] = f"kept: {r.get('reason')}"
             set_progress(job_tag, recut=n + 1)
         for rid in found:
-            if report[rid]["status"] == "flagged":
-                report[rid].update(status="failed", reason="recut_failed")
+            e = report[rid]
+            if e["status"] == "flagged":
+                e.update(status="failed", reason="recut_failed")
+            elif e["status"] == "ok" and not e.get("reason"):
+                e["reason"] = "kept: recut_failed"
         if apply:
             report_meta["backup_prefix"] = f"{backup_prefix}/{movie_id}/"
 
     set_progress(job_tag, phase="done")
-    return dict(movie_id=movie_id, apply=apply, fps=fps, **report_meta, images=list(report.values()))
+    return dict(movie_id=movie_id, apply=apply, recut_all=recut_all, fps=fps, **report_meta,
+                images=list(report.values()))
 
 
 @app.function(image=image, timeout=300)
@@ -319,7 +340,7 @@ def start(body: dict):
     job_tag = str(body["job_tag"])
     progress[job_tag] = dict(phase="queued")
     call = relocate_movie.spawn(int(body["movie_id"]), body["images"], float(body["fps"]),
-                                bool(body.get("apply", False)), job_tag)
+                                bool(body.get("apply", False)), job_tag, bool(body.get("recut_all", False)))
     return dict(call_id=call.object_id)
 
 

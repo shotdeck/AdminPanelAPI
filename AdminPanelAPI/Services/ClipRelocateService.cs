@@ -12,7 +12,8 @@ namespace AdminPanelAPI.Services
     /// <summary>
     /// Relocate-clips jobs: Modal (clip-relocate app) checks every clip of a movie
     /// against its still, finds the real frame of any still that isn't at the
-    /// clip's centre by searching the whole film, and recuts those clips. With
+    /// clip's centre by searching the whole film, and recuts those clips (every
+    /// clip with recutAll). With
     /// apply, this service then replaces their scene boundaries (backing up the
     /// old rows, short shots widened ±2s), recuts all 3 preview sizes and, with
     /// writeHistory, records the found frame in frl_imagehistory.
@@ -83,6 +84,7 @@ CREATE TABLE IF NOT EXISTS frl.frl_clip_relocate_jobs (
     finished_at    TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_crj_status ON frl.frl_clip_relocate_jobs (status);
+ALTER TABLE frl.frl_clip_relocate_jobs ADD COLUMN IF NOT EXISTS recut_all BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS frl.frl_clip_relocate_boundary_backup AS
 SELECT 0::BIGINT AS job_id, now() AS backed_up_at, b.*
 FROM frl.frl_image_scene_boundaries b
@@ -92,21 +94,22 @@ WITH NO DATA;";
             await cmd.ExecuteNonQueryAsync(ct);
         }
 
-        public async Task<long> CreateJobAsync(int movieId, bool apply, bool writeHistory, CancellationToken ct)
+        public async Task<long> CreateJobAsync(int movieId, bool apply, bool writeHistory, bool recutAll, CancellationToken ct)
         {
             await EnsureTablesAsync(ct);
             await using var conn = await OpenAsync(ct);
             await using var cmd = new NpgsqlCommand(@"
-INSERT INTO frl.frl_clip_relocate_jobs (movie_id, apply, write_history)
-VALUES (@m, @a, @w) RETURNING id;", conn);
+INSERT INTO frl.frl_clip_relocate_jobs (movie_id, apply, write_history, recut_all)
+VALUES (@m, @a, @w, @ra) RETURNING id;", conn);
             cmd.Parameters.AddWithValue("m", movieId);
             cmd.Parameters.AddWithValue("a", apply);
             cmd.Parameters.AddWithValue("w", writeHistory);
+            cmd.Parameters.AddWithValue("ra", recutAll);
             return Convert.ToInt64(await cmd.ExecuteScalarAsync(ct));
         }
 
         private const string JobColumns = @"id, movie_id, apply, write_history, status, modal_call_id, phase,
-progress::text, images, flagged, relocated, not_found, failed, report::text, error, created_at, started_at, updated_at, finished_at";
+progress::text, images, flagged, relocated, not_found, failed, report::text, error, created_at, started_at, updated_at, finished_at, recut_all";
 
         private static ClipRelocateJob ReadJob(NpgsqlDataReader r)
         {
@@ -133,6 +136,7 @@ progress::text, images, flagged, relocated, not_found, failed, report::text, err
                 StartedAt = r.IsDBNull(16) ? null : r.GetDateTime(16),
                 UpdatedAt = r.GetDateTime(17),
                 FinishedAt = r.IsDBNull(18) ? null : r.GetDateTime(18),
+                RecutAll = r.GetBoolean(19),
             };
         }
 
@@ -238,6 +242,7 @@ ORDER BY i.idnum", conn))
                 movie_id = job.MovieId,
                 fps,
                 apply = job.Apply,
+                recut_all = job.RecutAll,
                 job_tag = $"job{job.Id}",
                 images,
             });
@@ -293,7 +298,7 @@ ORDER BY i.idnum", conn))
                 {
                     p.AddWithValue("ph", job.Apply ? "writing boundaries" : "done");
                     p.AddWithValue("r", reportJson);
-                    p.AddWithValue("f", result.Images.Count(i => i.Status is "relocated" or "not_found" or "failed"));
+                    p.AddWithValue("f", result.Images.Count(i => i.Flagged ?? i.Status is "relocated" or "not_found" or "failed"));
                     p.AddWithValue("rl", Count("relocated"));
                     p.AddWithValue("nf", Count("not_found"));
                     p.AddWithValue("fl", Count("failed"));
