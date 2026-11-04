@@ -52,6 +52,12 @@ MATCH_MIN = 0.9
 CENTRE_TOLERANCE = 0.5
 # ...unless the centre frame scores within this of it (static shots).
 CENTRE_SLACK = 0.02
+# A weaker match counts when it lands this close to where the movie's drift line
+# (fitted from its confident matches) puts the still: stills graded differently
+# from the film's copy can score well under MATCH_MIN at the right frame.
+DRIFT_MATCH_MIN = 0.6
+DRIFT_TOLERANCE = 2.0
+DRIFT_MIN_POINTS = 8
 # The :8888 box re-encodes each window; at 8 at once its ffmpeg runs get OOM-killed.
 MOVIE_SERVER_PARALLEL = 4
 
@@ -158,6 +164,25 @@ with image.imports():
         progress[job_tag] = cur
 
 
+def fit_drift(points):
+    """Fit found_time = a * history_time + b to (history_time, found_time) pairs, ignoring
+    stills from other bad batches. Returns (a, b, inliers) or None."""
+    if len(points) < DRIFT_MIN_POINTS:
+        return None
+    h, f = np.array(points, dtype=float).T
+    ok = h > 0
+    ratio = np.median(f[ok] / h[ok]) if ok.any() else 1.0
+    keep = np.abs(f - ratio * h) < max(30.0, 0.01 * h.max())
+    for _ in range(5):
+        if keep.sum() < DRIFT_MIN_POINTS:
+            return None
+        a, b = np.polyfit(h[keep], f[keep], 1)
+        keep = np.abs(f - (a * h + b)) < 2 * DRIFT_TOLERANCE
+    if keep.sum() < DRIFT_MIN_POINTS:
+        return None
+    return float(a), float(b), int(keep.sum())
+
+
 @app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials")], timeout=600, max_containers=100)
 def check_clip(movie_id: int, rid: str) -> dict:
     still = still_feature(rid)
@@ -193,7 +218,8 @@ def match_window(movie_id: int, centre: float, tag: str, stills: bytes, count: i
 
 
 @app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials")], timeout=1800, max_containers=MOVIE_SERVER_PARALLEL)
-def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup_prefix: str) -> dict:
+def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup_prefix: str,
+          min_score: float = MATCH_MIN) -> dict:
     still = still_feature(rid)
     centre = max(WINDOW_SECONDS / 2, found_t)
     base = centre - WINDOW_SECONDS / 2
@@ -209,7 +235,7 @@ def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup
         ], check=True)
         # A still in the film's first 4.5s sits before the centre of its clip.
         m = best_in_clip(still, out, expected=found_t - base - start)
-        if m is None or m["best"] < MATCH_MIN or not at_centre(m):
+        if m is None or m["best"] < min_score or not at_centre(m):
             return dict(rid=rid, status="failed", reason="verify_failed", **(m or {}))
         if apply:
             r2 = connect_r2()
@@ -262,11 +288,12 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
                 time.sleep(60 * (attempt + 1))
         duration = float(info["duration"])
         feats = {rid: still_feature(rid) for rid in targets}
-        rids = [rid for rid in flagged if feats[rid] is not None]
+        rids = [rid for rid in targets if feats[rid] is not None]
         S = np.stack([feats[r] for r in rids]).astype(np.float16).tobytes()
         centres = [WINDOW_SECONDS / 2 + WINDOW_SECONDS * k for k in range(int(np.ceil(duration / WINDOW_SECONDS)))]
         set_progress(job_tag, phase="searching film", windows=len(centres), windows_done=0)
         best = {rid: (-1.0, None) for rid in rids}
+        window_best = {rid: [] for rid in rids}
         failed_centres = []
         todo = centres
         for round_no in range(3):
@@ -279,6 +306,7 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
                     failed_centres.append(c)
                 else:
                     for rid, (s, t) in zip(rids, w["best"]):
+                        window_best[rid].append((s, t))
                         if s > best[rid][0]:
                             best[rid] = (s, t)
                 set_progress(job_tag, windows_done=done_before + n + 1 - len(failed_centres),
@@ -289,12 +317,27 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         missing = len(failed_centres)
         report_meta["windows_failed"] = [round(c, 3) for c in failed_centres]
 
-        found = []
+        hist_frame = {i["rid"]: i.get("frame") for i in images}
+        drift = fit_drift([(hist_frame[r] / fps, best[r][1]) for r in rids
+                           if hist_frame.get(r) is not None and best[r][1] is not None and best[r][0] >= MATCH_MIN])
+        if drift:
+            a, b, n_in = drift
+            report_meta["drift_fit"] = dict(a=round(a, 6), b=round(b, 3), inliers=n_in)
+        found, min_scores = [], {}
         for rid in targets:
             e = report[rid]
             s, t = best.get(rid, (-1.0, None))
+            min_scores[rid] = MATCH_MIN
+            if (t is None or s < MATCH_MIN) and drift and hist_frame.get(rid) is not None:
+                pred = drift[0] * hist_frame[rid] / fps + drift[1]
+                near = [(ws, wt) for ws, wt in window_best.get(rid, [])
+                        if abs(wt - pred) <= DRIFT_TOLERANCE and ws >= DRIFT_MATCH_MIN]
+                if near:
+                    s, t = max(near)
+                    e["found_via"] = "drift_fit"
+                    min_scores[rid] = DRIFT_MATCH_MIN
             e["found_score"] = s if t is not None else None
-            if t is None or s < MATCH_MIN:
+            if t is None or s < min_scores[rid]:
                 if e["flagged"]:
                     e["status"] = "not_found"
                 else:
@@ -308,7 +351,7 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         backup_prefix = f"{SOURCE_PREFIX}_backup_{time.strftime('%Y%m%d')}"
         for n, r in enumerate(recut.map([movie_id] * len(found), found, [report[r]["found_time"] for r in found],
                                         [job_tag] * len(found), [apply] * len(found), [backup_prefix] * len(found),
-                                        order_outputs=False, return_exceptions=True)):
+                                        [min_scores[r] for r in found], order_outputs=False, return_exceptions=True)):
             if isinstance(r, Exception):
                 continue
             e = report[r["rid"]]
