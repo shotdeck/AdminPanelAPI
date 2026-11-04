@@ -36,6 +36,10 @@ image = (
 progress = modal.Dict.from_name("clip-relocate-progress", create_if_missing=True)
 
 MOVIE_SERVER = "http://35.89.51.60:8888"
+# Whole films, basic auth from the `movie-server` secret (MOVIE_USERNAME / MOVIE_PASSWORD).
+MOVIE_FILE_URL = "http://35.89.51.60:8889/movie/{movie_id}.mp4"
+FILM_BUCKET = "movies"
+FILM_DECODE_PROCS = 8
 STILL_URL = "https://crunch.shotdeck.com/assets/images/stills/smthumb/small_{rid}.jpg"
 # crunch refuses requests without a browser user agent.
 STILL_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120"}
@@ -72,6 +76,7 @@ with image.imports():
     import numpy as np
     import requests
     from botocore.client import Config
+    from boto3.s3.transfer import TransferConfig
 
     def connect_r2():
         return boto3.client(
@@ -157,6 +162,84 @@ with image.imports():
             time.sleep(10 * (attempt + 1))
         return False
 
+    def download_film(movie_id, path):
+        """From the R2 copy at movies/{id}/{id}.mp4 if there is one, else from :8889."""
+        r2 = connect_r2()
+        try:
+            r2.download_file(FILM_BUCKET, f"{movie_id}/{movie_id}.mp4", path,
+                             Config=TransferConfig(multipart_chunksize=64 << 20, max_concurrency=16))
+            if os.path.getsize(path) > 0:
+                return True
+        except Exception:
+            pass
+        auth = (os.environ["MOVIE_USERNAME"], os.environ["MOVIE_PASSWORD"])
+        for attempt in range(4):
+            try:
+                with requests.get(MOVIE_FILE_URL.format(movie_id=movie_id), auth=auth, stream=True, timeout=600) as r:
+                    if r.status_code == 200:
+                        with open(path, "wb") as fh:
+                            for chunk in r.iter_content(8 << 20):
+                                fh.write(chunk)
+                        if os.path.getsize(path) > 0:
+                            return True
+            except requests.RequestException:
+                pass
+            time.sleep(30 * (attempt + 1))
+        return False
+
+    def score_film_span(path, S, first_window, last_window):
+        """Best (score, time) per still in each WINDOW_SECONDS window of [first_window, last_window)."""
+        cap = cv2.VideoCapture(path)
+        cap.set(cv2.CAP_PROP_POS_MSEC, first_window * WINDOW_SECONDS * 1000)
+        out = {}
+        while True:
+            ok, f = cap.read()
+            if not ok:
+                break
+            t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+            w = int(t // WINDOW_SECONDS)
+            if w >= last_window:
+                break
+            if w < first_window:
+                continue
+            sc = S @ feature(f)
+            cur = out.get(w)
+            if cur is None:
+                out[w] = [sc.copy(), np.full(len(sc), t)]
+            else:
+                better = sc > cur[0]
+                cur[0][better] = sc[better]
+                cur[1][better] = t
+        cap.release()
+        return out
+
+    def recut_from(movie_id, rid, still, src, found_t, apply, backup_prefix, min_score, out, src_offset=0.0):
+        """Cut the 9s clip centred on found_t from src (which starts at src_offset), verify, upload."""
+        start = max(0.0, found_t - CLIP_CENTRE - src_offset)
+        subprocess.run([
+            "ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-i", src, "-t", f"{CLIP_SECONDS:g}",
+            "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-profile:v", "main", "-pix_fmt", "yuv420p",
+            "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
+        ], check=True)
+        # A still in the film's first 4.5s sits before the centre of its clip.
+        m = best_in_clip(still, out, expected=found_t - src_offset - start)
+        if m is None or m["best"] < min_score or not at_centre(m):
+            return dict(rid=rid, status="failed", reason="verify_failed", **(m or {}))
+        if apply:
+            r2 = connect_r2()
+            for suffix in [""] + PREVIEW_SUFFIXES:
+                key = f"{SOURCE_PREFIX}/{movie_id}/{rid}{suffix}.mp4"
+                backup = f"{backup_prefix}/{movie_id}/{rid}{suffix}.mp4"
+                # A preempted run is restarted from scratch; never replace the original backup with a recut.
+                if key_exists(r2, key) and not key_exists(r2, backup):
+                    r2.copy_object(Bucket=BUCKET_NAME, Key=backup,
+                                   CopySource={"Bucket": BUCKET_NAME, "Key": key})
+            r2.upload_file(out, BUCKET_NAME, f"{SOURCE_PREFIX}/{movie_id}/{rid}.mp4",
+                           ExtraArgs={"ContentType": "video/mp4"})
+            for suffix in PREVIEW_SUFFIXES:
+                r2.delete_object(Bucket=BUCKET_NAME, Key=f"{SOURCE_PREFIX}/{movie_id}/{rid}{suffix}.mp4")
+        return dict(rid=rid, status="uploaded" if apply else "verified", **m)
+
     def set_progress(job_tag, **kw):
         cur = progress.get(job_tag, {})
         cur.update(kw)
@@ -223,38 +306,68 @@ def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup
     still = still_feature(rid)
     centre = max(WINDOW_SECONDS / 2, found_t)
     base = centre - WINDOW_SECONDS / 2
-    start = max(0.0, found_t - CLIP_CENTRE - base)
     with tempfile.TemporaryDirectory() as d:
-        win, out = f"{d}/w.mp4", f"{d}/{rid}.mp4"
+        win = f"{d}/w.mp4"
         if not fetch_window(movie_id, centre, tag, win):
             return dict(rid=rid, status="failed", reason="download_failed")
-        subprocess.run([
-            "ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-i", win, "-t", f"{CLIP_SECONDS:g}",
-            "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-profile:v", "main", "-pix_fmt", "yuv420p",
-            "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
-        ], check=True)
-        # A still in the film's first 4.5s sits before the centre of its clip.
-        m = best_in_clip(still, out, expected=found_t - base - start)
-        if m is None or m["best"] < min_score or not at_centre(m):
-            return dict(rid=rid, status="failed", reason="verify_failed", **(m or {}))
-        if apply:
-            r2 = connect_r2()
-            for suffix in [""] + PREVIEW_SUFFIXES:
-                key = f"{SOURCE_PREFIX}/{movie_id}/{rid}{suffix}.mp4"
-                backup = f"{backup_prefix}/{movie_id}/{rid}{suffix}.mp4"
-                # A preempted run is restarted from scratch; never replace the original backup with a recut.
-                if key_exists(r2, key) and not key_exists(r2, backup):
-                    r2.copy_object(Bucket=BUCKET_NAME, Key=backup,
-                                   CopySource={"Bucket": BUCKET_NAME, "Key": key})
-            r2.upload_file(out, BUCKET_NAME, f"{SOURCE_PREFIX}/{movie_id}/{rid}.mp4",
-                           ExtraArgs={"ContentType": "video/mp4"})
-            for suffix in PREVIEW_SUFFIXES:
-                r2.delete_object(Bucket=BUCKET_NAME, Key=f"{SOURCE_PREFIX}/{movie_id}/{rid}{suffix}.mp4")
-    return dict(rid=rid, status="uploaded" if apply else "verified", **m)
+        return recut_from(movie_id, rid, still, win, found_t, apply, backup_prefix, min_score,
+                          f"{d}/{rid}.mp4", src_offset=base)
+
+
+@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")],
+              cpu=FILM_DECODE_PROCS,
+              memory=16384, timeout=4 * 3600)
+def search_film(movie_id: int, stills: bytes, count: int, duration: float, job_tag: str) -> list:
+    """Downloads the whole film once (R2 copy, else :8889) and returns, per still, its best (score, time) in every window."""
+    from concurrent.futures import ProcessPoolExecutor
+    S = np.frombuffer(stills, dtype=np.float16).astype(np.float32).reshape(count, -1)
+    n_windows = int(np.ceil(duration / WINDOW_SECONDS))
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/film.mp4"
+        set_progress(job_tag, phase="downloading film")
+        if not download_film(movie_id, path):
+            raise RuntimeError(f"Could not download movie {movie_id} from R2 or :8889.")
+        set_progress(job_tag, phase="searching film", windows=n_windows, windows_done=0)
+        step = int(np.ceil(n_windows / FILM_DECODE_PROCS))
+        spans = [(a, min(n_windows, a + step)) for a in range(0, n_windows, step)]
+        per_window = {}
+        with ProcessPoolExecutor(len(spans)) as pool:
+            futures = [pool.submit(score_film_span, path, S, a, b) for a, b in spans]
+            for f in futures:
+                per_window.update(f.result())
+                set_progress(job_tag, windows_done=len(per_window))
+    return [[(float(per_window[w][0][j]), float(per_window[w][1][j])) for w in sorted(per_window)]
+            for j in range(count)]
+
+
+@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")],
+              cpu=FILM_DECODE_PROCS, memory=16384, timeout=4 * 3600)
+def recut_film(movie_id: int, items: list, job_tag: str, apply: bool, backup_prefix: str) -> list:
+    """items: [(rid, found_t, min_score)]. Recuts every clip from one download of the whole film."""
+    from concurrent.futures import ThreadPoolExecutor
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/film.mp4"
+        if not download_film(movie_id, path):
+            raise RuntimeError(f"Could not download movie {movie_id} from R2 or :8889.")
+
+        def one(item):
+            rid, found_t, min_score = item
+            try:
+                return recut_from(movie_id, rid, still_feature(rid), path, found_t, apply, backup_prefix,
+                                  min_score, f"{d}/{rid}.mp4")
+            except Exception as ex:
+                return dict(rid=rid, status="failed", reason=f"recut_error: {ex}"[:300])
+
+        results = []
+        with ThreadPoolExecutor(FILM_DECODE_PROCS) as pool:
+            for r in pool.map(one, items):
+                results.append(r)
+                set_progress(job_tag, recut=len(results))
+    return results
 
 
 # Preemption restarts the whole run from the start (an hour's film search), so keep it on one instance.
-@app.function(image=image, timeout=24 * 3600, nonpreemptible=True)
+@app.function(image=image, secrets=[modal.Secret.from_name("movie-server")], timeout=24 * 3600, nonpreemptible=True)
 def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag: str,
                    recut_all: bool = False) -> dict:
     """images: [{"rid": str, "frame": int | None}]. Returns one entry per image."""
@@ -278,6 +391,9 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
     # With recut_all, clips that already match are recut too.
     targets = [rid for rid, e in report.items() if e["flagged"] or (recut_all and e["status"] == "ok")]
     report_meta = {}
+    # With the :8889 login the film is downloaded whole; otherwise it's pulled through :8888 in windows.
+    whole_film = bool(os.environ.get("MOVIE_USERNAME"))
+    report_meta["source"] = "whole_film" if whole_film else "windows"
     set_progress(job_tag, checked=len(images), flagged=len(flagged), targets=len(targets))
 
     if targets:
@@ -294,12 +410,18 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         rids = [rid for rid in targets if feats[rid] is not None]
         S = np.stack([feats[r] for r in rids]).astype(np.float16).tobytes()
         centres = [WINDOW_SECONDS / 2 + WINDOW_SECONDS * k for k in range(int(np.ceil(duration / WINDOW_SECONDS)))]
-        set_progress(job_tag, phase="searching film", windows=len(centres), windows_done=0)
         best = {rid: (-1.0, None) for rid in rids}
         window_best = {rid: [] for rid in rids}
         failed_centres = []
-        todo = centres
-        for round_no in range(3):
+        todo = [] if whole_film else centres
+        if whole_film:
+            for rid, wins in zip(rids, search_film.remote(movie_id, S, len(rids), duration, job_tag)):
+                window_best[rid] = wins
+                if wins:
+                    best[rid] = max(wins)
+        else:
+            set_progress(job_tag, phase="searching film", windows=len(centres), windows_done=0)
+        for round_no in range(3 if todo else 0):
             done_before = len(centres) - len(todo)
             failed_centres = []
             for n, (c, w) in enumerate(zip(todo, match_window.map([movie_id] * len(todo), todo, [f"{job_tag}r{round_no}"] * len(todo),
@@ -352,9 +474,14 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
 
         set_progress(job_tag, phase="recutting" if apply else "verifying", recut=0, recut_total=len(found))
         backup_prefix = f"{SOURCE_PREFIX}_backup_{time.strftime('%Y%m%d')}"
-        for n, r in enumerate(recut.map([movie_id] * len(found), found, [report[r]["found_time"] for r in found],
-                                        [job_tag] * len(found), [apply] * len(found), [backup_prefix] * len(found),
-                                        [min_scores[r] for r in found], order_outputs=False, return_exceptions=True)):
+        if whole_film:
+            recuts = recut_film.remote(movie_id, [(r, report[r]["found_time"], min_scores[r]) for r in found],
+                                       job_tag, apply, backup_prefix) if found else []
+        else:
+            recuts = recut.map([movie_id] * len(found), found, [report[r]["found_time"] for r in found],
+                               [job_tag] * len(found), [apply] * len(found), [backup_prefix] * len(found),
+                               [min_scores[r] for r in found], order_outputs=False, return_exceptions=True)
+        for n, r in enumerate(recuts):
             if isinstance(r, Exception):
                 continue
             e = report[r["rid"]]

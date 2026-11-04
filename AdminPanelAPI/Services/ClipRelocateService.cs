@@ -167,18 +167,21 @@ WHERE @m::int IS NULL OR movie_id = @m::int ORDER BY id DESC LIMIT @l", conn);
         }
 
         /// <summary>
-        /// The job to work on: one already started (so a restart resumes it), else
-        /// the oldest queued one.
+        /// Unfinished jobs: ones already started first (so a restart resumes them),
+        /// then queued ones oldest first.
         /// </summary>
-        public async Task<ClipRelocateJob?> NextJobAsync(CancellationToken ct)
+        public async Task<List<ClipRelocateJob>> ActiveJobsAsync(CancellationToken ct)
         {
             await using var conn = await OpenAsync(ct);
             await using var cmd = new NpgsqlCommand($@"
 SELECT {JobColumns} FROM frl.frl_clip_relocate_jobs
 WHERE status IN ('queued', 'starting', 'running', 'finishing')
-ORDER BY CASE WHEN status = 'queued' THEN 1 ELSE 0 END, id LIMIT 1", conn);
+ORDER BY CASE WHEN status = 'queued' THEN 1 ELSE 0 END, id", conn);
             await using var r = await cmd.ExecuteReaderAsync(ct);
-            return await r.ReadAsync(ct) ? ReadJob(r) : null;
+            var jobs = new List<ClipRelocateJob>();
+            while (await r.ReadAsync(ct))
+                jobs.Add(ReadJob(r));
+            return jobs;
         }
 
         /// <summary>
