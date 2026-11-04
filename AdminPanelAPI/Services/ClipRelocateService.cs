@@ -175,10 +175,26 @@ WHERE @m::int IS NULL OR movie_id = @m::int ORDER BY id DESC LIMIT @l", conn);
             await using var conn = await OpenAsync(ct);
             await using var cmd = new NpgsqlCommand($@"
 SELECT {JobColumns} FROM frl.frl_clip_relocate_jobs
-WHERE status IN ('queued', 'running', 'finishing')
+WHERE status IN ('queued', 'starting', 'running', 'finishing')
 ORDER BY CASE WHEN status = 'queued' THEN 1 ELSE 0 END, id LIMIT 1", conn);
             await using var r = await cmd.ExecuteReaderAsync(ct);
             return await r.ReadAsync(ct) ? ReadJob(r) : null;
+        }
+
+        /// <summary>
+        /// Moves the job to <paramref name="toStatus"/> only if it still matches <paramref name="fromCondition"/>.
+        /// Both App Service slots run this worker against the same table, so only the instance whose
+        /// update lands may start or finish a job. Stale claims (an instance died mid-step) can be retaken.
+        /// </summary>
+        private async Task<bool> TryClaimAsync(long jobId, string fromCondition, string toStatus, CancellationToken ct)
+        {
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = new NpgsqlCommand($@"
+UPDATE frl.frl_clip_relocate_jobs SET status = @to, updated_at = now()
+WHERE id = @id AND ({fromCondition}) RETURNING id", conn);
+            cmd.Parameters.AddWithValue("id", jobId);
+            cmd.Parameters.AddWithValue("to", toStatus);
+            return await cmd.ExecuteScalarAsync(ct) != null;
         }
 
         private async Task UpdateJobAsync(long jobId, string setSql, Action<NpgsqlParameterCollection> bind, CancellationToken ct)
@@ -229,7 +245,25 @@ ORDER BY i.idnum", conn))
         }
 
         /// <summary>Hands a queued job to Modal.</summary>
-        public async Task StartAsync(ClipRelocateJob job, CancellationToken ct)
+        /// <returns>false if another instance already started it.</returns>
+        public async Task<bool> StartAsync(ClipRelocateJob job, CancellationToken ct)
+        {
+            if (!await TryClaimAsync(job.Id,
+                    "status = 'queued' OR (status = 'starting' AND modal_call_id IS NULL AND updated_at < now() - interval '10 minutes')",
+                    "starting", ct))
+                return false;
+            try
+            {
+                return await StartClaimedAsync(job, ct);
+            }
+            catch (Exception ex) when (ex is not InvalidOperationException)
+            {
+                await UpdateJobAsync(job.Id, "status = 'queued'", _ => { }, CancellationToken.None);
+                throw;
+            }
+        }
+
+        private async Task<bool> StartClaimedAsync(ClipRelocateJob job, CancellationToken ct)
         {
             var (images, fps) = await GetImagesAsync(job.MovieId, ct);
             if (images.Count == 0)
@@ -259,6 +293,7 @@ ORDER BY i.idnum", conn))
             await UpdateJobAsync(job.Id,
                 "status = 'running', modal_call_id = @c, phase = 'queued', images = @n, started_at = now(), error = NULL",
                 p => { p.AddWithValue("c", callId); p.AddWithValue("n", images.Count); }, ct);
+            return true;
         }
 
         public async Task<ClipRelocatePoll> PollAsync(ClipRelocateJob job, CancellationToken ct)
@@ -288,8 +323,13 @@ ORDER BY i.idnum", conn))
         /// clips' scene boundaries, cuts their previews and writes history. Safe to
         /// rerun after a restart.
         /// </summary>
-        public async Task FinishAsync(ClipRelocateJob job, ClipRelocateModalResult result, CancellationToken ct)
+        /// <returns>false if another instance is already finishing it.</returns>
+        public async Task<bool> FinishAsync(ClipRelocateJob job, ClipRelocateModalResult result, CancellationToken ct)
         {
+            if (!await TryClaimAsync(job.Id,
+                    "status = 'running' OR (status = 'finishing' AND updated_at < now() - interval '30 minutes')",
+                    "finishing", ct))
+                return false;
             int Count(string s) => result.Images.Count(i => i.Status == s);
             var reportJson = JsonSerializer.Serialize(result);
             await UpdateJobAsync(job.Id,
@@ -348,6 +388,7 @@ ORDER BY i.idnum", conn))
 
             await UpdateJobAsync(job.Id, "status = 'done', phase = 'done', error = @e, finished_at = now()",
                 p => p.AddWithValue("e", errors.Count == 0 ? DBNull.Value : string.Join("; ", errors)), ct);
+            return true;
         }
 
         private async Task<SceneBoundaryResponse> DetectSceneBoundaryAsync(int movieId, string rid, CancellationToken ct)
