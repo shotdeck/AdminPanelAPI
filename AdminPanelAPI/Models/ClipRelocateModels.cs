@@ -52,6 +52,8 @@ namespace AdminPanelAPI.Models
         [JsonPropertyName("found_frame")] public int? FoundFrame { get; set; }
         [JsonPropertyName("found_score")] public double? FoundScore { get; set; }
         [JsonPropertyName("recut_score")] public double? RecutScore { get; set; }
+        /// <summary>"drift_fit" when the still was accepted below the normal match score because it sits where the movie's drift line predicts.</summary>
+        [JsonPropertyName("found_via")] public string? FoundVia { get; set; }
     }
 
     public class ClipRelocateModalResult
@@ -60,6 +62,8 @@ namespace AdminPanelAPI.Models
         [JsonPropertyName("apply")] public bool Apply { get; set; }
         [JsonPropertyName("recut_all")] public bool RecutAll { get; set; }
         [JsonPropertyName("backup_prefix")] public string? BackupPrefix { get; set; }
+        /// <summary>found_time ≈ a * (history_frame / fps) + b, fitted from the confident matches.</summary>
+        [JsonPropertyName("drift_fit")] public JsonElement? DriftFit { get; set; }
         [JsonPropertyName("images")] public List<ClipRelocateImageResult> Images { get; set; } = new();
     }
 
