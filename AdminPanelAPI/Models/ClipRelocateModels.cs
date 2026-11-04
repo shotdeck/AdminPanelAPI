@@ -9,6 +9,7 @@ namespace AdminPanelAPI.Models
         public int MovieId { get; set; }
         public bool Apply { get; set; }
         public bool WriteHistory { get; set; }
+        public bool RecutAll { get; set; }
         public string Status { get; set; } = "";
         public string? ModalCallId { get; set; }
         public string? Phase { get; set; }
@@ -41,6 +42,8 @@ namespace AdminPanelAPI.Models
         /// <summary>ok | flagged | relocated | not_found | failed | no_still</summary>
         [JsonPropertyName("status")] public string Status { get; set; } = "";
         [JsonPropertyName("reason")] public string? Reason { get; set; }
+        /// <summary>Whether the check found the existing clip wrong (null from older app versions).</summary>
+        [JsonPropertyName("flagged")] public bool? Flagged { get; set; }
         [JsonPropertyName("history_frame")] public int? HistoryFrame { get; set; }
         [JsonPropertyName("best_t")] public double? BestTime { get; set; }
         [JsonPropertyName("best")] public double? BestScore { get; set; }
@@ -55,6 +58,7 @@ namespace AdminPanelAPI.Models
     {
         [JsonPropertyName("movie_id")] public int MovieId { get; set; }
         [JsonPropertyName("apply")] public bool Apply { get; set; }
+        [JsonPropertyName("recut_all")] public bool RecutAll { get; set; }
         [JsonPropertyName("backup_prefix")] public string? BackupPrefix { get; set; }
         [JsonPropertyName("images")] public List<ClipRelocateImageResult> Images { get; set; } = new();
     }

@@ -157,21 +157,25 @@ SELECT
         /// previews backed up in R2), their scene boundaries replaced (old rows
         /// kept in frl_clip_relocate_boundary_backup) and all 3 preview sizes cut.
         /// writeHistory (needs apply) also adds a "Shot Time Autodetected" row with
-        /// the found frame to frl_imagehistory. Poll relocate-status/{jobId}.
+        /// the found frame to frl_imagehistory. recutAll searches the film for every
+        /// still and recuts every clip found, not only the flagged ones; a clip that
+        /// already matched is kept when its still isn't found or the recut fails.
+        /// Poll relocate-status/{jobId}.
         /// </summary>
         [HttpPost("relocate/{movieId:int}")]
         public async Task<IActionResult> RelocateClips(
             int movieId,
             [FromQuery] bool apply = false,
             [FromQuery] bool writeHistory = false,
+            [FromQuery] bool recutAll = false,
             CancellationToken cancellationToken = default)
         {
             if (writeHistory && !apply)
                 return BadRequest(new { error = "writeHistory needs apply." });
 
-            var jobId = await _clipRelocate.CreateJobAsync(movieId, apply, writeHistory, cancellationToken);
+            var jobId = await _clipRelocate.CreateJobAsync(movieId, apply, writeHistory, recutAll, cancellationToken);
 
-            return Ok(new { jobId, movieId, apply, writeHistory, status = "queued" });
+            return Ok(new { jobId, movieId, apply, writeHistory, recutAll, status = "queued" });
         }
 
         /// <summary>
