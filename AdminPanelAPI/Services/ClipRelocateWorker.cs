@@ -65,9 +65,10 @@ namespace AdminPanelAPI.Services
 
             try
             {
-                if (job.Status == "queued" || job.ModalCallId == null)
+                if (job.Status is "queued" or "starting" || job.ModalCallId == null)
                 {
-                    await svc.StartAsync(job, ct);
+                    if (!await svc.StartAsync(job, ct))
+                        return PollDelay;
                     _logger.LogInformation("Clip relocate job {JobId}: movie {MovieId} started on Modal.", job.Id, job.MovieId);
                     return PollDelay;
                 }
@@ -78,7 +79,8 @@ namespace AdminPanelAPI.Services
                     case "running":
                         return PollDelay;
                     case "done" when poll.Result != null:
-                        await svc.FinishAsync(job, poll.Result, ct);
+                        if (!await svc.FinishAsync(job, poll.Result, ct))
+                            return PollDelay;
                         _logger.LogInformation("Clip relocate job {JobId}: movie {MovieId} done.", job.Id, job.MovieId);
                         return TimeSpan.Zero;
                     default:
