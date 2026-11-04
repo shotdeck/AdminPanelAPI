@@ -38,6 +38,7 @@ progress = modal.Dict.from_name("clip-relocate-progress", create_if_missing=True
 MOVIE_SERVER = "http://35.89.51.60:8888"
 # Whole films, basic auth from the `movie-server` secret (MOVIE_USERNAME / MOVIE_PASSWORD).
 MOVIE_FILE_URL = "http://35.89.51.60:8889/movie/{movie_id}.mp4"
+FILM_BUCKET = "movies"
 FILM_DECODE_PROCS = 8
 STILL_URL = "https://crunch.shotdeck.com/assets/images/stills/smthumb/small_{rid}.jpg"
 # crunch refuses requests without a browser user agent.
@@ -75,6 +76,7 @@ with image.imports():
     import numpy as np
     import requests
     from botocore.client import Config
+    from boto3.s3.transfer import TransferConfig
 
     def connect_r2():
         return boto3.client(
@@ -161,6 +163,15 @@ with image.imports():
         return False
 
     def download_film(movie_id, path):
+        """From the R2 copy at movies/{id}/{id}.mp4 if there is one, else from :8889."""
+        r2 = connect_r2()
+        try:
+            r2.download_file(FILM_BUCKET, f"{movie_id}/{movie_id}.mp4", path,
+                             Config=TransferConfig(multipart_chunksize=64 << 20, max_concurrency=16))
+            if os.path.getsize(path) > 0:
+                return True
+        except Exception:
+            pass
         auth = (os.environ["MOVIE_USERNAME"], os.environ["MOVIE_PASSWORD"])
         for attempt in range(4):
             try:
@@ -303,10 +314,11 @@ def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup
                           f"{d}/{rid}.mp4", src_offset=base)
 
 
-@app.function(image=image, secrets=[modal.Secret.from_name("movie-server")], cpu=FILM_DECODE_PROCS,
+@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")],
+              cpu=FILM_DECODE_PROCS,
               memory=16384, timeout=4 * 3600)
 def search_film(movie_id: int, stills: bytes, count: int, duration: float, job_tag: str) -> list:
-    """Downloads the whole film once from :8889 and returns, per still, its best (score, time) in every window."""
+    """Downloads the whole film once (R2 copy, else :8889) and returns, per still, its best (score, time) in every window."""
     from concurrent.futures import ProcessPoolExecutor
     S = np.frombuffer(stills, dtype=np.float16).astype(np.float32).reshape(count, -1)
     n_windows = int(np.ceil(duration / WINDOW_SECONDS))
@@ -314,7 +326,7 @@ def search_film(movie_id: int, stills: bytes, count: int, duration: float, job_t
         path = f"{d}/film.mp4"
         set_progress(job_tag, phase="downloading film")
         if not download_film(movie_id, path):
-            raise RuntimeError(f"Could not download movie {movie_id} from :8889.")
+            raise RuntimeError(f"Could not download movie {movie_id} from R2 or :8889.")
         set_progress(job_tag, phase="searching film", windows=n_windows, windows_done=0)
         step = int(np.ceil(n_windows / FILM_DECODE_PROCS))
         spans = [(a, min(n_windows, a + step)) for a in range(0, n_windows, step)]
@@ -336,7 +348,7 @@ def recut_film(movie_id: int, items: list, job_tag: str, apply: bool, backup_pre
     with tempfile.TemporaryDirectory() as d:
         path = f"{d}/film.mp4"
         if not download_film(movie_id, path):
-            raise RuntimeError(f"Could not download movie {movie_id} from :8889.")
+            raise RuntimeError(f"Could not download movie {movie_id} from R2 or :8889.")
 
         def one(item):
             rid, found_t, min_score = item

@@ -167,10 +167,9 @@ WHERE @m::int IS NULL OR movie_id = @m::int ORDER BY id DESC LIMIT @l", conn);
         }
 
         /// <summary>
-        /// The job to work on: one already started (so a restart resumes it), else
-        /// the oldest queued one.
+        /// Unfinished jobs: ones already started first (so a restart resumes them),
+        /// then queued ones oldest first.
         /// </summary>
-        /// <summary>Unfinished jobs, in-flight ones first, then queued ones oldest first.</summary>
         public async Task<List<ClipRelocateJob>> ActiveJobsAsync(CancellationToken ct)
         {
             await using var conn = await OpenAsync(ct);
