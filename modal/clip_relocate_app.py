@@ -241,8 +241,10 @@ def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup
             r2 = connect_r2()
             for suffix in [""] + PREVIEW_SUFFIXES:
                 key = f"{SOURCE_PREFIX}/{movie_id}/{rid}{suffix}.mp4"
-                if key_exists(r2, key):
-                    r2.copy_object(Bucket=BUCKET_NAME, Key=f"{backup_prefix}/{movie_id}/{rid}{suffix}.mp4",
+                backup = f"{backup_prefix}/{movie_id}/{rid}{suffix}.mp4"
+                # A preempted run is restarted from scratch; never replace the original backup with a recut.
+                if key_exists(r2, key) and not key_exists(r2, backup):
+                    r2.copy_object(Bucket=BUCKET_NAME, Key=backup,
                                    CopySource={"Bucket": BUCKET_NAME, "Key": key})
             r2.upload_file(out, BUCKET_NAME, f"{SOURCE_PREFIX}/{movie_id}/{rid}.mp4",
                            ExtraArgs={"ContentType": "video/mp4"})
@@ -251,7 +253,8 @@ def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup
     return dict(rid=rid, status="uploaded" if apply else "verified", **m)
 
 
-@app.function(image=image, timeout=24 * 3600)
+# Preemption restarts the whole run from the start (an hour's film search), so keep it on one instance.
+@app.function(image=image, timeout=24 * 3600, nonpreemptible=True)
 def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag: str,
                    recut_all: bool = False) -> dict:
     """images: [{"rid": str, "frame": int | None}]. Returns one entry per image."""
