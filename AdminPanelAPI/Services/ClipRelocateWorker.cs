@@ -21,7 +21,7 @@ namespace AdminPanelAPI.Services
         private static readonly TimeSpan IdleDelay = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan PollDelay = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan ErrorDelay = TimeSpan.FromMinutes(2);
-        private const int MaxFinishing = 4;
+        private const int MaxFinishing = 8;
 
         public ClipRelocateWorker(IServiceScopeFactory scopeFactory, ILogger<ClipRelocateWorker> logger, IConfiguration configuration)
         {
