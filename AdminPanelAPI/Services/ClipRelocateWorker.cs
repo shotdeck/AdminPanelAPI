@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using AdminPanelAPI.Models;
 
 namespace AdminPanelAPI.Services
@@ -14,11 +15,13 @@ namespace AdminPanelAPI.Services
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly ILogger<ClipRelocateWorker> _logger;
         private readonly int _parallel;
+        private readonly ConcurrentDictionary<long, Task> _finishing = new();
 
         private static readonly TimeSpan StartupDelay = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan IdleDelay = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan PollDelay = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan ErrorDelay = TimeSpan.FromMinutes(2);
+        private const int MaxFinishing = 4;
 
         public ClipRelocateWorker(IServiceScopeFactory scopeFactory, ILogger<ClipRelocateWorker> logger, IConfiguration configuration)
         {
@@ -64,13 +67,18 @@ namespace AdminPanelAPI.Services
 
         private async Task<TimeSpan> StepAsync(ClipRelocateService svc, CancellationToken ct)
         {
+            foreach (var (id, task) in _finishing)
+                if (task.IsCompleted) _finishing.TryRemove(id, out _);
+
             var jobs = await svc.ActiveJobsAsync(ct);
             if (jobs.Count == 0) return IdleDelay;
 
-            var inFlight = jobs.Count(j => j.Status != "queued");
+            // Finishing runs here in the API, so only jobs on Modal count against the limit.
+            var inFlight = jobs.Count(j => j.Status is "starting" or "running");
             var delay = PollDelay;
             foreach (var job in jobs)
             {
+                if (_finishing.ContainsKey(job.Id)) continue;
                 if (job.Status == "queued")
                 {
                     if (inFlight >= _parallel) break;
@@ -100,10 +108,9 @@ namespace AdminPanelAPI.Services
                     case "running":
                         return PollDelay;
                     case "done" when poll.Result != null:
-                        if (!await svc.FinishAsync(job, poll.Result, ct))
-                            return PollDelay;
-                        _logger.LogInformation("Clip relocate job {JobId}: movie {MovieId} done.", job.Id, job.MovieId);
-                        return TimeSpan.Zero;
+                        if (_finishing.Count < MaxFinishing)
+                            _finishing[job.Id] = Task.Run(() => FinishInBackgroundAsync(job, poll.Result, ct), ct);
+                        return PollDelay;
                     default:
                         await svc.FailJobAsync(job.Id, poll.Error ?? $"Modal returned status '{poll.Status}'.", ct);
                         return TimeSpan.Zero;
@@ -113,6 +120,29 @@ namespace AdminPanelAPI.Services
             {
                 await svc.FailJobAsync(job.Id, ex.Message, ct);
                 return TimeSpan.Zero;
+            }
+        }
+
+        /// <summary>
+        /// Writes boundaries, previews and history off the polling loop, so other
+        /// jobs keep being started and polled meanwhile. A finish that dies here
+        /// stays 'finishing' and is reclaimed once stale, as before.
+        /// </summary>
+        private async Task FinishInBackgroundAsync(ClipRelocateJob job, ClipRelocateModalResult result, CancellationToken ct)
+        {
+            try
+            {
+                using var scope = _scopeFactory.CreateScope();
+                var svc = scope.ServiceProvider.GetRequiredService<ClipRelocateService>();
+                if (await svc.FinishAsync(job, result, ct))
+                    _logger.LogInformation("Clip relocate job {JobId}: movie {MovieId} done.", job.Id, job.MovieId);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Clip relocate job {JobId}: finishing failed.", job.Id);
             }
         }
     }
