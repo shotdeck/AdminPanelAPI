@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text;
@@ -30,6 +31,7 @@ namespace AdminPanelAPI.Services
         private readonly string _startUrl;
         private readonly string _resultUrl;
         private readonly string _sceneDetectionBaseUrl;
+        private const int BoundaryParallel = 8;
 
         private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
 
@@ -348,21 +350,23 @@ ORDER BY i.idnum", conn))
                 }, ct);
 
             var relocated = result.Images.Where(i => i.Status == "relocated").ToList();
-            var errors = new List<string>();
+            var errors = new ConcurrentQueue<string>();
 
             if (job.Apply && relocated.Count > 0)
             {
                 var (images, _) = await GetImagesAsync(job.MovieId, ct);
                 var imageIds = images.ToDictionary(i => i.Rid, i => i.ImageId);
-                var boundaries = new List<ClipPreviewBoundary>();
+                var boundaries = new ConcurrentBag<ClipPreviewBoundary>();
+                var boundariesDone = 0;
 
-                foreach (var img in relocated)
+                var options = new ParallelOptions { MaxDegreeOfParallelism = BoundaryParallel, CancellationToken = ct };
+                await Parallel.ForEachAsync(relocated, options, async (img, token) =>
                 {
                     try
                     {
-                        var b = await DetectSceneBoundaryAsync(job.MovieId, img.Rid, ct);
+                        var b = await DetectSceneBoundaryAsync(job.MovieId, img.Rid, token);
                         WidenShortShot(b);
-                        await ReplaceBoundaryAsync(job.Id, b, ct);
+                        await ReplaceBoundaryAsync(job.Id, b, token);
                         if (b.StartTime is double s && b.EndTime is double e)
                             boundaries.Add(new ClipPreviewBoundary
                             {
@@ -376,14 +380,17 @@ ORDER BY i.idnum", conn))
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
                         _logger.LogWarning(ex, "Relocate job {JobId}: boundary for {Rid} failed.", job.Id, img.Rid);
-                        errors.Add($"boundary {img.Rid}: {ex.Message}");
+                        errors.Enqueue($"boundary {img.Rid}: {ex.Message}");
                     }
-                }
+                    // Keeps updated_at fresh so the other slot doesn't treat this finish as stale.
+                    if (Interlocked.Increment(ref boundariesDone) % 25 == 0)
+                        await UpdateJobAsync(job.Id, "phase = 'writing boundaries'", _ => { }, token);
+                });
 
                 await UpdateJobAsync(job.Id, "phase = 'cutting previews'", _ => { }, ct);
-                var previews = await _clipPreviews.GeneratePreviewsAsync(job.MovieId, boundaries, overwrite: true, ct);
+                var previews = await _clipPreviews.GeneratePreviewsAsync(job.MovieId, boundaries.ToList(), overwrite: true, ct);
                 if (previews.Errors > 0)
-                    errors.Add($"{previews.Errors} preview(s) failed");
+                    errors.Enqueue($"{previews.Errors} preview(s) failed");
 
                 if (job.WriteHistory)
                     await WriteHistoryAsync(job.Id, relocated, imageIds, ct);
