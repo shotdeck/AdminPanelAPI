@@ -64,8 +64,17 @@ CENTRE_SLACK = 0.02
 DRIFT_MATCH_MIN = 0.6
 DRIFT_TOLERANCE = 2.0
 DRIFT_MIN_POINTS = 8
+# A history "Frame #" is a frame number for some stills and milliseconds for others, even
+# within one movie, so a line is also fitted (or, with too few matches, assumed) per unit.
+# A match on one of those lines must score within this of the still's best in the film.
+UNIT_MATCH_SLACK = 0.1
 # The :8888 box re-encodes each window; at 8 at once its ffmpeg runs get OOM-killed.
 MOVIE_SERVER_PARALLEL = 4
+# An encode with black borders (letterbox/windowbox) the still lacks scores 0.6-0.9 at the right
+# frame, so each image is also compared with its borders cropped, and the better score counts.
+# A row/column is border when nearly all of it is below this level.
+BORDER_LEVEL = 24
+FEATURE_SIZE = 96 * 40
 
 with image.imports():
     import os
@@ -96,12 +105,39 @@ with image.imports():
         except r2.exceptions.ClientError:
             return False
 
-    def feature(img):
+    def content_box(grey):
+        """(y0, y1, x0, x1) inside the black borders of a greyscale image, or None if it has none."""
+        rows = np.where(np.percentile(grey, 98, axis=1) > BORDER_LEVEL)[0]
+        cols = np.where(np.percentile(grey, 98, axis=0) > BORDER_LEVEL)[0]
+        if not len(rows) or not len(cols):
+            return None
+        y0, y1, x0, x1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+        h, w = grey.shape
+        if (y1 - y0) * (x1 - x0) < 0.4 * h * w or (y1 - y0 > 0.98 * h and x1 - x0 > 0.98 * w):
+            return None
+        return y0, y1, x0, x1
+
+    def plain_feature(img):
         g = cv2.cvtColor(cv2.resize(img, (96, 40), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
         g = g.astype(np.float32).ravel()
         g -= g.mean()
         n = np.linalg.norm(g)
         return g / n if n else g
+
+    def feature(img):
+        """The image's feature, then the same with its black borders cropped (FEATURE_SIZE each)."""
+        small = cv2.cvtColor(cv2.resize(img, (192, 108), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+        box = content_box(small)
+        plain = plain_feature(img)
+        if not box:
+            return np.concatenate([plain, plain])
+        h, w = img.shape[:2]
+        y0, y1, x0, x1 = box
+        return np.concatenate([plain, plain_feature(img[y0 * h // 108:y1 * h // 108, x0 * w // 192:x1 * w // 192])])
+
+    def match(a, b):
+        """Similarity of features a (last axis) and b (first axis): the better of uncropped and cropped."""
+        return np.maximum(a[..., :FEATURE_SIZE] @ b[:FEATURE_SIZE], a[..., FEATURE_SIZE:] @ b[FEATURE_SIZE:])
 
     def still_feature(rid):
         for attempt in range(3):
@@ -135,7 +171,7 @@ with image.imports():
         F, fps = video_features(path)
         if F is None:
             return None
-        sc = F @ still
+        sc = match(F, still)
         i = int(np.argmax(sc))
         c = min(len(sc) - 1, int(round(expected * fps)))
         return dict(best_t=i / fps, best=float(sc[i]), centre=float(sc[max(0, c - 1):c + 2].max()),
@@ -204,7 +240,7 @@ with image.imports():
                 break
             if w < first_window:
                 continue
-            sc = S @ feature(f)
+            sc = match(S, feature(f))
             cur = out.get(w)
             if cur is None:
                 out[w] = [sc.copy(), np.full(len(sc), t)]
@@ -268,6 +304,24 @@ def fit_drift(points):
     return float(a), float(b), int(keep.sum())
 
 
+def history_lines(hist, best, fps):
+    """Lines mapping a history value to film time: [(divisor, a, b, slack)]. The movie-wide drift
+    fit comes first (no slack); then, per unit (frames, ms), a fit from that unit's confident
+    matches near found = history time, or that identity when too few fit."""
+    confident = [(hist[r], best[r][1]) for r in best
+                 if hist.get(r) is not None and best[r][1] is not None and best[r][0] >= MATCH_MIN]
+    lines = []
+    drift = fit_drift([(h / fps, f) for h, f in confident])
+    if drift:
+        lines.append((fps, drift[0], drift[1], None))
+    for div in (fps, 1000.0):
+        pts = [(h / div, f) for h, f in confident if h > 0 and 0.9 <= f / (h / div) <= 1.1]
+        fit = fit_drift(pts)
+        a, b = (fit[0], fit[1]) if fit else (1.0, 0.0)
+        lines.append((div, a, b, UNIT_MATCH_SLACK))
+    return lines
+
+
 @app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials")], timeout=600, max_containers=100)
 def check_clip(movie_id: int, rid: str) -> dict:
     still = still_feature(rid)
@@ -296,7 +350,7 @@ def match_window(movie_id: int, centre: float, tag: str, stills: bytes, count: i
         F, fps = video_features(path)
     if F is None:
         return dict(centre=centre, error="unreadable_window")
-    sc = S @ F.T
+    sc = match(S, F.T)
     idx = sc.argmax(axis=1)
     base = max(0.0, centre - WINDOW_SECONDS / 2)
     return dict(centre=centre, best=[(float(sc[j, i]), base + i / fps) for j, i in enumerate(idx)])
@@ -445,20 +499,21 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         report_meta["windows_failed"] = [round(c, 3) for c in failed_centres]
 
         hist_frame = {i["rid"]: i.get("frame") for i in images}
-        drift = fit_drift([(hist_frame[r] / fps, best[r][1]) for r in rids
-                           if hist_frame.get(r) is not None and best[r][1] is not None and best[r][0] >= MATCH_MIN])
-        if drift:
-            a, b, n_in = drift
-            report_meta["drift_fit"] = dict(a=round(a, 6), b=round(b, 3), inliers=n_in)
+        lines = history_lines(hist_frame, {r: best[r] for r in rids}, fps)
+        if lines[0][3] is None:
+            report_meta["drift_fit"] = dict(a=round(lines[0][1], 6), b=round(lines[0][2], 3))
+        report_meta["history_lines"] = [dict(divisor=round(d, 3), a=round(a, 6), b=round(b, 3), slack=sl)
+                                        for d, a, b, sl in lines]
         found, min_scores = [], {}
         for rid in targets:
             e = report[rid]
             s, t = best.get(rid, (-1.0, None))
             min_scores[rid] = MATCH_MIN
-            if (t is None or s < MATCH_MIN) and drift and hist_frame.get(rid) is not None:
-                pred = drift[0] * hist_frame[rid] / fps + drift[1]
-                near = [(ws, wt) for ws, wt in window_best.get(rid, [])
-                        if abs(wt - pred) <= DRIFT_TOLERANCE and ws >= DRIFT_MATCH_MIN]
+            if (t is None or s < MATCH_MIN) and hist_frame.get(rid) is not None:
+                near = [(ws, wt) for d, a, b, slack in lines
+                        for ws, wt in window_best.get(rid, [])
+                        if abs(wt - (a * hist_frame[rid] / d + b)) <= DRIFT_TOLERANCE and ws >= DRIFT_MATCH_MIN
+                        and (slack is None or ws >= s - slack)]
                 if near:
                     s, t = max(near)
                     e["found_via"] = "drift_fit"
