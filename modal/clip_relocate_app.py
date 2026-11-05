@@ -40,6 +40,8 @@ MOVIE_SERVER = "http://35.89.51.60:8888"
 MOVIE_FILE_URL = "http://35.89.51.60:8889/movie/{movie_id}.mp4"
 FILM_BUCKET = "movies"
 FILM_DECODE_PROCS = 8
+# Clips per recut_film machine; each machine downloads the film from R2 once.
+RECUT_CHUNK = 80
 STILL_URL = "https://crunch.shotdeck.com/assets/images/stills/smthumb/small_{rid}.jpg"
 # crunch refuses requests without a browser user agent.
 STILL_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120"}
@@ -475,8 +477,15 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         set_progress(job_tag, phase="recutting" if apply else "verifying", recut=0, recut_total=len(found))
         backup_prefix = f"{SOURCE_PREFIX}_backup_{time.strftime('%Y%m%d')}"
         if whole_film:
-            recuts = recut_film.remote(movie_id, [(r, report[r]["found_time"], min_scores[r]) for r in found],
-                                       job_tag, apply, backup_prefix) if found else []
+            items = [(r, report[r]["found_time"], min_scores[r]) for r in found]
+            chunks = [items[i:i + RECUT_CHUNK] for i in range(0, len(items), RECUT_CHUNK)]
+            parts = recut_film.starmap([(movie_id, c, job_tag, apply, backup_prefix) for c in chunks],
+                                       return_exceptions=True)
+            recuts = []
+            for c, part in zip(chunks, parts):
+                if isinstance(part, Exception):
+                    part = [dict(rid=rid, status="failed", reason=f"recut_error: {part}"[:300]) for rid, _, _ in c]
+                recuts.extend(part)
         else:
             recuts = recut.map([movie_id] * len(found), found, [report[r]["found_time"] for r in found],
                                [job_tag] * len(found), [apply] * len(found), [backup_prefix] * len(found),
