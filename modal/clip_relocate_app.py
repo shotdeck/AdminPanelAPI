@@ -479,9 +479,13 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         if whole_film:
             items = [(r, report[r]["found_time"], min_scores[r]) for r in found]
             chunks = [items[i:i + RECUT_CHUNK] for i in range(0, len(items), RECUT_CHUNK)]
-            recuts = [r for part in recut_film.starmap([(movie_id, c, job_tag, apply, backup_prefix) for c in chunks],
-                                                       order_outputs=False)
-                      for r in part]
+            parts = recut_film.starmap([(movie_id, c, job_tag, apply, backup_prefix) for c in chunks],
+                                       return_exceptions=True)
+            recuts = []
+            for c, part in zip(chunks, parts):
+                if isinstance(part, Exception):
+                    part = [dict(rid=rid, status="failed", reason=f"recut_error: {part}"[:300]) for rid, _, _ in c]
+                recuts.extend(part)
         else:
             recuts = recut.map([movie_id] * len(found), found, [report[r]["found_time"] for r in found],
                                [job_tag] * len(found), [apply] * len(found), [backup_prefix] * len(found),
