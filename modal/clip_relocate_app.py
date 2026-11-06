@@ -42,7 +42,9 @@ FILM_BUCKET = "movies"
 FILM_DECODE_PROCS = 8
 # Clips per recut_film machine; each machine downloads the film from R2 once.
 RECUT_CHUNK = 80
-STILL_URL = "https://crunch.shotdeck.com/assets/images/stills/smthumb/small_{rid}.jpg"
+STILL_URL = "https://crunch.shotdeck.com/assets/images/stills/smthumb/small_{rid}.{ext}"
+# The thumbnail keeps the uploaded file's extension, which isn't always .jpg.
+STILL_EXTS = ["jpg", "png", "JPG", "jpeg"]
 # crunch refuses requests without a browser user agent.
 STILL_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120"}
 SOURCE_PREFIX = "clips_9s"
@@ -140,18 +142,19 @@ with image.imports():
         return np.maximum(a[..., :FEATURE_SIZE] @ b[:FEATURE_SIZE], a[..., FEATURE_SIZE:] @ b[FEATURE_SIZE:])
 
     def still_feature(rid):
-        for attempt in range(3):
-            try:
-                r = requests.get(STILL_URL.format(rid=rid), headers=STILL_HEADERS, timeout=60)
-                if r.status_code == 200:
-                    img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
-                    if img is not None:
-                        return feature(img)
-                elif r.status_code == 404:
-                    return None
-            except requests.RequestException:
-                pass
-            time.sleep(2 * (attempt + 1))
+        for ext in STILL_EXTS:
+            for attempt in range(3):
+                try:
+                    r = requests.get(STILL_URL.format(rid=rid, ext=ext), headers=STILL_HEADERS, timeout=60)
+                    if r.status_code == 200:
+                        img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+                        if img is not None:
+                            return feature(img)
+                    elif r.status_code == 404:
+                        break
+                except requests.RequestException:
+                    pass
+                time.sleep(2 * (attempt + 1))
         return None
 
     def video_features(path):
