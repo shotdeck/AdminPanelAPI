@@ -273,8 +273,6 @@ ORDER BY i.idnum", conn))
             var (images, fps) = await GetImagesAsync(job.MovieId, ct);
             if (images.Count == 0)
                 throw new InvalidOperationException($"Movie {job.MovieId} has no live images.");
-            if (fps == null)
-                throw new InvalidOperationException($"Movie {job.MovieId} has no fps in frl_movie_info.");
 
             var body = JsonSerializer.Serialize(new
             {
