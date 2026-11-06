@@ -79,6 +79,7 @@ BORDER_LEVEL = 24
 FEATURE_SIZE = 96 * 40
 
 with image.imports():
+    import json
     import os
     import subprocess
     import tempfile
@@ -399,6 +400,24 @@ def search_film(movie_id: int, stills: bytes, count: int, duration: float, job_t
             for j in range(count)]
 
 
+@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials")], timeout=600)
+def probe_film(movie_id: int) -> dict:
+    """Duration and fps of the R2 copy at movies/{id}/{id}.mp4, read with ffprobe over a signed URL."""
+    url = connect_r2().generate_presigned_url("get_object", Params={"Bucket": FILM_BUCKET, "Key": f"{movie_id}/{movie_id}.mp4"},
+                                              ExpiresIn=3600)
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=avg_frame_rate,r_frame_rate:format=duration", "-of", "json", url],
+                         capture_output=True, text=True, timeout=300)
+    if out.returncode != 0:
+        raise RuntimeError(f"Movie {movie_id} isn't on :8888 and its R2 copy couldn't be probed: "
+                           f"{out.stderr.replace(url, '<film url>')[:300]}")
+    j = json.loads(out.stdout)
+    st = j["streams"][0]
+    rate = st.get("avg_frame_rate") if st.get("avg_frame_rate") not in (None, "0/0") else st["r_frame_rate"]
+    num, den = (float(x) for x in rate.split("/"))
+    return dict(duration=float(j["format"]["duration"]), fps=num / den)
+
+
 @app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")],
               cpu=FILM_DECODE_PROCS, memory=16384, timeout=4 * 3600)
 def recut_film(movie_id: int, items: list, job_tag: str, apply: bool, backup_prefix: str) -> list:
@@ -464,7 +483,13 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
                 if attempt == 3:
                     raise
                 time.sleep(60 * (attempt + 1))
+        # Films uploaded straight to R2 aren't on :8888, so probe the R2 copy instead.
+        if "duration" not in info:
+            info = probe_film.remote(movie_id)
         duration = float(info["duration"])
+        if not fps:
+            fps = float(info["fps"])
+            report_meta["fps_source"] = "film"
         feats = {rid: still_feature(rid) for rid in targets}
         rids = [rid for rid in targets if feats[rid] is not None]
         S = np.stack([feats[r] for r in rids]).astype(np.float16).tobytes()
@@ -579,7 +604,7 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
 def start(body: dict):
     job_tag = str(body["job_tag"])
     progress[job_tag] = dict(phase="queued")
-    call = relocate_movie.spawn(int(body["movie_id"]), body["images"], float(body["fps"]),
+    call = relocate_movie.spawn(int(body["movie_id"]), body["images"], float(body.get("fps") or 0),
                                 bool(body.get("apply", False)), job_tag, bool(body.get("recut_all", False)))
     return dict(call_id=call.object_id)
 
