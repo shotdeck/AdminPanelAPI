@@ -16,4 +16,17 @@ public class SmtpDiagnosticsTests
 
         Assert.StartsWith("InvalidOperationException: Failure sending mail. -> IOException: Unable to read data -> SocketException(ConnectionReset)", text);
     }
+
+    [Fact]
+    public void NormalizePassword_StripsAllWhitespace() =>
+        Assert.Equal("abcdefghijklmnop", QdrantSyncMailer.NormalizePassword(" abcd efgh\tijkl\u00a0mnop\r\n"));
+
+    [Fact]
+    public void Fingerprint_DoesNotContainPassword()
+    {
+        var json = System.Text.Json.JsonSerializer.Serialize(SmtpDiagnostics.Fingerprint("abcdefghijklmnop"));
+        Assert.DoesNotContain("abcdefghijklmnop", json);
+        Assert.Contains("\"length\":16", json);
+        Assert.Contains("\"lettersOnly\":true", json);
+    }
 }
