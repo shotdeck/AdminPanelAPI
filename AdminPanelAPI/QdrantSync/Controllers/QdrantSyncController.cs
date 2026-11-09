@@ -107,13 +107,19 @@ public sealed class QdrantSyncController(
 
     /// <summary>Which settings are in place (no secrets) and when the nightly run is.</summary>
     /// <summary>
-    /// Tests the SMTP path from this server (connect, banner, EHLO, STARTTLS/TLS) on 587 and 465
-    /// without logging in or sending mail.
+    /// Tests the SMTP path from this server (connect, banner, EHLO, STARTTLS/TLS, AUTH, MAIL FROM/RCPT TO)
+    /// on 587 and 465 without sending mail. The password is never echoed, only its fingerprint.
     /// </summary>
     [HttpGet("email/diagnose")]
-    public async Task<IActionResult> DiagnoseEmail(CancellationToken ct) =>
-        Ok(await SmtpDiagnostics.RunAsync(options.CurrentValue.Email.SmtpHost,
-            new[] { options.CurrentValue.Email.SmtpPort, 465 }.Distinct(), ct));
+    public async Task<IActionResult> DiagnoseEmail(CancellationToken ct)
+    {
+        var e = options.CurrentValue.Email;
+        var username = string.IsNullOrWhiteSpace(e.Username) ? e.From : e.Username;
+        var login = e.Configured
+            ? new SmtpDiagnostics.Login(username, QdrantSyncMailer.NormalizePassword(e.Password), string.IsNullOrWhiteSpace(e.From) ? username : e.From, e.To)
+            : null;
+        return Ok(await SmtpDiagnostics.RunAsync(e.SmtpHost, new[] { e.SmtpPort, 465 }.Distinct(), ct, login));
+    }
 
     [HttpGet("config")]
     public IActionResult Config()

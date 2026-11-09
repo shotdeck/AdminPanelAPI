@@ -16,7 +16,10 @@ public static class SmtpDiagnostics
 
     private static readonly TimeSpan StepTimeout = TimeSpan.FromSeconds(15);
 
-    public static async Task<object> RunAsync(string host, IEnumerable<int> ports, CancellationToken ct)
+    /// <summary>Credentials for the optional AUTH + MAIL FROM/RCPT TO steps (no DATA, nothing is sent).</summary>
+    public sealed record Login(string Username, string Password, string From, string To);
+
+    public static async Task<object> RunAsync(string host, IEnumerable<int> ports, CancellationToken ct, Login? login = null)
     {
         string[] addresses;
         try { addresses = (await Dns.GetHostAddressesAsync(host, ct)).Select(a => a.ToString()).ToArray(); }
@@ -24,11 +27,11 @@ public static class SmtpDiagnostics
 
         var results = new Dictionary<string, List<Step>>();
         foreach (var port in ports)
-            results[port.ToString()] = await ProbeAsync(host, port, implicitTls: port == 465, ct);
-        return new { host, addresses, ports = results };
+            results[port.ToString()] = await ProbeAsync(host, port, implicitTls: port == 465, login, ct);
+        return new { host, addresses, password = login == null ? null : Fingerprint(login.Password), ports = results };
     }
 
-    private static async Task<List<Step>> ProbeAsync(string host, int port, bool implicitTls, CancellationToken ct)
+    private static async Task<List<Step>> ProbeAsync(string host, int port, bool implicitTls, Login? login, CancellationToken ct)
     {
         var steps = new List<Step>();
         using var tcp = new TcpClient();
@@ -45,6 +48,18 @@ public static class SmtpDiagnostics
             if (!await RunStepAsync(steps, "starttls", t => CommandAsync(stream, "STARTTLS", "220", t), ct)) return steps;
             if (!await TlsAsync(steps, host, () => stream, s => stream = s, ct)) return steps;
             if (!await RunStepAsync(steps, "ehlo-after-tls", t => CommandAsync(stream, "EHLO adminpanelapi", "250", t), ct)) return steps;
+        }
+        if (login != null)
+        {
+            var user = Convert.ToBase64String(Encoding.UTF8.GetBytes(login.Username));
+            var pass = Convert.ToBase64String(Encoding.UTF8.GetBytes(login.Password));
+            if (!await RunStepAsync(steps, "auth-login", t => CommandAsync(stream, "AUTH LOGIN", "334", t), ct)) return steps;
+            if (!await RunStepAsync(steps, "auth-username", t => CommandAsync(stream, user, "334", t), ct)) return steps;
+            if (!await RunStepAsync(steps, "auth-password", t => CommandAsync(stream, pass, "235", t), ct)) return steps;
+            if (!await RunStepAsync(steps, "mail-from", t => CommandAsync(stream, $"MAIL FROM:<{login.From}>", "250", t), ct)) return steps;
+            foreach (var to in login.To.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                if (!await RunStepAsync(steps, "rcpt-to", t => CommandAsync(stream, $"RCPT TO:<{to}>", "250", t), ct)) return steps;
+            await RunStepAsync(steps, "rset", t => CommandAsync(stream, "RSET", "250", t), ct);
         }
         try { await CommandAsync(stream, "QUIT", "221", ct); } catch { /* best effort */ }
         return steps;
@@ -112,6 +127,14 @@ public static class SmtpDiagnostics
             if (sb.Length > 4096) throw new IOException("reply line too long: " + sb.ToString(0, 200));
         }
     }
+
+    /// <summary>Shape of the password plus a short hash prefix, to compare configs without revealing it.</summary>
+    public static object Fingerprint(string password) => new
+    {
+        length = password.Length,
+        lettersOnly = password.Length > 0 && password.All(char.IsAsciiLetter),
+        sha256Prefix = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(password)))[..8].ToLowerInvariant(),
+    };
 
     /// <summary>Message of <paramref name="ex"/> and all inner exceptions, with socket error codes.</summary>
     public static string Describe(Exception ex)

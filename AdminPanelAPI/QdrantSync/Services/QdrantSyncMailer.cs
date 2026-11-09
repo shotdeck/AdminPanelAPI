@@ -66,11 +66,15 @@ public sealed class QdrantSyncMailer(
         {
             EnableSsl = true,
             DeliveryMethod = SmtpDeliveryMethod.Network,
-            Credentials = new NetworkCredential(username, cfg.Password.Replace(" ", "")),
+            Credentials = new NetworkCredential(username, NormalizePassword(cfg.Password)),
             Timeout = 100_000,
         };
         await smtp.SendMailAsync(message, ct);
     }
+
+    /// <summary>Gmail shows app passwords in groups ("abcd efgh ..."); strip all whitespace.</summary>
+    public static string NormalizePassword(string password) =>
+        new(password.Where(c => !char.IsWhiteSpace(c)).ToArray());
 
     private static Attachment Csv(string csv, string name) =>
         new(new MemoryStream(Encoding.UTF8.GetBytes(csv)), name, MediaTypeNames.Text.Csv);
