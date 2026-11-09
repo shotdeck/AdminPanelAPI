@@ -1,3 +1,4 @@
+using AdminPanelAPI.QdrantSync;
 using AdminPanelAPI.Bts;
 using AdminPanelAPI.Interfaces;
 using AdminPanelAPI.Services;
@@ -148,6 +149,9 @@ builder.Services.AddHostedService<MovieLocationBackgroundService>();
 
 // BTS: customer behind-the-scenes media spaces (/bts pages, /api/bts routes)
 builder.AddBts();
+
+// Postgres -> Qdrant metadata sync (/api/qdrant-sync, nightly worker, report email)
+builder.AddQdrantSync();
 
 builder.Services.AddCors(opt =>
 {
