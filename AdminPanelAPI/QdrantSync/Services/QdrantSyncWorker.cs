@@ -72,8 +72,9 @@ public sealed class QdrantSyncWorker(
     {
         if (!opts.Nightly.Enabled) return;
         if (NightlyDue(opts.Nightly, DateTime.UtcNow) is not { } date) return;
-        if (await store.CreateNightlyJobAsync(date, opts.Nightly.Apply, ct) is { } id)
-            logger.LogInformation("Queued nightly Qdrant sync #{JobId} for {Date}.", id, date);
+        var kinds = opts.Nightly.Insert ? new[] { "insert", "sync" } : new[] { "sync" };
+        foreach (var id in await store.CreateNightlyJobsAsync(date, kinds, opts.Nightly.Apply, ct))
+            logger.LogInformation("Queued nightly Qdrant job #{JobId} for {Date}.", id, date);
     }
 
     /// <summary>Today's date while inside [AtUtc, AtUtc + WindowHours), else null.</summary>
@@ -88,7 +89,7 @@ public sealed class QdrantSyncWorker(
 
     private async Task RunAsync(QdrantSyncJob job, CancellationToken ct)
     {
-        logger.LogInformation("Qdrant sync #{JobId} started (apply={Apply}, after id {LastId}).", job.Id, job.Apply, job.LastId);
+        logger.LogInformation("Qdrant {Kind} #{JobId} started (apply={Apply}, after id {LastId}).", job.Kind, job.Id, job.Apply, job.LastId);
         string status;
         string? error = null;
         try

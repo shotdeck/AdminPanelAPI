@@ -14,6 +14,12 @@ public sealed class QdrantSyncOptions
     public int DbTimeoutSeconds { get; set; } = 180;
     public int LogEveryRows { get; set; } = 10000;
     public int MaxLoggedRecords { get; set; } = 200;
+    public string VectorName { get; set; } = "qwen3";
+    /// <summary>Insert job: images loaded (with vectors) and upserted per request.</summary>
+    public int InsertBatchSize { get; set; } = 500;
+    /// <summary>Insert job: embedded ids read from Postgres per query when looking for missing ones.</summary>
+    public int IdScanBatchSize { get; set; } = 20000;
+    public int ScrollPageSize { get; set; } = 10000;
     public NightlyOptions Nightly { get; set; } = new();
     public EmailOptions Email { get; set; } = new();
 
@@ -25,6 +31,8 @@ public sealed class QdrantSyncOptions
         /// <summary>UTC time of day, HH:mm. 09:00 UTC is 02:00 Mountain Standard Time.</summary>
         public string AtUtc { get; set; } = "09:00";
         public bool Apply { get; set; } = true;
+        /// <summary>Also queue the insert-missing job each night, ahead of the sync.</summary>
+        public bool Insert { get; set; } = true;
         /// <summary>A nightly run that couldn't start on time (another job running, API down) may still start this many hours late.</summary>
         public int WindowHours { get; set; } = 6;
     }
@@ -47,6 +55,7 @@ public sealed class QdrantSyncOptions
 public sealed class QdrantSyncJob
 {
     public long Id { get; set; }
+    /// <summary>sync (update payloads of existing points) | insert (add embedded images missing from Qdrant)</summary>
     public string Kind { get; set; } = "sync";
     public bool Apply { get; set; }
     public string TriggeredBy { get; set; } = "manual";
@@ -58,9 +67,9 @@ public sealed class QdrantSyncJob
     public bool Email { get; set; }
     public int LastId { get; set; }
     public long Scanned { get; set; }
-    /// <summary>Live images that are in Qdrant.</summary>
+    /// <summary>Sync: live images that are in Qdrant. Insert: embedded images already in Qdrant.</summary>
     public long Found { get; set; }
-    /// <summary>Live images not in Qdrant yet (left for the insert job).</summary>
+    /// <summary>Sync: live images not in Qdrant (left for the insert job). Insert: embedded images missing from Qdrant.</summary>
     public long Missing { get; set; }
     public long Changed { get; set; }
     public long Unchanged { get; set; }

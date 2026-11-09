@@ -29,11 +29,15 @@ public static class QdrantSyncReport
         return sb.ToString();
     }
 
-    public static string Subject(QdrantSyncJob job) =>
-        $"Qdrant sync #{job.Id} {job.Status}: {job.Changed:N0} changed{(job.Apply ? "" : " (dry run)")}";
+    public static bool HasCsvs(QdrantSyncJob job) => job.Kind != "insert";
+
+    public static string Subject(QdrantSyncJob job) => job.Kind == "insert"
+        ? $"Qdrant insert #{job.Id} {job.Status}: {job.Written:N0} inserted, {job.Missing:N0} missing{(job.Apply ? "" : " (dry run)")}"
+        : $"Qdrant sync #{job.Id} {job.Status}: {job.Changed:N0} changed{(job.Apply ? "" : " (dry run)")}";
 
     public static string Body(QdrantSyncJob job)
     {
+        if (job.Kind == "insert") return InsertBody(job);
         var elapsed = job.StartedAt != null && job.FinishedAt != null ? job.FinishedAt.Value - job.StartedAt.Value : (TimeSpan?)null;
         var sb = new StringBuilder();
         sb.AppendLine($"Qdrant metadata sync #{job.Id} ({job.TriggeredBy}{(job.NightlyDate is { } d ? $" {d:yyyy-MM-dd}" : "")})");
@@ -57,6 +61,22 @@ public static class QdrantSyncReport
         }
         sb.AppendLine();
         sb.AppendLine($"Attached: {ExamplesFileName(job)} (first {job.Examples?.Select(e => e.ImageId).Distinct().Count() ?? 0:N0} changed records) and {ByFieldFileName(job)}.");
+        return sb.ToString();
+    }
+
+    private static string InsertBody(QdrantSyncJob job)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"Qdrant insert-missing #{job.Id} ({job.TriggeredBy}{(job.NightlyDate is { } d ? $" {d:yyyy-MM-dd}" : "")})");
+        sb.AppendLine($"Status: {job.Status}{(job.Apply ? "" : " — dry run, nothing inserted")}");
+        if (job.Error != null) sb.AppendLine($"Error: {job.Error}");
+        sb.AppendLine();
+        sb.AppendLine($"Embedded images in Postgres: {job.Scanned:N0}");
+        sb.AppendLine($"Already in Qdrant:           {job.Found:N0}");
+        sb.AppendLine($"Missing from Qdrant:         {job.Missing:N0}");
+        sb.AppendLine($"Inserted:                    {job.Written:N0}");
+        if (job.StartedAt != null && job.FinishedAt != null)
+            sb.AppendLine($"Elapsed:                     {job.FinishedAt.Value - job.StartedAt.Value:hh\\:mm\\:ss}");
         return sb.ToString();
     }
 

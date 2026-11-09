@@ -56,8 +56,11 @@ public sealed class QdrantSyncMailer(
         };
         foreach (var to in cfg.To.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             message.To.Add(to);
-        message.Attachments.Add(Csv(QdrantSyncReport.ExamplesCsv(job), QdrantSyncReport.ExamplesFileName(job)));
-        message.Attachments.Add(Csv(QdrantSyncReport.ByFieldCsv(job), QdrantSyncReport.ByFieldFileName(job)));
+        if (QdrantSyncReport.HasCsvs(job))
+        {
+            message.Attachments.Add(Csv(QdrantSyncReport.ExamplesCsv(job), QdrantSyncReport.ExamplesFileName(job)));
+            message.Attachments.Add(Csv(QdrantSyncReport.ByFieldCsv(job), QdrantSyncReport.ByFieldFileName(job)));
+        }
 
         using var smtp = new SmtpClient(cfg.SmtpHost, cfg.SmtpPort)
         {

@@ -22,12 +22,27 @@ public sealed class QdrantSyncController(
     /// Dry run unless <paramref name="apply"/> is true. Only one job runs at a time.
     /// </summary>
     [HttpPost("sync")]
-    public async Task<IActionResult> QueueSync(
+    public Task<IActionResult> QueueSync(
         [FromQuery] bool apply = false,
         [FromQuery] int startAfterId = 0,
         [FromQuery] long maxRows = 0,
         [FromQuery] bool email = false,
-        CancellationToken ct = default)
+        CancellationToken ct = default) => QueueAsync("sync", apply, startAfterId, maxRows, email, ct);
+
+    /// <summary>
+    /// Queues an insert of every image that has a 998-dim embedding but no Qdrant point yet
+    /// (vector + full payload). Dry run (counts only) unless <paramref name="apply"/> is true.
+    /// <paramref name="maxRows"/> caps how many embedded Postgres ids are scanned.
+    /// </summary>
+    [HttpPost("insert")]
+    public Task<IActionResult> QueueInsert(
+        [FromQuery] bool apply = false,
+        [FromQuery] int startAfterId = 0,
+        [FromQuery] long maxRows = 0,
+        [FromQuery] bool email = false,
+        CancellationToken ct = default) => QueueAsync("insert", apply, startAfterId, maxRows, email, ct);
+
+    private async Task<IActionResult> QueueAsync(string kind, bool apply, int startAfterId, long maxRows, bool email, CancellationToken ct)
     {
         if (!options.CurrentValue.QdrantConfigured)
             return StatusCode(503, new { error = "QdrantSync:Url and QdrantSync:ApiKey are not configured." });
@@ -35,10 +50,10 @@ public sealed class QdrantSyncController(
             return BadRequest(new { error = "startAfterId and maxRows must be >= 0." });
 
         await store.EnsureTablesAsync(ct);
-        var (jobId, created) = await store.CreateJobAsync(apply, startAfterId, maxRows, email, ct);
+        var (jobId, created) = await store.CreateJobAsync(kind, apply, startAfterId, maxRows, email, ct);
         if (!created)
-            return Conflict(new { error = "A Qdrant sync job is already queued or running.", jobId, statusUrl = $"/api/qdrant-sync/jobs/{jobId}" });
-        return Accepted(new { jobId, apply, startAfterId, maxRows, email, statusUrl = $"/api/qdrant-sync/jobs/{jobId}" });
+            return Conflict(new { error = "A Qdrant sync/insert job is already queued or running.", jobId, statusUrl = $"/api/qdrant-sync/jobs/{jobId}" });
+        return Accepted(new { jobId, kind, apply, startAfterId, maxRows, email, statusUrl = $"/api/qdrant-sync/jobs/{jobId}" });
     }
 
     [HttpGet("jobs")]
@@ -103,7 +118,7 @@ public sealed class QdrantSyncController(
             o.BatchSize,
             o.WriteBatchSize,
             o.IncludeColorShades,
-            nightly = new { o.Nightly.Enabled, o.Nightly.AtUtc, o.Nightly.Apply, o.Nightly.WindowHours },
+            nightly = new { o.Nightly.Enabled, o.Nightly.AtUtc, o.Nightly.Apply, o.Nightly.Insert, o.Nightly.WindowHours },
             email = new { configured = o.Email.Configured, o.Email.SmtpHost, o.Email.SmtpPort, o.Email.From, o.Email.To },
             instance = QdrantSyncWorker.Instance,
         });

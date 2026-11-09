@@ -5,9 +5,11 @@ using Npgsql;
 namespace AdminPanelAPI.QdrantSync.Services;
 
 /// <summary>One image's metadata as the Qdrant importer lays it out: <c>{ image: {...}, movie: {...} }</c>.</summary>
-public sealed class ImagePoint(long id, Dictionary<string, object?> payload)
+public sealed class ImagePoint(long id, Dictionary<string, object?> payload, float[]? vector = null)
 {
     public long Id { get; } = id;
+    /// <summary>The 998-dim qwen3 vector; only loaded for inserts.</summary>
+    public float[]? Vector { get; } = vector;
     public Dictionary<string, object?> Payload { get; } = payload;
     public Dictionary<string, object?> Image => (Dictionary<string, object?>)Payload["image"]!;
 }
@@ -46,7 +48,7 @@ public static class QdrantPayloads
     // ---------- PostgreSQL ----------
 
     /// <summary>Fails before any writes if a source column is missing or the TV columns aren't integers.</summary>
-    public static async Task VerifySourceSchemaAsync(NpgsqlConnection db, CancellationToken ct)
+    public static async Task VerifySourceSchemaAsync(NpgsqlConnection db, CancellationToken ct, bool includeEmbeddings = false)
     {
         var expected = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
         {
@@ -60,6 +62,8 @@ public static class QdrantPayloads
                 "comm_brand", "comm_product", "trailer_description" },
             ["frl_join_images_tags"] = new[] { "imageid", "tag" }
         };
+        if (includeEmbeddings)
+            expected["frl_caption_embeddings_qwen3_mini_998"] = new[] { "idnum", "keyword_vectorized_embeddings" };
         await using var cmd = new NpgsqlCommand("""
             SELECT table_name, column_name, data_type FROM information_schema.columns
             WHERE table_schema = 'frl' AND table_name = ANY(@tables)
@@ -101,25 +105,48 @@ public static class QdrantPayloads
         return result;
     }
 
+    /// <summary>Image ids (any status) that have a 998-dim embedding, i.e. can be inserted into Qdrant.</summary>
+    public static async Task<List<int>> ReadEmbeddedImageIdsAsync(NpgsqlConnection db, int afterId, int limit, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand("""
+            SELECT i.idnum
+            FROM frl.frl_images i
+            INNER JOIN frl.frl_caption_embeddings_qwen3_mini_998 e ON e.idnum = i.idnum
+            WHERE i.idnum > @after AND e.keyword_vectorized_embeddings IS NOT NULL
+            ORDER BY i.idnum
+            LIMIT @count
+            """, db);
+        cmd.Parameters.AddWithValue("after", afterId);
+        cmd.Parameters.AddWithValue("count", limit);
+        var result = new List<int>(limit);
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        while (await rdr.ReadAsync(ct)) result.Add(rdr.GetInt32(0));
+        return result;
+    }
+
     /// <summary>Complete managed payloads (no vectors) for the given images, join-table fields included.</summary>
     public static async Task<List<ImagePoint>> BuildPayloadsAsync(
-        NpgsqlConnection db, int[] ids, bool includeColorShades, CancellationToken ct)
+        NpgsqlConnection db, int[] ids, bool includeColorShades, CancellationToken ct, bool withVectors = false)
     {
-        var points = await ReadImagesAsync(db, ids, ct);
+        var points = await ReadImagesAsync(db, ids, withVectors, ct);
         await FetchTagsAsync(db, points, ct);
         await FetchFreeTagsAsync(db, points, ct);
         if (includeColorShades) await FetchColorShadesAsync(db, points, ct);
         return points;
     }
 
-    private static async Task<List<ImagePoint>> ReadImagesAsync(NpgsqlConnection db, int[] ids, CancellationToken ct)
+    /// <summary>
+    /// Images (and their movie) by id. With <paramref name="withVectors"/>, also the 998-dim
+    /// vector from frl_caption_embeddings_qwen3_mini_998; images without one are skipped.
+    /// </summary>
+    private static async Task<List<ImagePoint>> ReadImagesAsync(NpgsqlConnection db, int[] ids, bool withVectors, CancellationToken ct)
     {
-        const string sql = """
+        var sql = """
             SELECT i.idnum, i.movieid, i.status::text, i.search_excluded,
                    i.time_period::text, i.aspect_ratio::text, i.optical_format::text,
                    i.format::text, i.numpeople::text, i.int_ext::text,
                    i."isNSFW", i."isViolent", i."isDrugs",
-                   NULL::text,
+                   {VECTOR},
                    i.weighted_score, i.live_date::text, i.clip_nsfw_violence,
                    m.title::text, m.year, m.media_type::text, m.genre::text,
                    m.mv_music_genre::text, m.director::text, m.cinematographer::text,
@@ -132,10 +159,14 @@ public static class QdrantPayloads
                    m.comm_brand::text, m.comm_product::text, m.trailer_description::text,
                    i.width, i.height, i.updated::text
             FROM frl.frl_images AS i
+            {VECTOR_JOIN}
             LEFT JOIN frl.frl_movies AS m ON m.idnum = i.movieid
             WHERE i.idnum = ANY(@ids)
             ORDER BY i.idnum
-            """;
+            """
+            .Replace("{VECTOR}", withVectors ? "e.keyword_vectorized_embeddings::text" : "NULL::text")
+            .Replace("{VECTOR_JOIN}", withVectors
+                ? "LEFT JOIN frl.frl_caption_embeddings_qwen3_mini_998 AS e ON e.idnum = i.idnum" : "");
         await using var cmd = new NpgsqlCommand(sql, db);
         cmd.Parameters.AddWithValue("ids", ids);
         var result = new List<ImagePoint>(ids.Length);
@@ -143,6 +174,15 @@ public static class QdrantPayloads
         while (await rdr.ReadAsync(ct))
         {
             var id = Convert.ToInt64(rdr.GetValue(0), CultureInfo.InvariantCulture);
+            float[]? vector = null;
+            if (withVectors)
+            {
+                if (rdr.IsDBNull(13)) continue;
+                try { vector = ParseVector(rdr.GetString(13)); }
+                catch (FormatException e) { throw new InvalidDataException($"Bad vector for image {id}: {e.Message}", e); }
+                if (vector.Any(x => !float.IsFinite(x)))
+                    throw new InvalidDataException($"Image {id}: vector has non-finite values.");
+            }
             var image = new Dictionary<string, object?>
             {
                 ["movieid"] = DbLong(rdr, 1),
@@ -195,7 +235,7 @@ public static class QdrantPayloads
             PutCommaArray(movie, "comm_brand", DbString(rdr, 42));
             PutCommaArray(movie, "comm_product", DbString(rdr, 43));
             PutSimple(movie, "trailer_description", DbString(rdr, 44));
-            result.Add(new ImagePoint(id, new Dictionary<string, object?> { ["image"] = image, ["movie"] = movie }));
+            result.Add(new ImagePoint(id, new Dictionary<string, object?> { ["image"] = image, ["movie"] = movie }, vector));
         }
         return result;
     }
@@ -391,6 +431,28 @@ public static class QdrantPayloads
         reader.IsDBNull(i) ? null : Convert.ToInt64(reader.GetValue(i), CultureInfo.InvariantCulture);
 
     private static string? DbString(NpgsqlDataReader reader, int i) => reader.IsDBNull(i) ? null : reader.GetString(i);
+
+    public const int VectorSize = 998;
+
+    /// <summary>A pgvector text literal, e.g. [0.1,-2,3e-4], which must have exactly <see cref="VectorSize"/> values.</summary>
+    public static float[] ParseVector(string input)
+    {
+        var text = input.AsSpan().Trim();
+        if (text.Length < 2 || text[0] != '[' || text[^1] != ']') throw new FormatException("Expected pgvector array literal.");
+        text = text[1..^1];
+        var values = new float[VectorSize];
+        var count = 0;
+        while (!text.IsEmpty)
+        {
+            var comma = text.IndexOf(',');
+            var token = comma < 0 ? text : text[..comma];
+            if (count == values.Length) throw new FormatException("Too many elements.");
+            values[count++] = float.Parse(token, NumberStyles.Float, CultureInfo.InvariantCulture);
+            text = comma < 0 ? ReadOnlySpan<char>.Empty : text[(comma + 1)..];
+        }
+        if (count != values.Length) throw new FormatException($"Expected {VectorSize} elements, got {count}.");
+        return values;
+    }
 
     public static void PutCommaArray(Dictionary<string, object?> payload, string field, string? csv)
     {

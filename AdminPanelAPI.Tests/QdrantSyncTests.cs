@@ -87,6 +87,53 @@ public class QdrantSyncTests
         Assert.Equal(new[] { "A", "B" }, (string[])payload["actors"]!);
     }
 
+    [Fact]
+    public void ParseVector_RequiresExactly998FiniteValues()
+    {
+        var literal = "[" + string.Join(",", Enumerable.Range(0, 998).Select(i => (i / 1000.0).ToString(System.Globalization.CultureInfo.InvariantCulture))) + "]";
+        var v = QdrantPayloads.ParseVector(literal);
+        Assert.Equal(998, v.Length);
+        Assert.Equal(0.997f, v[^1]);
+        Assert.Throws<FormatException>(() => QdrantPayloads.ParseVector("[1,2,3]"));
+        Assert.Throws<FormatException>(() => QdrantPayloads.ParseVector("1,2,3"));
+    }
+
+    [Fact]
+    public async Task RestClient_ScrollsUntilNoNextOffset()
+    {
+        var pages = new Queue<string>(new[]
+        {
+            """{"status":"ok","result":{"points":[{"id":1},{"id":2}],"next_page_offset":3}}""",
+            """{"status":"ok","result":{"points":[{"id":3}],"next_page_offset":null}}""",
+        });
+        var handler = new FakeHandler((_, _) => Json(HttpStatusCode.OK, pages.Dequeue()));
+        var client = new QdrantRestClient(new HttpClient(handler) { BaseAddress = new Uri("http://q/") }, NullLogger.Instance);
+
+        var ids = await client.ScrollAllIdsAsync("images", 2, CancellationToken.None);
+
+        Assert.Equal(new long[] { 1, 2, 3 }, ids.OrderBy(x => x));
+        Assert.Equal(3, JsonDocument.Parse(handler.Bodies[1]).RootElement.GetProperty("offset").GetInt64());
+    }
+
+    [Fact]
+    public async Task RestClient_UpsertSendsNamedVector()
+    {
+        var handler = new FakeHandler((req, _) =>
+        {
+            Assert.Equal(HttpMethod.Put, req.Method);
+            return Json(HttpStatusCode.OK, """{"status":"ok","result":{}}""");
+        });
+        var client = new QdrantRestClient(new HttpClient(handler) { BaseAddress = new Uri("http://q/") }, NullLogger.Instance);
+        var point = new ImagePoint(5, new Dictionary<string, object?> { ["image"] = new Dictionary<string, object?>() }, [0.5f, 1f]);
+
+        await client.UpsertPointsAsync("images", "qwen3", [point], CancellationToken.None);
+
+        using var body = JsonDocument.Parse(handler.Bodies[0]);
+        var p = body.RootElement.GetProperty("points")[0];
+        Assert.Equal(5, p.GetProperty("id").GetInt64());
+        Assert.Equal(2, p.GetProperty("vector").GetProperty("qwen3").GetArrayLength());
+    }
+
     [Theory]
     [InlineData("2026-11-09T08:59:00", null)]
     [InlineData("2026-11-09T09:00:00", "2026-11-09")]

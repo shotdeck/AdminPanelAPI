@@ -23,7 +23,10 @@ public sealed class QdrantSyncRunner(
     public sealed record BatchResult(List<int> Ids, int Present, int Unchanged, List<BatchChange> Changes, int Written);
 
     /// <summary>Runs <paramref name="job"/> to the end. False if it was cancelled or claimed elsewhere mid-run.</summary>
-    public async Task<bool> RunAsync(string instance, QdrantSyncJob job, CancellationToken ct)
+    public Task<bool> RunAsync(string instance, QdrantSyncJob job, CancellationToken ct) =>
+        job.Kind == "insert" ? RunInsertAsync(instance, job, ct) : RunSyncAsync(instance, job, ct);
+
+    private async Task<bool> RunSyncAsync(string instance, QdrantSyncJob job, CancellationToken ct)
     {
         var opts = options.CurrentValue;
         var connectionString = SourceConnectionString(opts);
@@ -90,6 +93,96 @@ public sealed class QdrantSyncRunner(
                     job.Id, job.Scanned, job.Found, job.Missing, job.Changed, job.Unchanged, job.Written, job.LastId);
         }
         return true;
+    }
+
+    /// <summary>
+    /// Insert job: snapshot every Qdrant id, scan Postgres images that have an embedding, then
+    /// load and upsert (vector + payload) only the ones Qdrant lacks. No checkpoint across runs on
+    /// purpose: each run rescans so older images that were embedded late are picked up; a resumed
+    /// job starts over, and the recheck before each upload keeps that idempotent.
+    /// </summary>
+    private async Task<bool> RunInsertAsync(string instance, QdrantSyncJob job, CancellationToken ct)
+    {
+        var opts = options.CurrentValue;
+        var connectionString = SourceConnectionString(opts);
+        var qdrant = new QdrantRestClient(httpFactory.CreateClient(QdrantSyncSetup.HttpClientName), logger);
+        await using (var db = new NpgsqlConnection(connectionString))
+        {
+            await db.OpenAsync(ct);
+            await QdrantPayloads.VerifySourceSchemaAsync(db, ct, includeEmbeddings: true);
+        }
+
+        job.LastId = job.StartAfterId;
+        job.Scanned = job.Found = job.Missing = job.Changed = job.Unchanged = job.Written = 0;
+        job.FieldCounts.Clear();
+        job.Examples = null;
+
+        var existing = await RetryAsync(job, () => qdrant.ScrollAllIdsAsync(opts.Collection, Math.Max(1, opts.ScrollPageSize), ct), ct);
+        logger.LogInformation("Qdrant insert #{JobId}: {Count:N0} ids in Qdrant.", job.Id, existing.Count);
+        if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+
+        var missing = new List<int>();
+        while (job.MaxRows == 0 || job.Scanned < job.MaxRows)
+        {
+            var limit = job.MaxRows == 0 ? opts.IdScanBatchSize : (int)Math.Min(opts.IdScanBatchSize, job.MaxRows - job.Scanned);
+            var after = job.LastId;
+            var ids = await RetryAsync(job, async () =>
+            {
+                await using var db = new NpgsqlConnection(connectionString);
+                await db.OpenAsync(ct);
+                return await QdrantPayloads.ReadEmbeddedImageIdsAsync(db, after, limit, ct);
+            }, ct);
+            if (ids.Count == 0) break;
+            foreach (var id in ids)
+                if (existing.Contains(id)) job.Found++;
+                else missing.Add(id);
+            job.Scanned += ids.Count;
+            job.Missing = missing.Count;
+            job.LastId = ids[^1];
+            if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+        }
+        existing.Clear();
+        existing.TrimExcess();
+        logger.LogInformation("Qdrant insert #{JobId}: {Scanned:N0} embedded, {Found:N0} in Qdrant, {Missing:N0} missing.",
+            job.Id, job.Scanned, job.Found, job.Missing);
+        if (!job.Apply) return true;
+
+        foreach (var chunk in missing.Chunk(Math.Max(1, opts.InsertBatchSize)))
+        {
+            ct.ThrowIfCancellationRequested();
+            var inserted = await RetryAsync(job, async () =>
+            {
+                var present = await qdrant.GetExistingIdsAsync(opts.Collection, chunk.Select(x => (long)x).ToArray(), ct);
+                var absent = chunk.Where(id => !present.Contains(id)).ToArray();
+                if (absent.Length == 0) return 0;
+                await using var db = new NpgsqlConnection(connectionString);
+                await db.OpenAsync(ct);
+                var points = await QdrantPayloads.BuildPayloadsAsync(db, absent, opts.IncludeColorShades, ct, withVectors: true);
+                if (points.Count == 0) return 0;
+                await qdrant.UpsertPointsAsync(opts.Collection, opts.VectorName, points, ct);
+                return points.Count;
+            }, ct);
+            job.Written += inserted;
+            job.LastId = chunk[^1];
+            if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+            if (job.Written % 10000 < inserted)
+                logger.LogInformation("Qdrant insert #{JobId}: inserted {Written:N0}/{Missing:N0}.", job.Id, job.Written, job.Missing);
+        }
+        return true;
+    }
+
+    private async Task<T> RetryAsync<T>(QdrantSyncJob job, Func<Task<T>> action, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try { return await action(); }
+            catch (Exception ex) when (!ct.IsCancellationRequested && IsTransient(ex) && attempt < MaxConsecutiveFailures)
+            {
+                job.Retries++;
+                logger.LogWarning(ex, "Qdrant {Kind} #{JobId} step failed, retry {Attempt}.", job.Kind, job.Id, attempt);
+                await Task.Delay(TimeSpan.FromSeconds(30 * attempt), ct);
+            }
+        }
     }
 
     /// <summary>One batch: read ids after <paramref name="afterId"/>, diff against Qdrant, write changes when applying.</summary>

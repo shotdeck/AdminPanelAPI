@@ -120,7 +120,7 @@ email_status, error, created_at, started_at, updated_at, finished_at";
 
     /// <summary>Queues a job unless one is already queued or running; returns that one's id instead.</summary>
     public async Task<(long JobId, bool Created)> CreateJobAsync(
-        bool apply, int startAfterId, long maxRows, bool email, CancellationToken ct)
+        string kind, bool apply, int startAfterId, long maxRows, bool email, CancellationToken ct)
     {
         await using var conn = await OpenAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
@@ -128,8 +128,9 @@ email_status, error, created_at, started_at, updated_at, finished_at";
         if (await ActiveJobIdAsync(conn, tx, ct) is long active)
             return (active, false);
         await using var cmd = new NpgsqlCommand($@"
-INSERT INTO {Table} (apply, start_after_id, last_id, max_rows, email)
-VALUES (@a, @s, @s, @m, @e) RETURNING id", conn, tx);
+INSERT INTO {Table} (kind, apply, start_after_id, last_id, max_rows, email)
+VALUES (@k, @a, @s, @s, @m, @e) RETURNING id", conn, tx);
+        cmd.Parameters.AddWithValue("k", kind);
         cmd.Parameters.AddWithValue("a", apply);
         cmd.Parameters.AddWithValue("s", startAfterId);
         cmd.Parameters.AddWithValue("m", maxRows);
@@ -139,23 +140,30 @@ VALUES (@a, @s, @s, @m, @e) RETURNING id", conn, tx);
         return (id, true);
     }
 
-    /// <summary>Queues the nightly job for <paramref name="date"/> once; skipped while another job is active.</summary>
-    public async Task<long?> CreateNightlyJobAsync(DateOnly date, bool apply, CancellationToken ct)
+    /// <summary>
+    /// Queues the nightly jobs for <paramref name="date"/> once each (insert first, so the sync
+    /// runs after it); they wait behind any job that is already running.
+    /// </summary>
+    public async Task<List<long>> CreateNightlyJobsAsync(DateOnly date, IEnumerable<string> kinds, bool apply, CancellationToken ct)
     {
         await using var conn = await OpenAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
         await LockAsync(conn, tx, ct);
-        if (await ActiveJobIdAsync(conn, tx, ct) is not null) return null;
-        await using var cmd = new NpgsqlCommand($@"
-INSERT INTO {Table} (apply, triggered_by, nightly_date, email)
-VALUES (@a, 'nightly', @d, TRUE)
+        var created = new List<long>();
+        foreach (var kind in kinds)
+        {
+            await using var cmd = new NpgsqlCommand($@"
+INSERT INTO {Table} (kind, apply, triggered_by, nightly_date, email)
+VALUES (@k, @a, 'nightly', @d, TRUE)
 ON CONFLICT (kind, nightly_date) WHERE nightly_date IS NOT NULL DO NOTHING
 RETURNING id", conn, tx);
-        cmd.Parameters.AddWithValue("a", apply);
-        cmd.Parameters.Add(new NpgsqlParameter("d", NpgsqlDbType.Date) { Value = date });
-        var id = await cmd.ExecuteScalarAsync(ct);
+            cmd.Parameters.AddWithValue("k", kind);
+            cmd.Parameters.AddWithValue("a", apply);
+            cmd.Parameters.Add(new NpgsqlParameter("d", NpgsqlDbType.Date) { Value = date });
+            if (await cmd.ExecuteScalarAsync(ct) is long id) created.Add(id);
+        }
         await tx.CommitAsync(ct);
-        return id is long l ? l : null;
+        return created;
     }
 
     public async Task<QdrantSyncJob?> GetJobAsync(long id, CancellationToken ct)
