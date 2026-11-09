@@ -1,0 +1,124 @@
+using System.Globalization;
+using AdminPanelAPI.QdrantSync.Models;
+using Microsoft.Extensions.Options;
+
+namespace AdminPanelAPI.QdrantSync.Services;
+
+/// <summary>
+/// Queues the nightly sync and runs sync jobs one at a time. Both slots run this; the job table's
+/// claim decides which one does the work. On shutdown the job goes back to queued and the next
+/// instance resumes it from its last checkpoint.
+/// </summary>
+public sealed class QdrantSyncWorker(
+    QdrantSyncStore store,
+    QdrantSyncRunner runner,
+    QdrantSyncMailer mailer,
+    IOptionsMonitor<QdrantSyncOptions> options,
+    ILogger<QdrantSyncWorker> logger) : BackgroundService
+{
+    public static readonly string Instance =
+        $"{Environment.MachineName}/{Environment.GetEnvironmentVariable("WEBSITE_SLOT_NAME") ?? "local"}/{Guid.NewGuid():N}";
+
+    private static readonly TimeSpan StartupDelay = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan IdleDelay = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan NotConfiguredDelay = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan ErrorDelay = TimeSpan.FromMinutes(2);
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        try { await Task.Delay(StartupDelay, stoppingToken); }
+        catch (OperationCanceledException) { return; }
+
+        var tablesReady = false;
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            TimeSpan delay;
+            try
+            {
+                if (!tablesReady)
+                {
+                    await store.EnsureTablesAsync(stoppingToken);
+                    tablesReady = true;
+                }
+                var opts = options.CurrentValue;
+                if (!opts.QdrantConfigured)
+                {
+                    delay = NotConfiguredDelay;
+                }
+                else
+                {
+                    await QueueNightlyIfDueAsync(opts, stoppingToken);
+                    var job = await store.ClaimNextAsync(Instance, stoppingToken);
+                    if (job != null) await RunAsync(job, stoppingToken);
+                    delay = job != null ? TimeSpan.FromSeconds(5) : IdleDelay;
+                }
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Qdrant sync step failed.");
+                delay = ErrorDelay;
+            }
+
+            try { await Task.Delay(delay, stoppingToken); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    private async Task QueueNightlyIfDueAsync(QdrantSyncOptions opts, CancellationToken ct)
+    {
+        if (!opts.Nightly.Enabled) return;
+        if (NightlyDue(opts.Nightly, DateTime.UtcNow) is not { } date) return;
+        if (await store.CreateNightlyJobAsync(date, opts.Nightly.Apply, ct) is { } id)
+            logger.LogInformation("Queued nightly Qdrant sync #{JobId} for {Date}.", id, date);
+    }
+
+    /// <summary>Today's date while inside [AtUtc, AtUtc + WindowHours), else null.</summary>
+    public static DateOnly? NightlyDue(QdrantSyncOptions.NightlyOptions nightly, DateTime utcNow)
+    {
+        if (!TimeOnly.TryParseExact(nightly.AtUtc, ["HH:mm", "H:mm"], CultureInfo.InvariantCulture, DateTimeStyles.None, out var at))
+            return null;
+        var today = DateOnly.FromDateTime(utcNow);
+        var start = today.ToDateTime(at, DateTimeKind.Utc);
+        return utcNow >= start && utcNow < start.AddHours(Math.Max(1, nightly.WindowHours)) ? today : null;
+    }
+
+    private async Task RunAsync(QdrantSyncJob job, CancellationToken ct)
+    {
+        logger.LogInformation("Qdrant sync #{JobId} started (apply={Apply}, after id {LastId}).", job.Id, job.Apply, job.LastId);
+        string status;
+        string? error = null;
+        try
+        {
+            if (!await runner.RunAsync(Instance, job, ct))
+            {
+                logger.LogInformation("Qdrant sync #{JobId} stopped: cancelled or taken over.", job.Id);
+                return;
+            }
+            status = "done";
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            await store.ReleaseAsync(Instance, job.Id, CancellationToken.None);
+            logger.LogInformation("Qdrant sync #{JobId} released at id {LastId} for resume.", job.Id, job.LastId);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Qdrant sync #{JobId} failed at id {LastId}.", job.Id, job.LastId);
+            status = "failed";
+            error = ex.Message;
+        }
+
+        if (!await store.FinishAsync(Instance, job.Id, status, error, CancellationToken.None)) return;
+        logger.LogInformation("Qdrant sync #{JobId} {Status}: scanned {Scanned}, changed {Changed}, written {Written}.",
+            job.Id, status, job.Scanned, job.Changed, job.Written);
+
+        var finished = await store.GetJobAsync(job.Id, CancellationToken.None);
+        if (finished != null && (finished.Email || finished.TriggeredBy == "nightly"))
+            await mailer.SendAndRecordAsync(finished, CancellationToken.None);
+    }
+}
