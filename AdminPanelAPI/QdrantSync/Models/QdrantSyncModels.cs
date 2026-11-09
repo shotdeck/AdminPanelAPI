@@ -27,7 +27,7 @@ public sealed class QdrantSyncOptions
 
     public sealed class NightlyOptions
     {
-        public bool Enabled { get; set; } = true;
+        public bool Enabled { get; set; }
         /// <summary>UTC time of day, HH:mm. 09:00 UTC is 02:00 Mountain Standard Time.</summary>
         public string AtUtc { get; set; } = "09:00";
         public bool Apply { get; set; } = true;
