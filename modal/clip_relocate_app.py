@@ -381,12 +381,19 @@ def search_film(movie_id: int, stills: bytes, count: int, duration: float, job_t
     """Downloads the whole film once (R2 copy, else :8889) and returns, per still, its best (score, time) in every window."""
     from concurrent.futures import ProcessPoolExecutor
     S = np.frombuffer(stills, dtype=np.float16).astype(np.float32).reshape(count, -1)
-    n_windows = int(np.ceil(duration / WINDOW_SECONDS))
     with tempfile.TemporaryDirectory() as d:
         path = f"{d}/film.mp4"
         set_progress(job_tag, phase="downloading film")
         if not download_film(movie_id, path):
             raise RuntimeError(f"Could not download movie {movie_id} from R2 or :8889.")
+        # The R2 copy can be a longer cut than the :8888 film the duration came from.
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                               capture_output=True, text=True, timeout=300)
+        try:
+            duration = max(duration, float(probe.stdout.strip()))
+        except ValueError:
+            pass
+        n_windows = int(np.ceil(duration / WINDOW_SECONDS))
         set_progress(job_tag, phase="searching film", windows=n_windows, windows_done=0)
         step = int(np.ceil(n_windows / FILM_DECODE_PROCS))
         spans = [(a, min(n_windows, a + step)) for a in range(0, n_windows, step)]
