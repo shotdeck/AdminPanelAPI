@@ -110,22 +110,23 @@ email_status, error, created_at, started_at, updated_at, finished_at";
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    private static async Task<long?> ActiveJobIdAsync(NpgsqlConnection conn, NpgsqlTransaction tx, CancellationToken ct)
+    private static async Task<long?> ActiveJobIdAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string kind, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand(
-            $"SELECT id FROM {Table} WHERE status IN ('queued', 'running') ORDER BY id LIMIT 1", conn, tx);
+            $"SELECT id FROM {Table} WHERE kind = @kind AND status IN ('queued', 'running') ORDER BY id LIMIT 1", conn, tx);
+        cmd.Parameters.AddWithValue("kind", kind);
         var id = await cmd.ExecuteScalarAsync(ct);
         return id is long l ? l : null;
     }
 
-    /// <summary>Queues a job unless one is already queued or running; returns that one's id instead.</summary>
+    /// <summary>Queues a job unless one of the same kind is already queued or running; returns that one's id instead.</summary>
     public async Task<(long JobId, bool Created)> CreateJobAsync(
         string kind, bool apply, int startAfterId, long maxRows, bool email, CancellationToken ct)
     {
         await using var conn = await OpenAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
         await LockAsync(conn, tx, ct);
-        if (await ActiveJobIdAsync(conn, tx, ct) is long active)
+        if (await ActiveJobIdAsync(conn, tx, kind, ct) is long active)
             return (active, false);
         await using var cmd = new NpgsqlCommand($@"
 INSERT INTO {Table} (kind, apply, start_after_id, last_id, max_rows, email)
@@ -141,8 +142,8 @@ VALUES (@k, @a, @s, @s, @m, @e) RETURNING id", conn, tx);
     }
 
     /// <summary>
-    /// Queues the nightly jobs for <paramref name="date"/> once each (insert first, so the sync
-    /// runs after it); they wait behind any job that is already running.
+    /// Queues the nightly jobs for <paramref name="date"/> once each; each waits behind any job of
+    /// its own kind that is already running.
     /// </summary>
     public async Task<List<long>> CreateNightlyJobsAsync(DateOnly date, IEnumerable<string> kinds, bool apply, CancellationToken ct)
     {
@@ -201,7 +202,8 @@ WHERE id = @id AND status IN ('queued', 'running') RETURNING id", conn);
 
     /// <summary>
     /// Takes the next job for <paramref name="instance"/>: a stale running one first (resumed from
-    /// its last id), else the oldest queued one, and only if no other job is running.
+    /// its last id), else the oldest queued one, and only if no other job of the same kind is running.
+    /// A sync and an insert can therefore run side by side.
     /// </summary>
     public async Task<QdrantSyncJob?> ClaimNextAsync(string instance, CancellationToken ct)
     {
@@ -212,11 +214,12 @@ WHERE id = @id AND status IN ('queued', 'running') RETURNING id", conn);
         await using (var cmd = new NpgsqlCommand($@"
 UPDATE {Table} SET status = 'running', claimed_by = @me, started_at = COALESCE(started_at, now()), updated_at = now()
 WHERE id = (
-    SELECT id FROM {Table}
-    WHERE status = 'queued' OR (status = 'running' AND updated_at < now() - make_interval(mins => @stale))
-    ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END, id LIMIT 1)
-AND NOT EXISTS (
-    SELECT 1 FROM {Table} WHERE status = 'running' AND updated_at >= now() - make_interval(mins => @stale))
+    SELECT j.id FROM {Table} j
+    WHERE (j.status = 'queued' OR (j.status = 'running' AND j.updated_at < now() - make_interval(mins => @stale)))
+      AND NOT EXISTS (
+          SELECT 1 FROM {Table} r
+          WHERE r.kind = j.kind AND r.status = 'running' AND r.updated_at >= now() - make_interval(mins => @stale))
+    ORDER BY CASE WHEN j.status = 'running' THEN 0 ELSE 1 END, j.id LIMIT 1)
 RETURNING {Columns}", conn, tx))
         {
             cmd.Parameters.AddWithValue("me", instance);

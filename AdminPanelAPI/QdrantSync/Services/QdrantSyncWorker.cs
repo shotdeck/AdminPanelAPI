@@ -5,8 +5,8 @@ using Microsoft.Extensions.Options;
 namespace AdminPanelAPI.QdrantSync.Services;
 
 /// <summary>
-/// Queues the nightly sync and runs sync jobs one at a time. Both slots run this; the job table's
-/// claim decides which one does the work. On shutdown the job goes back to queued and the next
+/// Queues the nightly jobs and runs at most one job per kind at a time (a sync and an insert can
+/// run side by side). Both slots run this; the job table's claim decides which one does the work. On shutdown the job goes back to queued and the next
 /// instance resumes it from its last checkpoint.
 /// </summary>
 public sealed class QdrantSyncWorker(
@@ -29,6 +29,19 @@ public sealed class QdrantSyncWorker(
         try { await Task.Delay(StartupDelay, stoppingToken); }
         catch (OperationCanceledException) { return; }
 
+        var running = new Dictionary<long, Task>();
+        try
+        {
+            await PollAsync(running, stoppingToken);
+        }
+        finally
+        {
+            await Task.WhenAll(running.Values);
+        }
+    }
+
+    private async Task PollAsync(Dictionary<long, Task> running, CancellationToken stoppingToken)
+    {
         var tablesReady = false;
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -48,9 +61,15 @@ public sealed class QdrantSyncWorker(
                 else
                 {
                     await QueueNightlyIfDueAsync(opts, stoppingToken);
-                    var job = await store.ClaimNextAsync(Instance, stoppingToken);
-                    if (job != null) await RunAsync(job, stoppingToken);
-                    delay = job != null ? TimeSpan.FromSeconds(5) : IdleDelay;
+                    foreach (var finished in running.Where(r => r.Value.IsCompleted).Select(r => r.Key).ToList())
+                        running.Remove(finished);
+                    var claimed = false;
+                    while (await store.ClaimNextAsync(Instance, stoppingToken) is { } job)
+                    {
+                        running[job.Id] = Task.Run(() => RunGuardedAsync(job, stoppingToken), CancellationToken.None);
+                        claimed = true;
+                    }
+                    delay = claimed ? TimeSpan.FromSeconds(5) : IdleDelay;
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -85,6 +104,13 @@ public sealed class QdrantSyncWorker(
         var today = DateOnly.FromDateTime(utcNow);
         var start = today.ToDateTime(at, DateTimeKind.Utc);
         return utcNow >= start && utcNow < start.AddHours(Math.Max(1, nightly.WindowHours)) ? today : null;
+    }
+
+    private async Task RunGuardedAsync(QdrantSyncJob job, CancellationToken ct)
+    {
+        try { await RunAsync(job, ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception ex) { logger.LogError(ex, "Qdrant {Kind} #{JobId} crashed.", job.Kind, job.Id); }
     }
 
     private async Task RunAsync(QdrantSyncJob job, CancellationToken ct)
