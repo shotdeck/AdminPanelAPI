@@ -19,7 +19,7 @@ public sealed class QdrantSyncController(
     /// <summary>
     /// Queues a full scan of live images that rewrites out-of-date Qdrant payloads from Postgres
     /// (payload only; vectors untouched, images missing from Qdrant are counted, not inserted).
-    /// Dry run unless <paramref name="apply"/> is true. Only one job runs at a time.
+    /// Dry run unless <paramref name="apply"/> is true. One job per kind runs at a time.
     /// </summary>
     [HttpPost("sync")]
     public Task<IActionResult> QueueSync(
@@ -52,7 +52,7 @@ public sealed class QdrantSyncController(
         await store.EnsureTablesAsync(ct);
         var (jobId, created) = await store.CreateJobAsync(kind, apply, startAfterId, maxRows, email, ct);
         if (!created)
-            return Conflict(new { error = "A Qdrant sync/insert job is already queued or running.", jobId, statusUrl = $"/api/qdrant-sync/jobs/{jobId}" });
+            return Conflict(new { error = $"A Qdrant {kind} job is already queued or running.", jobId, statusUrl = $"/api/qdrant-sync/jobs/{jobId}" });
         return Accepted(new { jobId, kind, apply, startAfterId, maxRows, email, statusUrl = $"/api/qdrant-sync/jobs/{jobId}" });
     }
 
