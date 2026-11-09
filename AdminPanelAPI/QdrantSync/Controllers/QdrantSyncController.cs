@@ -106,6 +106,15 @@ public sealed class QdrantSyncController(
     }
 
     /// <summary>Which settings are in place (no secrets) and when the nightly run is.</summary>
+    /// <summary>
+    /// Tests the SMTP path from this server (connect, banner, EHLO, STARTTLS/TLS) on 587 and 465
+    /// without logging in or sending mail.
+    /// </summary>
+    [HttpGet("email/diagnose")]
+    public async Task<IActionResult> DiagnoseEmail(CancellationToken ct) =>
+        Ok(await SmtpDiagnostics.RunAsync(options.CurrentValue.Email.SmtpHost,
+            new[] { options.CurrentValue.Email.SmtpPort, 465 }.Distinct(), ct));
+
     [HttpGet("config")]
     public IActionResult Config()
     {

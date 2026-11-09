@@ -31,7 +31,7 @@ public sealed class QdrantSyncMailer(
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 logger.LogError(ex, "Qdrant sync #{JobId} report email failed.", job.Id);
-                status = $"failed: {ex.Message}";
+                status = $"failed: {SmtpDiagnostics.Describe(ex)}";
             }
         }
         await store.SetEmailStatusAsync(job.Id, status, CancellationToken.None);
