@@ -8,7 +8,9 @@ namespace AdminPanelAPI.QdrantSync.Services;
 /// The full metadata sync: walks live <c>frl_images</c> in id order, rebuilds each image's managed
 /// payload from Postgres, and rewrites the Qdrant payload where it differs. Postgres is read-only;
 /// Qdrant vectors and payload keys the sync doesn't own are left alone; images missing from
-/// Qdrant are only counted. Progress is checkpointed on the job row after every batch.
+/// Qdrant are only counted. When the collection has a cinemanet vector, points lacking one get it
+/// added from <c>frl_cinemanet_embeddings</c> (vector-only update). Progress is checkpointed on the
+/// job row after every batch.
 /// </summary>
 public sealed class QdrantSyncRunner(
     IOptionsMonitor<QdrantSyncOptions> options,
@@ -20,22 +22,31 @@ public sealed class QdrantSyncRunner(
     private const int MaxConsecutiveFailures = 5;
 
     public sealed record BatchChange(long Id, Dictionary<string, object?> Payload, List<FieldDifference> Differences);
-    public sealed record BatchResult(List<int> Ids, int Present, int Unchanged, List<BatchChange> Changes, int Written);
+    public sealed record BatchResult(List<int> Ids, int Present, int Unchanged, List<BatchChange> Changes, int Written,
+        int CinemanetAdded = 0);
+
+    public const string CinemanetField = "cinemanet (vector added)";
 
     /// <summary>Runs <paramref name="job"/> to the end. False if it was cancelled or claimed elsewhere mid-run.</summary>
     public Task<bool> RunAsync(string instance, QdrantSyncJob job, CancellationToken ct) =>
-        job.Kind == "insert" ? RunInsertAsync(instance, job, ct) : RunSyncAsync(instance, job, ct);
+        job.Kind switch
+        {
+            "insert" => RunInsertAsync(instance, job, ct),
+            "rebuild" => RunRebuildAsync(instance, job, ct),
+            _ => RunSyncAsync(instance, job, ct),
+        };
 
     private async Task<bool> RunSyncAsync(string instance, QdrantSyncJob job, CancellationToken ct)
     {
         var opts = options.CurrentValue;
         var connectionString = SourceConnectionString(opts);
         var qdrant = new QdrantRestClient(httpFactory.CreateClient(QdrantSyncSetup.HttpClientName), logger);
+        var cinemanet = await HasCinemanetAsync(qdrant, opts, job, ct);
 
         await using (var db = new NpgsqlConnection(connectionString))
         {
             await db.OpenAsync(ct);
-            await QdrantPayloads.VerifySourceSchemaAsync(db, ct);
+            await QdrantPayloads.VerifySourceSchemaAsync(db, ct, includeCinemanet: cinemanet);
         }
 
         job.Examples ??= new();
@@ -48,7 +59,7 @@ public sealed class QdrantSyncRunner(
             BatchResult batch;
             try
             {
-                batch = await ProcessBatchAsync(connectionString, qdrant, opts, job.LastId, limit, job.Apply, ct);
+                batch = await ProcessBatchAsync(connectionString, qdrant, opts, job.LastId, limit, job.Apply, ct, cinemanet);
                 failures = 0;
             }
             catch (Exception ex) when (!ct.IsCancellationRequested && IsTransient(ex) && ++failures < MaxConsecutiveFailures)
@@ -77,6 +88,8 @@ public sealed class QdrantSyncRunner(
                     examplesChanged = true;
                 }
             }
+            if (batch.CinemanetAdded > 0)
+                job.FieldCounts[CinemanetField] = job.FieldCounts.GetValueOrDefault(CinemanetField) + batch.CinemanetAdded;
             job.Scanned += batch.Ids.Count;
             job.Found += batch.Present;
             job.Missing += batch.Ids.Count - batch.Present;
@@ -106,10 +119,11 @@ public sealed class QdrantSyncRunner(
         var opts = options.CurrentValue;
         var connectionString = SourceConnectionString(opts);
         var qdrant = new QdrantRestClient(httpFactory.CreateClient(QdrantSyncSetup.HttpClientName), logger);
+        var cinemanet = await HasCinemanetAsync(qdrant, opts, job, ct);
         await using (var db = new NpgsqlConnection(connectionString))
         {
             await db.OpenAsync(ct);
-            await QdrantPayloads.VerifySourceSchemaAsync(db, ct, includeEmbeddings: true);
+            await QdrantPayloads.VerifySourceSchemaAsync(db, ct, includeEmbeddings: true, includeCinemanet: cinemanet);
         }
 
         job.LastId = job.StartAfterId;
@@ -159,7 +173,13 @@ public sealed class QdrantSyncRunner(
                 await db.OpenAsync(ct);
                 var points = await QdrantPayloads.BuildPayloadsAsync(db, absent, opts.IncludeColorShades, ct, withVectors: true);
                 if (points.Count == 0) return 0;
-                await qdrant.UpsertPointsAsync(opts.Collection, opts.VectorName, points, ct);
+                if (cinemanet)
+                {
+                    var vectors = await QdrantPayloads.ReadCinemanetVectorsAsync(db, points.Select(p => p.Id).ToArray(), ct);
+                    foreach (var p in points) p.Cinemanet = vectors.GetValueOrDefault(p.Id);
+                }
+                await qdrant.UpsertPointsAsync(opts.Collection, opts.VectorName, points, ct,
+                    cinemanet ? opts.CinemanetVectorName : null);
                 return points.Count;
             }, ct);
             job.Written += inserted;
@@ -170,6 +190,118 @@ public sealed class QdrantSyncRunner(
         }
         return true;
     }
+
+    /// <summary>
+    /// Rebuild job: copies every point of <c>Collection</c> (payload + existing vectors) into
+    /// <c>RebuildTargetCollection</c>, which is created with the extra cinemanet vector, adding
+    /// each image's cinemanet embedding from Postgres. Walks Qdrant in id order and checkpoints the
+    /// last copied id, so a restarted job carries on; re-copying a page is harmless (upsert).
+    /// Dry run (counts only, nothing created) unless the job applies.
+    /// </summary>
+    private async Task<bool> RunRebuildAsync(string instance, QdrantSyncJob job, CancellationToken ct)
+    {
+        var opts = options.CurrentValue;
+        var source = opts.Collection;
+        var target = opts.RebuildTargetCollection;
+        if (string.IsNullOrWhiteSpace(target) || target == source)
+            throw new InvalidOperationException("QdrantSync:RebuildTargetCollection must be set and differ from QdrantSync:Collection.");
+        var connectionString = SourceConnectionString(opts);
+        var qdrant = new QdrantRestClient(httpFactory.CreateClient(QdrantSyncSetup.HttpClientName), logger);
+        await using (var db = new NpgsqlConnection(connectionString))
+        {
+            await db.OpenAsync(ct);
+            await QdrantPayloads.VerifySourceSchemaAsync(db, ct, includeCinemanet: true);
+        }
+        if (await RetryAsync(job, () => qdrant.AliasTargetAsync(source, ct), ct) == target)
+            throw new InvalidOperationException($"'{source}' is already an alias of '{target}'; nothing to rebuild.");
+        var sourceInfo = await RetryAsync(job, () => qdrant.GetCollectionAsync(source, ct), ct)
+            ?? throw new InvalidOperationException($"Qdrant collection '{source}' not found.");
+        if (job.Apply) await EnsureRebuildTargetAsync(qdrant, opts, job, sourceInfo, ct);
+
+        var pageSize = Math.Max(1, opts.RebuildBatchSize);
+        var resumeAfter = Math.Max(job.LastId, job.StartAfterId);
+        long? offset = resumeAfter > 0 ? resumeAfter + 1L : null;
+        var reachedEnd = false;
+        while (job.MaxRows == 0 || job.Scanned < job.MaxRows)
+        {
+            ct.ThrowIfCancellationRequested();
+            var limit = job.MaxRows == 0 ? pageSize : (int)Math.Min(pageSize, job.MaxRows - job.Scanned);
+            var from = offset;
+            var (points, next) = await RetryAsync(job, () => qdrant.ScrollPageAsync(source, from, limit, job.Apply, ct), ct);
+            if (points.Count == 0) { reachedEnd = true; break; }
+
+            var ids = points.Select(p => p.Id).ToArray();
+            var vectors = await RetryAsync(job, async () =>
+            {
+                await using var db = new NpgsqlConnection(connectionString);
+                await db.OpenAsync(ct);
+                return await QdrantPayloads.ReadCinemanetVectorsAsync(db, ids, ct, idsOnly: !job.Apply);
+            }, ct);
+            if (job.Apply)
+            {
+                var copies = points.Select(p =>
+                {
+                    var named = new Dictionary<string, float[]>(p.Vectors);
+                    if (vectors.GetValueOrDefault(p.Id) is { } c) named[opts.CinemanetVectorName] = c;
+                    return p with { Vectors = named };
+                }).ToList();
+                await RetryAsync(job, async () => { await qdrant.UpsertCopiedPointsAsync(target, copies, ct); return 0; }, ct);
+                job.Written += copies.Count;
+            }
+            job.Scanned += points.Count;
+            job.Found += vectors.Count;
+            job.Missing += points.Count - vectors.Count;
+            job.LastId = checked((int)points[^1].Id);
+            job.Error = null;
+            if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+            if (job.Scanned % opts.LogEveryRows < points.Count)
+                logger.LogInformation("Qdrant rebuild #{JobId}: scanned {Scanned:N0} with cinemanet {Found:N0} without {Missing:N0} copied {Written:N0} last id {LastId}.",
+                    job.Id, job.Scanned, job.Found, job.Missing, job.Written, job.LastId);
+            if (next == null) { reachedEnd = true; break; }
+            offset = next;
+        }
+
+        if (job.Apply && reachedEnd)
+        {
+            var threshold = QdrantCollectionConfig.IndexingThreshold(sourceInfo);
+            await RetryAsync(job, async () =>
+            {
+                await qdrant.UpdateCollectionAsync(target, new { optimizers_config = new { indexing_threshold = threshold } }, ct);
+                return 0;
+            }, ct);
+            logger.LogInformation("Qdrant rebuild #{JobId}: copy finished, indexing of {Target} turned back on (threshold {Threshold}).",
+                job.Id, target, threshold);
+        }
+        return true;
+    }
+
+    /// <summary>Creates the rebuild target from the source's config plus cinemanet, and any payload indexes it lacks.</summary>
+    private async Task EnsureRebuildTargetAsync(QdrantRestClient qdrant, QdrantSyncOptions opts, QdrantSyncJob job,
+        System.Text.Json.JsonElement sourceInfo, CancellationToken ct)
+    {
+        var target = opts.RebuildTargetCollection;
+        var info = await RetryAsync(job, () => qdrant.GetCollectionAsync(target, ct), ct);
+        if (info == null)
+        {
+            logger.LogInformation("Qdrant rebuild #{JobId}: creating collection {Target}.", job.Id, target);
+            await qdrant.CreateCollectionAsync(target, QdrantCollectionConfig.RebuildTarget(sourceInfo, opts), ct);
+            info = await qdrant.GetCollectionAsync(target, ct)
+                ?? throw new InvalidOperationException($"Qdrant collection '{target}' was not created.");
+        }
+        var names = QdrantCollectionConfig.VectorNames(info.Value);
+        foreach (var name in QdrantCollectionConfig.VectorNames(sourceInfo).Append(opts.CinemanetVectorName))
+            if (!names.Contains(name))
+                throw new InvalidOperationException($"Existing collection '{target}' has no '{name}' vector; delete it or pick another RebuildTargetCollection.");
+
+        var have = QdrantCollectionConfig.PayloadIndexes(info.Value);
+        foreach (var (field, schema) in QdrantCollectionConfig.PayloadIndexes(sourceInfo))
+            if (!have.ContainsKey(field))
+                await RetryAsync(job, async () => { await qdrant.CreatePayloadIndexAsync(target, field, schema, ct); return 0; }, ct);
+    }
+
+    private async Task<bool> HasCinemanetAsync(QdrantRestClient qdrant, QdrantSyncOptions opts, QdrantSyncJob job, CancellationToken ct) =>
+        !string.IsNullOrWhiteSpace(opts.CinemanetVectorName)
+        && (await RetryAsync(job, () => qdrant.VectorNamesAsync(opts.Collection, ct), ct)).Contains(opts.CinemanetVectorName);
 
     private async Task<T> RetryAsync<T>(QdrantSyncJob job, Func<Task<T>> action, CancellationToken ct)
     {
@@ -188,7 +320,7 @@ public sealed class QdrantSyncRunner(
     /// <summary>One batch: read ids after <paramref name="afterId"/>, diff against Qdrant, write changes when applying.</summary>
     public static async Task<BatchResult> ProcessBatchAsync(
         string connectionString, QdrantRestClient qdrant, QdrantSyncOptions opts,
-        int afterId, int limit, bool apply, CancellationToken ct)
+        int afterId, int limit, bool apply, CancellationToken ct, bool cinemanet = false)
     {
         await using var db = new NpgsqlConnection(connectionString);
         await db.OpenAsync(ct);
@@ -220,7 +352,21 @@ public sealed class QdrantSyncRunner(
                 written += chunk.Length;
             }
         }
-        return new BatchResult(ids, present.Length, unchanged, changes, written);
+
+        var cinemanetAdded = 0;
+        if (cinemanet && present.Length > 0)
+        {
+            var lacking = await qdrant.IdsWithoutVectorAsync(opts.Collection, opts.CinemanetVectorName, present.Select(x => (long)x).ToArray(), ct);
+            if (lacking.Count > 0)
+            {
+                var vectors = await QdrantPayloads.ReadCinemanetVectorsAsync(db, lacking, ct);
+                cinemanetAdded = vectors.Count;
+                if (apply)
+                    foreach (var chunk in vectors.Chunk(Math.Max(1, opts.WriteBatchSize)))
+                        await qdrant.UpdateVectorsAsync(opts.Collection, opts.CinemanetVectorName, chunk.Select(x => (x.Key, x.Value!)), ct);
+            }
+        }
+        return new BatchResult(ids, present.Length, unchanged, changes, written, cinemanetAdded);
     }
 
     private string SourceConnectionString(QdrantSyncOptions opts)

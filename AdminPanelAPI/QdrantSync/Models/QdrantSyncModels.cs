@@ -15,6 +15,15 @@ public sealed class QdrantSyncOptions
     public int LogEveryRows { get; set; } = 10000;
     public int MaxLoggedRecords { get; set; } = 200;
     public string VectorName { get; set; } = "qwen3";
+    /// <summary>Second named vector (image similarity), from <c>frl_cinemanet_embeddings</c> joined on randid.</summary>
+    public string CinemanetVectorName { get; set; } = "cinemanet";
+    public int CinemanetVectorSize { get; set; } = 1280;
+    public string CinemanetDistance { get; set; } = "Cosine";
+    public bool CinemanetOnDisk { get; set; } = true;
+    /// <summary>Rebuild job: new collection (qwen3 + cinemanet) that <see cref="Collection"/> is copied into.</summary>
+    public string RebuildTargetCollection { get; set; } = "images_v2";
+    /// <summary>Rebuild job: points copied per scroll page.</summary>
+    public int RebuildBatchSize { get; set; } = 250;
     /// <summary>Insert job: images loaded (with vectors) and upserted per request.</summary>
     public int InsertBatchSize { get; set; } = 500;
     /// <summary>Insert job: embedded ids read from Postgres per query when looking for missing ones.</summary>
