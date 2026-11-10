@@ -145,7 +145,10 @@ public sealed class QdrantSyncWorker(
             job.Kind, job.Id, status, job.Scanned, job.Changed, job.Written);
 
         var finished = await store.GetJobAsync(job.Id, CancellationToken.None);
-        if (finished != null && (finished.Email || finished.TriggeredBy == "nightly"))
+        if (finished == null || !(finished.Email || finished.TriggeredBy == "nightly")) return;
+        if (QdrantSyncReport.NothingToReport(finished))
+            await store.SetEmailStatusAsync(finished.Id, "skipped: nothing added or updated", CancellationToken.None);
+        else
             await mailer.SendAndRecordAsync(finished, CancellationToken.None);
     }
 }
