@@ -146,6 +146,7 @@ public sealed class QdrantSyncController(
             o.VectorName,
             cinemanet = new { name = o.CinemanetVectorName, size = o.CinemanetVectorSize, distance = o.CinemanetDistance, onDisk = o.CinemanetOnDisk },
             o.RebuildTargetCollection,
+            o.RebuildParallelism,
             sourceDatabase = string.IsNullOrWhiteSpace(o.SourceConnectionString) ? "ConnectionStrings:Default" : "QdrantSync:SourceConnectionString",
             o.BatchSize,
             o.WriteBatchSize,

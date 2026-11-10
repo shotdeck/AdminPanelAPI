@@ -286,6 +286,38 @@ public class QdrantSyncTests
         Assert.Equal("word", indexes["image.title"].GetProperty("tokenizer").GetString());
     }
 
+    [Fact]
+    public void PlanSlices_CoversEveryIdOnceAndLastSliceIsOpenEnded()
+    {
+        var slices = QdrantSyncRunner.PlanSlices(0, 2_000_000, 16);
+        Assert.Equal(16, slices.Count);
+        Assert.Equal(0, slices[0].After);
+        for (var i = 1; i < slices.Count; i++)
+            Assert.Equal(slices[i - 1].End, slices[i].After);
+        Assert.Null(slices[^1].End);
+        Assert.All(slices, s => Assert.False(s.Done));
+    }
+
+    [Theory]
+    [InlineData(0, 0, 16)]
+    [InlineData(0, 10, 16)]
+    [InlineData(500, 2_000_000, 1)]
+    [InlineData(2_000_000, 1_000_000, 16)]
+    public void PlanSlices_FallsBackToOneOpenSlice(int after, int maxId, int count)
+    {
+        var slice = Assert.Single(QdrantSyncRunner.PlanSlices(after, maxId, count));
+        Assert.Equal(after, slice.After);
+        Assert.Null(slice.End);
+    }
+
+    [Fact]
+    public void PlanSlices_StartsAfterResumePoint()
+    {
+        var slices = QdrantSyncRunner.PlanSlices(1000, 2000, 4);
+        Assert.Equal(new[] { 1000, 1250, 1500, 1750 }, slices.Select(s => s.After));
+        Assert.Equal(new int?[] { 1250, 1500, 1750, null }, slices.Select(s => s.End));
+    }
+
     private sealed class FakeHandler(Func<HttpRequestMessage, string, HttpResponseMessage> respond) : HttpMessageHandler
     {
         public List<string> Bodies { get; } = new();

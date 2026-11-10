@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS {Table} (
     finished_at     TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_qsj_status ON {Table} (status);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_qsj_nightly ON {Table} (kind, nightly_date) WHERE nightly_date IS NOT NULL;";
+CREATE UNIQUE INDEX IF NOT EXISTS ux_qsj_nightly ON {Table} (kind, nightly_date) WHERE nightly_date IS NOT NULL;
+ALTER TABLE {Table} ADD COLUMN IF NOT EXISTS slices JSONB;";
         await using var conn = await OpenAsync(ct);
         await using var cmd = new NpgsqlCommand(sql, conn);
         await cmd.ExecuteNonQueryAsync(ct);
@@ -72,7 +73,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_qsj_nightly ON {Table} (kind, nightly_date)
 
     private const string Columns = @"id, kind, apply, triggered_by, nightly_date, status, start_after_id, max_rows, email,
 last_id, scanned, found, missing, changed, unchanged, written, field_counts::text, examples::text, retries,
-email_status, error, created_at, started_at, updated_at, finished_at";
+email_status, error, created_at, started_at, updated_at, finished_at, slices::text";
 
     private static QdrantSyncJob Read(NpgsqlDataReader r) => new()
     {
@@ -101,6 +102,7 @@ email_status, error, created_at, started_at, updated_at, finished_at";
         StartedAt = r.IsDBNull(22) ? null : r.GetDateTime(22),
         UpdatedAt = r.GetDateTime(23),
         FinishedAt = r.IsDBNull(24) ? null : r.GetDateTime(24),
+        Slices = r.IsDBNull(25) ? null : JsonSerializer.Deserialize<List<RebuildSlice>>(r.GetString(25)),
     };
 
     private static async Task LockAsync(NpgsqlConnection conn, NpgsqlTransaction tx, CancellationToken ct)
@@ -238,7 +240,7 @@ RETURNING {Columns}", conn, tx))
     public async Task<bool> CheckpointAsync(string instance, QdrantSyncJob job, bool examplesChanged, CancellationToken ct)
     {
         await using var conn = await OpenAsync(ct);
-        var examplesSql = examplesChanged ? ", examples = @x::jsonb" : "";
+        var examplesSql = (examplesChanged ? ", examples = @x::jsonb" : "") + (job.Slices != null ? ", slices = @sl::jsonb" : "");
         await using var cmd = new NpgsqlCommand($@"
 UPDATE {Table} SET last_id = @last, scanned = @sc, found = @f, missing = @mi, changed = @ch, unchanged = @un,
     written = @w, field_counts = @fc::jsonb, retries = @re, error = @err, updated_at = now(){examplesSql}
@@ -257,6 +259,8 @@ WHERE id = @id AND claimed_by = @me AND status = 'running' RETURNING id", conn);
         cmd.Parameters.Add(new NpgsqlParameter("err", NpgsqlDbType.Text) { Value = (object?)job.Error ?? DBNull.Value });
         if (examplesChanged)
             cmd.Parameters.AddWithValue("x", JsonSerializer.Serialize(job.Examples ?? new()));
+        if (job.Slices != null)
+            cmd.Parameters.AddWithValue("sl", JsonSerializer.Serialize(job.Slices));
         return await cmd.ExecuteScalarAsync(ct) != null;
     }
 
