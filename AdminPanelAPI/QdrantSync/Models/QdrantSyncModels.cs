@@ -24,6 +24,8 @@ public sealed class QdrantSyncOptions
     public string RebuildTargetCollection { get; set; } = "images_v2";
     /// <summary>Rebuild job: points copied per scroll page.</summary>
     public int RebuildBatchSize { get; set; } = 250;
+    /// <summary>Rebuild job: id slices copied at the same time (1 = one sequential pass).</summary>
+    public int RebuildParallelism { get; set; } = 4;
     /// <summary>Insert job: images loaded (with vectors) and upserted per request.</summary>
     public int InsertBatchSize { get; set; } = 500;
     /// <summary>Insert job: embedded ids read from Postgres per query when looking for missing ones.</summary>
@@ -93,6 +95,16 @@ public sealed class QdrantSyncJob
     public DateTime? StartedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
     public DateTime? FinishedAt { get; set; }
+    /// <summary>Rebuild only: per-slice progress, so a parallel copy resumes each slice where it stopped.</summary>
+    public List<RebuildSlice>? Slices { get; set; }
+}
+
+/// <summary>Rebuild id range (<see cref="After"/>, <see cref="End"/>]; <see cref="After"/> is its checkpoint. No End = open-ended.</summary>
+public sealed class RebuildSlice
+{
+    public int After { get; set; }
+    public int? End { get; set; }
+    public bool Done { get; set; }
 }
 
 public sealed record ChangeExample(long ImageId, string Field, string Qdrant, string Postgres);

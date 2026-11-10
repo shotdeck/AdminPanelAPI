@@ -110,6 +110,13 @@ public static class QdrantPayloads
         return result;
     }
 
+    /// <summary>The highest image id in <c>frl_images</c> (0 when empty); used to split a rebuild into slices.</summary>
+    public static async Task<int> ReadMaxImageIdAsync(NpgsqlConnection db, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand("SELECT COALESCE(MAX(idnum), 0) FROM frl.frl_images", db);
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
+    }
+
     /// <summary>Image ids (any status) that have a 998-dim embedding, i.e. can be inserted into Qdrant.</summary>
     public static async Task<List<int>> ReadEmbeddedImageIdsAsync(NpgsqlConnection db, int afterId, int limit, CancellationToken ct)
     {
