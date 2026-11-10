@@ -29,15 +29,19 @@ public static class QdrantSyncReport
         return sb.ToString();
     }
 
-    public static bool HasCsvs(QdrantSyncJob job) => job.Kind != "insert";
+    public static bool HasCsvs(QdrantSyncJob job) => job.Kind is not ("insert" or "rebuild");
 
-    public static string Subject(QdrantSyncJob job) => job.Kind == "insert"
-        ? $"Qdrant insert #{job.Id} {job.Status}: {job.Written:N0} inserted, {job.Missing:N0} missing{(job.Apply ? "" : " (dry run)")}"
-        : $"Qdrant sync #{job.Id} {job.Status}: {job.Changed:N0} changed{(job.Apply ? "" : " (dry run)")}";
+    public static string Subject(QdrantSyncJob job) => job.Kind switch
+    {
+        "insert" => $"Qdrant insert #{job.Id} {job.Status}: {job.Written:N0} inserted, {job.Missing:N0} missing{(job.Apply ? "" : " (dry run)")}",
+        "rebuild" => $"Qdrant rebuild #{job.Id} {job.Status}: {job.Written:N0} copied, {job.Found:N0} with cinemanet{(job.Apply ? "" : " (dry run)")}",
+        _ => $"Qdrant sync #{job.Id} {job.Status}: {job.Changed:N0} changed{(job.Apply ? "" : " (dry run)")}",
+    };
 
     public static string Body(QdrantSyncJob job)
     {
         if (job.Kind == "insert") return InsertBody(job);
+        if (job.Kind == "rebuild") return RebuildBody(job);
         var elapsed = job.StartedAt != null && job.FinishedAt != null ? job.FinishedAt.Value - job.StartedAt.Value : (TimeSpan?)null;
         var sb = new StringBuilder();
         sb.AppendLine($"Qdrant metadata sync #{job.Id} ({job.TriggeredBy}{(job.NightlyDate is { } d ? $" {d:yyyy-MM-dd}" : "")})");
@@ -77,6 +81,23 @@ public static class QdrantSyncReport
         sb.AppendLine($"Inserted:                    {job.Written:N0}");
         if (job.StartedAt != null && job.FinishedAt != null)
             sb.AppendLine($"Elapsed:                     {job.FinishedAt.Value - job.StartedAt.Value:hh\\:mm\\:ss}");
+        return sb.ToString();
+    }
+
+    private static string RebuildBody(QdrantSyncJob job)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"Qdrant rebuild (qwen3 + cinemanet) #{job.Id} ({job.TriggeredBy})");
+        sb.AppendLine($"Status: {job.Status}{(job.Apply ? "" : " — dry run, nothing created or copied")}");
+        if (job.Error != null) sb.AppendLine($"Error: {job.Error}");
+        sb.AppendLine();
+        sb.AppendLine($"Points scanned:        {job.Scanned:N0}");
+        sb.AppendLine($"With cinemanet:        {job.Found:N0}");
+        sb.AppendLine($"Without cinemanet:     {job.Missing:N0}");
+        sb.AppendLine($"Copied:                {job.Written:N0}");
+        sb.AppendLine($"Last point id:         {job.LastId}");
+        if (job.StartedAt != null && job.FinishedAt != null)
+            sb.AppendLine($"Elapsed:               {job.FinishedAt.Value - job.StartedAt.Value:hh\\:mm\\:ss}");
         return sb.ToString();
     }
 

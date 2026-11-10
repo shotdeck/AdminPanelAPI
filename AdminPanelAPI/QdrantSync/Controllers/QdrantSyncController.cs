@@ -42,6 +42,20 @@ public sealed class QdrantSyncController(
         [FromQuery] bool email = false,
         CancellationToken ct = default) => QueueAsync("insert", apply, startAfterId, maxRows, email, ct);
 
+    /// <summary>
+    /// Queues a rebuild: copies every point of QdrantSync:Collection (payload + qwen3) into
+    /// QdrantSync:RebuildTargetCollection (default images_v2), created with both qwen3 and cinemanet,
+    /// adding each image's cinemanet embedding from frl_cinemanet_embeddings. Resumes after a
+    /// restart. Dry run (counts only, nothing created) unless <paramref name="apply"/> is true.
+    /// </summary>
+    [HttpPost("rebuild")]
+    public Task<IActionResult> QueueRebuild(
+        [FromQuery] bool apply = false,
+        [FromQuery] int startAfterId = 0,
+        [FromQuery] long maxRows = 0,
+        [FromQuery] bool email = false,
+        CancellationToken ct = default) => QueueAsync("rebuild", apply, startAfterId, maxRows, email, ct);
+
     private async Task<IActionResult> QueueAsync(string kind, bool apply, int startAfterId, long maxRows, bool email, CancellationToken ct)
     {
         if (!options.CurrentValue.QdrantConfigured)
@@ -129,6 +143,9 @@ public sealed class QdrantSyncController(
         {
             qdrantConfigured = o.QdrantConfigured,
             o.Collection,
+            o.VectorName,
+            cinemanet = new { name = o.CinemanetVectorName, size = o.CinemanetVectorSize, distance = o.CinemanetDistance, onDisk = o.CinemanetOnDisk },
+            o.RebuildTargetCollection,
             sourceDatabase = string.IsNullOrWhiteSpace(o.SourceConnectionString) ? "ConnectionStrings:Default" : "QdrantSync:SourceConnectionString",
             o.BatchSize,
             o.WriteBatchSize,

@@ -163,6 +163,112 @@ public class QdrantSyncTests
         Assert.Equal("qdrant-sync-7-changes-examples.csv", QdrantSyncReport.ExamplesFileName(job));
     }
 
+    [Fact]
+    public void ParseVector_CinemanetSizeAndFiniteValues()
+    {
+        var text = "[" + string.Join(",", Enumerable.Repeat("0.25", 1280)) + "]";
+        Assert.Equal(1280, QdrantPayloads.ParseVector(text, QdrantPayloads.CinemanetVectorSize).Length);
+        var qwen = "[" + string.Join(",", Enumerable.Repeat("1", 998)) + "]";
+        Assert.Throws<FormatException>(() => QdrantPayloads.ParseVector(qwen, QdrantPayloads.CinemanetVectorSize));
+        var nan = "[NaN" + string.Concat(Enumerable.Repeat(",1", 1279)) + "]";
+        Assert.Throws<FormatException>(() => QdrantPayloads.ParseVector(nan, QdrantPayloads.CinemanetVectorSize));
+    }
+
+    [Fact]
+    public async Task RestClient_UpsertAddsCinemanetOnlyWhenPresent()
+    {
+        var handler = new FakeHandler((_, _) => Json(HttpStatusCode.OK, """{"status":"ok","result":{}}"""));
+        var client = new QdrantRestClient(new HttpClient(handler) { BaseAddress = new Uri("http://q/") }, NullLogger.Instance);
+        var with = new ImagePoint(1, new Dictionary<string, object?> { ["image"] = new Dictionary<string, object?>() }, [1f]) { Cinemanet = [2f, 3f] };
+        var without = new ImagePoint(2, new Dictionary<string, object?> { ["image"] = new Dictionary<string, object?>() }, [1f]);
+        await client.UpsertPointsAsync("images", "qwen3", [with, without], CancellationToken.None, "cinemanet");
+        using var body = JsonDocument.Parse(handler.Bodies[0]);
+        var points = body.RootElement.GetProperty("points");
+        Assert.Equal(2, points[0].GetProperty("vector").GetProperty("cinemanet").GetArrayLength());
+        Assert.True(points[0].GetProperty("vector").TryGetProperty("qwen3", out _));
+        Assert.False(points[1].GetProperty("vector").TryGetProperty("cinemanet", out _));
+    }
+
+    [Fact]
+    public async Task RestClient_UpdateVectorsSendsOnlyThatVector()
+    {
+        string? url = null;
+        var handler = new FakeHandler((req, _) =>
+        {
+            url = req.RequestUri!.PathAndQuery;
+            Assert.Equal(HttpMethod.Put, req.Method);
+            return Json(HttpStatusCode.OK, """{"status":"ok","result":{}}""");
+        });
+        var client = new QdrantRestClient(new HttpClient(handler) { BaseAddress = new Uri("http://q/") }, NullLogger.Instance);
+        await client.UpdateVectorsAsync("images", "cinemanet", [(7L, new[] { 1f, 2f })], CancellationToken.None);
+        Assert.StartsWith("/collections/images/points/vectors?", url);
+        using var body = JsonDocument.Parse(handler.Bodies[0]);
+        var p = body.RootElement.GetProperty("points")[0];
+        Assert.Equal(7, p.GetProperty("id").GetInt64());
+        Assert.False(p.TryGetProperty("payload", out _));
+        var vector = p.GetProperty("vector");
+        Assert.Single(vector.EnumerateObject());
+        Assert.Equal(2, vector.GetProperty("cinemanet").GetArrayLength());
+    }
+
+    [Fact]
+    public async Task RestClient_IdsWithoutVectorFiltersByHasVector()
+    {
+        var handler = new FakeHandler((_, _) =>
+            Json(HttpStatusCode.OK, """{"status":"ok","result":{"points":[{"id":3}],"next_page_offset":null}}"""));
+        var client = new QdrantRestClient(new HttpClient(handler) { BaseAddress = new Uri("http://q/") }, NullLogger.Instance);
+        var lacking = await client.IdsWithoutVectorAsync("images", "cinemanet", [1L, 2L, 3L], CancellationToken.None);
+        Assert.Equal(new HashSet<long> { 3 }, lacking);
+        using var body = JsonDocument.Parse(handler.Bodies[0]);
+        var filter = body.RootElement.GetProperty("filter");
+        Assert.Equal(3, filter.GetProperty("must")[0].GetProperty("has_id").GetArrayLength());
+        Assert.Equal("cinemanet", filter.GetProperty("must_not")[0].GetProperty("has_vector").GetString());
+        Assert.Equal(3, body.RootElement.GetProperty("limit").GetInt32());
+    }
+
+    [Fact]
+    public async Task RestClient_ScrollPageReadsNamedVectorsAndPayload()
+    {
+        var handler = new FakeHandler((_, _) => Json(HttpStatusCode.OK,
+            """{"status":"ok","result":{"points":[{"id":10,"vector":{"qwen3":[0.5,1]},"payload":{"image":{"id":10}}}],"next_page_offset":11}}"""));
+        var client = new QdrantRestClient(new HttpClient(handler) { BaseAddress = new Uri("http://q/") }, NullLogger.Instance);
+        var (points, next) = await client.ScrollPageAsync("images", 10, 1, true, CancellationToken.None);
+        Assert.Equal(11, next);
+        Assert.Equal(new[] { 0.5f, 1f }, points[0].Vectors["qwen3"]);
+        Assert.Equal(10, points[0].Payload!.Value.GetProperty("image").GetProperty("id").GetInt32());
+    }
+
+    [Fact]
+    public void RebuildTarget_CopiesSourceConfigAndAddsCinemanet()
+    {
+        using var info = JsonDocument.Parse("""
+            {"config":{"params":{"vectors":{"qwen3":{"size":998,"distance":"Cosine","on_disk":false,"multivector_config":null}},
+              "shard_number":2,"replication_factor":2,"write_consistency_factor":1,"on_disk_payload":true,"sharding_method":null},
+             "hnsw_config":{"m":24,"ef_construct":256,"payload_m":24},
+             "optimizer_config":{"deleted_threshold":0.2,"indexing_threshold":20000,"flush_interval_sec":5,"max_optimization_threads":null},
+             "quantization_config":null,"strict_mode_config":{"enabled":true}},
+             "payload_schema":{"image.movie_id":{"data_type":"integer","points":5},
+               "image.title":{"data_type":"text","params":{"type":"text","tokenizer":"word"},"points":5}}}
+            """);
+        var opts = new QdrantSyncOptions();
+        var body = QdrantCollectionConfig.RebuildTarget(info.RootElement, opts);
+        Assert.Equal(998, (int)body["vectors"]!["qwen3"]!["size"]!);
+        Assert.Null(body["vectors"]!["qwen3"]!.AsObject()["multivector_config"]);
+        Assert.Equal(1280, (int)body["vectors"]!["cinemanet"]!["size"]!);
+        Assert.Equal("Cosine", (string)body["vectors"]!["cinemanet"]!["distance"]!);
+        Assert.True((bool)body["vectors"]!["cinemanet"]!["on_disk"]!);
+        Assert.Equal(2, (int)body["replication_factor"]!);
+        Assert.Equal(24, (int)body["hnsw_config"]!["m"]!);
+        Assert.Equal(0, (int)body["optimizers_config"]!["indexing_threshold"]!);
+        Assert.False(body.ContainsKey("quantization_config"));
+        Assert.False(body.ContainsKey("sharding_method"));
+        Assert.Equal(20000, QdrantCollectionConfig.IndexingThreshold(info.RootElement));
+
+        var indexes = QdrantCollectionConfig.PayloadIndexes(info.RootElement);
+        Assert.Equal("integer", indexes["image.movie_id"].GetString());
+        Assert.Equal("word", indexes["image.title"].GetProperty("tokenizer").GetString());
+    }
+
     private sealed class FakeHandler(Func<HttpRequestMessage, string, HttpResponseMessage> respond) : HttpMessageHandler
     {
         public List<string> Bodies { get; } = new();

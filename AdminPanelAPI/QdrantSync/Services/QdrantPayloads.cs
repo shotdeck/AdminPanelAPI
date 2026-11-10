@@ -8,6 +8,8 @@ namespace AdminPanelAPI.QdrantSync.Services;
 public sealed class ImagePoint(long id, Dictionary<string, object?> payload, float[]? vector = null)
 {
     public long Id { get; } = id;
+    /// <summary>The 1280-dim cinemanet vector, when the image has one; only loaded for inserts.</summary>
+    public float[]? Cinemanet { get; set; }
     /// <summary>The 998-dim qwen3 vector; only loaded for inserts.</summary>
     public float[]? Vector { get; } = vector;
     public Dictionary<string, object?> Payload { get; } = payload;
@@ -48,7 +50,8 @@ public static class QdrantPayloads
     // ---------- PostgreSQL ----------
 
     /// <summary>Fails before any writes if a source column is missing or the TV columns aren't integers.</summary>
-    public static async Task VerifySourceSchemaAsync(NpgsqlConnection db, CancellationToken ct, bool includeEmbeddings = false)
+    public static async Task VerifySourceSchemaAsync(NpgsqlConnection db, CancellationToken ct, bool includeEmbeddings = false,
+        bool includeCinemanet = false)
     {
         var expected = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
         {
@@ -64,6 +67,8 @@ public static class QdrantPayloads
         };
         if (includeEmbeddings)
             expected["frl_caption_embeddings_qwen3_mini_998"] = new[] { "idnum", "keyword_vectorized_embeddings" };
+        if (includeCinemanet)
+            expected["frl_cinemanet_embeddings"] = new[] { "randid", "embedding" };
         await using var cmd = new NpgsqlCommand("""
             SELECT table_name, column_name, data_type FROM information_schema.columns
             WHERE table_schema = 'frl' AND table_name = ANY(@tables)
@@ -434,13 +439,47 @@ public static class QdrantPayloads
 
     public const int VectorSize = 998;
 
-    /// <summary>A pgvector text literal, e.g. [0.1,-2,3e-4], which must have exactly <see cref="VectorSize"/> values.</summary>
-    public static float[] ParseVector(string input)
+    public const int CinemanetVectorSize = 1280;
+
+    /// <summary>
+    /// Cinemanet vectors for the given image ids (images without one are left out), joined on randid.
+    /// With <paramref name="idsOnly"/> the values are null and no embedding is transferred.
+    /// </summary>
+    public static async Task<Dictionary<long, float[]?>> ReadCinemanetVectorsAsync(
+        NpgsqlConnection db, IReadOnlyCollection<long> ids, CancellationToken ct, bool idsOnly = false)
+    {
+        var result = new Dictionary<long, float[]?>();
+        if (ids.Count == 0) return result;
+        await using var cmd = new NpgsqlCommand($"""
+            SELECT i.idnum, {(idsOnly ? "NULL::text" : "c.embedding::text")}
+            FROM frl.frl_images AS i
+            JOIN frl.frl_cinemanet_embeddings AS c ON c.randid = i.randid
+            WHERE i.idnum = ANY(@ids) AND c.embedding IS NOT NULL
+            """, db);
+        cmd.Parameters.AddWithValue("ids", ids.Select(x => checked((int)x)).ToArray());
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var id = Convert.ToInt64(reader.GetValue(0), CultureInfo.InvariantCulture);
+            try
+            {
+                result[id] = idsOnly ? null : ParseVector(reader.GetString(1), CinemanetVectorSize);
+            }
+            catch (FormatException ex)
+            {
+                throw new FormatException($"Image {id}: bad cinemanet embedding: {ex.Message}", ex);
+            }
+        }
+        return result;
+    }
+
+    /// <summary>A pgvector text literal, e.g. [0.1,-2,3e-4], which must have exactly <paramref name="size"/> finite values.</summary>
+    public static float[] ParseVector(string input, int size = VectorSize)
     {
         var text = input.AsSpan().Trim();
         if (text.Length < 2 || text[0] != '[' || text[^1] != ']') throw new FormatException("Expected pgvector array literal.");
         text = text[1..^1];
-        var values = new float[VectorSize];
+        var values = new float[size];
         var count = 0;
         while (!text.IsEmpty)
         {
@@ -450,7 +489,8 @@ public static class QdrantPayloads
             values[count++] = float.Parse(token, NumberStyles.Float, CultureInfo.InvariantCulture);
             text = comma < 0 ? ReadOnlySpan<char>.Empty : text[(comma + 1)..];
         }
-        if (count != values.Length) throw new FormatException($"Expected {VectorSize} elements, got {count}.");
+        if (count != values.Length) throw new FormatException($"Expected {size} elements, got {count}.");
+        if (values.Any(v => !float.IsFinite(v))) throw new FormatException("Vector has a non-finite value.");
         return values;
     }
 

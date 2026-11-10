@@ -122,7 +122,7 @@ public sealed class QdrantSyncWorker(
         {
             if (!await runner.RunAsync(Instance, job, ct))
             {
-                logger.LogInformation("Qdrant sync #{JobId} stopped: cancelled or taken over.", job.Id);
+                logger.LogInformation("Qdrant {Kind} #{JobId} stopped: cancelled or taken over.", job.Kind, job.Id);
                 return;
             }
             status = "done";
@@ -130,19 +130,19 @@ public sealed class QdrantSyncWorker(
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             await store.ReleaseAsync(Instance, job.Id, CancellationToken.None);
-            logger.LogInformation("Qdrant sync #{JobId} released at id {LastId} for resume.", job.Id, job.LastId);
+            logger.LogInformation("Qdrant {Kind} #{JobId} released at id {LastId} for resume.", job.Kind, job.Id, job.LastId);
             throw;
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Qdrant sync #{JobId} failed at id {LastId}.", job.Id, job.LastId);
+            logger.LogError(ex, "Qdrant {Kind} #{JobId} failed at id {LastId}.", job.Kind, job.Id, job.LastId);
             status = "failed";
             error = ex.Message;
         }
 
         if (!await store.FinishAsync(Instance, job.Id, status, error, CancellationToken.None)) return;
-        logger.LogInformation("Qdrant sync #{JobId} {Status}: scanned {Scanned}, changed {Changed}, written {Written}.",
-            job.Id, status, job.Scanned, job.Changed, job.Written);
+        logger.LogInformation("Qdrant {Kind} #{JobId} {Status}: scanned {Scanned}, changed {Changed}, written {Written}.",
+            job.Kind, job.Id, status, job.Scanned, job.Changed, job.Written);
 
         var finished = await store.GetJobAsync(job.Id, CancellationToken.None);
         if (finished != null && (finished.Email || finished.TriggeredBy == "nightly"))
