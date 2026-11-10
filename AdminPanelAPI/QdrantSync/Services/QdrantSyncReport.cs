@@ -31,6 +31,14 @@ public static class QdrantSyncReport
 
     public static bool HasCsvs(QdrantSyncJob job) => job.Kind is not ("insert" or "rebuild");
 
+    /// <summary>A finished sync/insert that found nothing to add or update; its email is skipped.</summary>
+    public static bool NothingToReport(QdrantSyncJob job) => job.Status == "done" && job.Written == 0 && job.Kind switch
+    {
+        "insert" => job.Missing == 0,
+        "rebuild" => false,
+        _ => job.Changed == 0,
+    };
+
     public static string Subject(QdrantSyncJob job) => job.Kind switch
     {
         "insert" => $"Qdrant insert #{job.Id} {job.Status}: {job.Written:N0} inserted, {job.Missing:N0} missing{(job.Apply ? "" : " (dry run)")}",

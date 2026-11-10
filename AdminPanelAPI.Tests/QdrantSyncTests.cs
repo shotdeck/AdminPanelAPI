@@ -146,6 +146,23 @@ public class QdrantSyncTests
         Assert.Equal(expected, due?.ToString("yyyy-MM-dd"));
     }
 
+    [Theory]
+    [InlineData("sync", "done", true, 0, 0, 0, true)]
+    [InlineData("sync", "done", false, 5, 0, 0, false)]
+    [InlineData("sync", "done", true, 0, 3, 0, false)]
+    [InlineData("sync", "done", true, 0, 0, 12, true)]
+    [InlineData("sync", "failed", true, 0, 0, 0, false)]
+    [InlineData("insert", "done", true, 0, 0, 0, true)]
+    [InlineData("insert", "done", false, 0, 0, 8, false)]
+    [InlineData("insert", "done", true, 0, 8, 8, false)]
+    [InlineData("rebuild", "done", false, 0, 0, 0, false)]
+    public void Report_NothingToReport_OnlyForDoneJobsWithNoChanges(
+        string kind, string status, bool apply, long changed, long written, long missing, bool expected)
+    {
+        var job = new QdrantSyncJob { Kind = kind, Status = status, Apply = apply, Changed = changed, Written = written, Missing = missing };
+        Assert.Equal(expected, QdrantSyncReport.NothingToReport(job));
+    }
+
     [Fact]
     public void Report_WritesBothCsvs()
     {
