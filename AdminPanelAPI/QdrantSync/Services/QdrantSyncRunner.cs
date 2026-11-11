@@ -85,7 +85,7 @@ public sealed class QdrantSyncRunner(
                 {
                     job.Retries++;
                     job.Error = $"retrying after id {slice.After}: {ex.Message}";
-                    if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+                    if (!await CheckpointAsync(instance, job, false, ct)) return false;
                 }
                 finally { progress.Release(); }
                 await Task.Delay(TimeSpan.FromSeconds(30 * failures), ct);
@@ -125,7 +125,7 @@ public sealed class QdrantSyncRunner(
                 }
                 slice.Done = batch.Ids.Count < limit;
                 job.Error = null;
-                if (!await store.CheckpointAsync(instance, job, examplesChanged, ct)) return false;
+                if (!await CheckpointAsync(instance, job, examplesChanged, ct)) return false;
 
                 if (job.Scanned % opts.LogEveryRows < batch.Ids.Count)
                     logger.LogInformation(
@@ -164,7 +164,7 @@ public sealed class QdrantSyncRunner(
 
         var existing = await RetryAsync(job, () => qdrant.ScrollAllIdsAsync(opts.Collection, Math.Max(1, opts.ScrollPageSize), ct), ct);
         logger.LogInformation("Qdrant insert #{JobId}: {Count:N0} ids in Qdrant.", job.Id, existing.Count);
-        if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+        if (!await CheckpointAsync(instance, job, false, ct)) return false;
 
         var missing = new List<int>();
         while (job.MaxRows == 0 || job.Scanned < job.MaxRows)
@@ -184,7 +184,7 @@ public sealed class QdrantSyncRunner(
             job.Scanned += ids.Count;
             job.Missing = missing.Count;
             job.LastId = ids[^1];
-            if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+            if (!await CheckpointAsync(instance, job, false, ct)) return false;
         }
         existing.Clear();
         existing.TrimExcess();
@@ -215,7 +215,7 @@ public sealed class QdrantSyncRunner(
             }, ct);
             job.Written += inserted;
             job.LastId = chunk[^1];
-            if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+            if (!await CheckpointAsync(instance, job, false, ct)) return false;
             if (job.Written % 10000 < inserted)
                 logger.LogInformation("Qdrant insert #{JobId}: inserted {Written:N0}/{Missing:N0}.", job.Id, job.Written, job.Missing);
         }
@@ -399,7 +399,7 @@ public sealed class QdrantSyncRunner(
                 }
                 slice.Done = last;
                 job.Error = null;
-                if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+                if (!await CheckpointAsync(instance, job, false, ct)) return false;
                 if (job.Scanned % opts.LogEveryRows < points.Count)
                     logger.LogInformation("Qdrant rebuild #{JobId}: scanned {Scanned:N0} with cinemanet {Found:N0} without {Missing:N0} copied {Written:N0}, {Done}/{Slices} slices done.",
                         job.Id, job.Scanned, job.Found, job.Missing, job.Written, job.Slices!.Count(s => s.Done), job.Slices!.Count);
@@ -454,6 +454,21 @@ public sealed class QdrantSyncRunner(
     private async Task<bool> HasCinemanetAsync(QdrantRestClient qdrant, QdrantSyncOptions opts, QdrantSyncJob job, CancellationToken ct) =>
         !string.IsNullOrWhiteSpace(opts.CinemanetVectorName)
         && (await RetryAsync(job, () => qdrant.VectorNamesAsync(opts.Collection, ct), ct)).Contains(opts.CinemanetVectorName);
+
+    /// <summary>Saves progress, retrying transient database errors so a brief Postgres hiccup doesn't fail a long job.</summary>
+    private async Task<bool> CheckpointAsync(string instance, QdrantSyncJob job, bool examplesChanged, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try { return await store.CheckpointAsync(instance, job, examplesChanged, ct); }
+            catch (Exception ex) when (!ct.IsCancellationRequested && IsTransient(ex) && attempt < MaxConsecutiveFailures)
+            {
+                lock (job) job.Retries++;
+                logger.LogWarning(ex, "Qdrant {Kind} #{JobId} checkpoint failed, retry {Attempt}.", job.Kind, job.Id, attempt);
+                await Task.Delay(TimeSpan.FromSeconds(10 * attempt), ct);
+            }
+        }
+    }
 
     private async Task<T> RetryAsync<T>(QdrantSyncJob job, Func<Task<T>> action, CancellationToken ct)
     {

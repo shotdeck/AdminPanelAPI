@@ -203,6 +203,26 @@ WHERE id = @id AND status IN ('queued', 'running') RETURNING id", conn);
     }
 
     /// <summary>
+    /// Re-queues a failed or cancelled job so it carries on from its checkpoint (last id / slices),
+    /// unless another job of its kind is queued or running.
+    /// </summary>
+    public async Task<bool> ResumeAsync(long id, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+        await LockAsync(conn, tx, ct);
+        await using var cmd = new NpgsqlCommand($@"
+UPDATE {Table} j SET status = 'queued', claimed_by = NULL, error = NULL, email_status = NULL, finished_at = NULL, updated_at = now()
+WHERE j.id = @id AND j.status IN ('failed', 'cancelled')
+  AND NOT EXISTS (SELECT 1 FROM {Table} o WHERE o.kind = j.kind AND o.status IN ('queued', 'running'))
+RETURNING j.id", conn, tx);
+        cmd.Parameters.AddWithValue("id", id);
+        var resumed = await cmd.ExecuteScalarAsync(ct) != null;
+        await tx.CommitAsync(ct);
+        return resumed;
+    }
+
+    /// <summary>
     /// Takes the next job for <paramref name="instance"/>: a stale running one first (resumed from
     /// its last id), else the oldest queued one, and only if no other job of the same kind is running.
     /// A sync and an insert can therefore run side by side.

@@ -108,6 +108,13 @@ public sealed class QdrantSyncController(
     public async Task<IActionResult> Cancel(long id, CancellationToken ct) =>
         await store.CancelAsync(id, ct) ? Ok(new { id, status = "cancelled" }) : Conflict(new { error = "Job is not queued or running." });
 
+    /// <summary>Re-queues a failed or cancelled job; it carries on from its checkpoint instead of starting over.</summary>
+    [HttpPost("jobs/{id:long}/resume")]
+    public async Task<IActionResult> Resume(long id, CancellationToken ct) =>
+        await store.ResumeAsync(id, ct)
+            ? Accepted(new { id, status = "queued" })
+            : Conflict(new { error = "Job is not failed or cancelled, or another job of its kind is queued or running." });
+
     /// <summary>Emails the job's summary and CSVs now (QdrantSync:Email settings).</summary>
     [HttpPost("jobs/{id:long}/email")]
     public async Task<IActionResult> Email(long id, CancellationToken ct)
