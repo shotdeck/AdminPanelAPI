@@ -33,14 +33,22 @@ public static class QdrantPayloads
         "location","location_raw","filming_location","filming_location_raw","camera","lens","film_stock",
         "randid","shot_time","colors","time_of_day","gender","subject_age","subject_ethnicity",
         "frame_size","shot_types","movements","compositions","lens_types","lightings","lighting_types",
-        "focus","clean_dirty","vfx_backing","location_type","lab_process","tags","rgb_colors"
+        "focus","clean_dirty","vfx_backing","location_type","lab_process","tags","rgb_colors",
+        "filename","created","clip_start","clip_end"
     };
 
     public static readonly HashSet<string> ManagedMovieKeys = new(StringComparer.Ordinal)
     {
         "title","year","media_type","genre","mv_music_genre","director","cinematographer",
         "production_designer","costume_designer","editor","colorist","tv_showid","tv_season",
-        "mv_artist","mv_featured_artist","mv_stylist","comm_brand","comm_product","trailer_description"
+        "mv_artist","mv_featured_artist","mv_stylist","comm_brand","comm_product","trailer_description",
+        "alphatitle","tv_episode","tv_episode_title","poster","key_image","video_link","video_file","content_status"
+    };
+
+    /// <summary>Payload indexes the sync and insert add to the collection when it lacks them.</summary>
+    public static readonly IReadOnlyDictionary<string, string> RequiredIndexes = new Dictionary<string, string>
+    {
+        ["image.created"] = "datetime"
     };
 
     private static readonly string[] Sections = { "image", "movie" };
@@ -58,12 +66,14 @@ public static class QdrantPayloads
             ["frl_images"] = new[] { "idnum", "movieid", "status", "search_excluded", "time_period", "aspect_ratio",
                 "optical_format", "format", "numpeople", "int_ext", "isNSFW", "isViolent", "isDrugs",
                 "weighted_score", "live_date", "clip_nsfw_violence", "width", "height", "updated", "actors", "setting", "location",
-                "filming_location", "camera", "lens", "film_stock", "randid", "shot_time" },
+                "filming_location", "camera", "lens", "film_stock", "randid", "shot_time", "filename", "created" },
             ["frl_movies"] = new[] { "idnum", "title", "year", "media_type", "genre", "mv_music_genre",
                 "director", "cinematographer", "production_designer", "costume_designer", "editor", "colorist",
                 "tv_showid", "tv_season", "mv_artist", "mv_featured_artist", "mv_stylist",
-                "comm_brand", "comm_product", "trailer_description" },
-            ["frl_join_images_tags"] = new[] { "imageid", "tag" }
+                "comm_brand", "comm_product", "trailer_description", "alphatitle", "tv_episode", "tv_episode_title",
+                "poster", "key_image", "video_link", "filename", "content_status" },
+            ["frl_join_images_tags"] = new[] { "imageid", "tag" },
+            ["frl_image_scene_boundaries"] = new[] { "movieid", "filename", "start_time", "end_time" }
         };
         if (includeEmbeddings)
             expected["frl_caption_embeddings_qwen3_mini_998"] = new[] { "idnum", "keyword_vectorized_embeddings" };
@@ -89,7 +99,7 @@ public static class QdrantPayloads
             if (missing.Length > 0)
                 throw new InvalidOperationException($"Missing source columns in frl.{table}: {string.Join(", ", missing)}.");
         }
-        foreach (var col in new[] { "tv_showid", "tv_season" })
+        foreach (var col in new[] { "tv_showid", "tv_season", "tv_episode" })
         {
             var type = found["frl_movies"][col];
             if (type is not ("smallint" or "integer" or "bigint"))
@@ -143,6 +153,7 @@ public static class QdrantPayloads
         var points = await ReadImagesAsync(db, ids, withVectors, ct);
         await FetchTagsAsync(db, points, ct);
         await FetchFreeTagsAsync(db, points, ct);
+        await FetchClipBoundariesAsync(db, points, ct);
         if (includeColorShades) await FetchColorShadesAsync(db, points, ct);
         return points;
     }
@@ -169,7 +180,9 @@ public static class QdrantPayloads
                    m.editor::text, m.colorist::text, m.tv_showid, m.tv_season,
                    m.mv_artist::text, m.mv_featured_artist::text, m.mv_stylist::text,
                    m.comm_brand::text, m.comm_product::text, m.trailer_description::text,
-                   i.width, i.height, i.updated::text
+                   i.width, i.height, i.updated::text,
+                   i.filename::text, i.created::text, m.alphatitle::text, m.tv_episode, m.tv_episode_title::text,
+                   m.poster::text, m.key_image::text, m.video_link::text, m.filename::text, m.content_status::text
             FROM frl.frl_images AS i
             {VECTOR_JOIN}
             LEFT JOIN frl.frl_movies AS m ON m.idnum = i.movieid
@@ -214,6 +227,8 @@ public static class QdrantPayloads
                 ["height"] = DbLong(rdr, 46),
                 ["date_updated"] = IsoTimestamp(DbString(rdr, 47))
             };
+            PutSimple(image, "filename", DbString(rdr, 48));
+            if (IsoTimestamp(DbString(rdr, 49)) is { } created) image["created"] = created;
             PutCommaArray(image, "optical_format", DbString(rdr, 6));
             PutCommaArray(image, "format", DbString(rdr, 7));
             var movie = new Dictionary<string, object?>
@@ -247,9 +262,46 @@ public static class QdrantPayloads
             PutCommaArray(movie, "comm_brand", DbString(rdr, 42));
             PutCommaArray(movie, "comm_product", DbString(rdr, 43));
             PutSimple(movie, "trailer_description", DbString(rdr, 44));
+            PutSimple(movie, "alphatitle", DbString(rdr, 50));
+            if (DbLong(rdr, 51) is { } episode) movie["tv_episode"] = episode;
+            PutSimple(movie, "tv_episode_title", DbString(rdr, 52));
+            PutSimple(movie, "poster", DbString(rdr, 53));
+            PutSimple(movie, "key_image", DbString(rdr, 54));
+            PutSimple(movie, "video_link", DbString(rdr, 55));
+            PutSimple(movie, "video_file", DbString(rdr, 56));
+            PutSimple(movie, "content_status", DbString(rdr, 57));
             result.Add(new ImagePoint(id, new Dictionary<string, object?> { ["image"] = image, ["movie"] = movie }, vector));
         }
         return result;
+    }
+
+    /// <summary>
+    /// <c>clip_start</c>/<c>clip_end</c> from the image's scene boundary (movieid + filename = randid);
+    /// images without a valid one get neither. If there are several, the earliest start wins.
+    /// </summary>
+    private static async Task FetchClipBoundariesAsync(NpgsqlConnection db, List<ImagePoint> points, CancellationToken ct)
+    {
+        var keyed = points
+            .Where(p => p.Image.GetValueOrDefault("movieid") is long && p.Image.GetValueOrDefault("randid") is string)
+            .ToDictionary(p => ((long)p.Image["movieid"]!, (string)p.Image["randid"]!));
+        if (keyed.Count == 0) return;
+        await using var cmd = new NpgsqlCommand("""
+            SELECT DISTINCT ON (movieid, filename) movieid, filename::text, start_time::float8, end_time::float8
+            FROM frl.frl_image_scene_boundaries
+            WHERE movieid = ANY(@movies) AND filename = ANY(@files)
+              AND start_time IS NOT NULL AND end_time IS NOT NULL AND end_time > start_time
+            ORDER BY movieid, filename, start_time, end_time
+            """, db);
+        cmd.Parameters.AddWithValue("movies", keyed.Keys.Select(k => (int)k.Item1).Distinct().ToArray());
+        cmd.Parameters.AddWithValue("files", keyed.Keys.Select(k => k.Item2).Distinct().ToArray());
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        while (await rdr.ReadAsync(ct))
+        {
+            if (!keyed.TryGetValue((Convert.ToInt64(rdr.GetValue(0), CultureInfo.InvariantCulture), rdr.GetString(1)), out var point))
+                continue;
+            point.Image["clip_start"] = rdr.GetDouble(2);
+            point.Image["clip_end"] = rdr.GetDouble(3);
+        }
     }
 
     private static async Task FetchTagsAsync(NpgsqlConnection db, List<ImagePoint> points, CancellationToken ct)

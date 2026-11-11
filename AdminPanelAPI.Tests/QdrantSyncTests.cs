@@ -57,6 +57,29 @@ public class QdrantSyncTests
     }
 
     [Fact]
+    public void Reconcile_AddsNewImageAndMovieFields_AndDropsClipWhenBoundaryGone()
+    {
+        var existing = FromJson("""{"image":{"movieid":5,"clip_start":1.5,"clip_end":3.0},"movie":{"title":"The Thing"}}""");
+        var source = Source(
+            new() { ["movieid"] = 5L, ["filename"] = "ABC123.png", ["created"] = "2014-10-22T01:11:00.0000000+00:00" },
+            new()
+            {
+                ["title"] = "The Thing", ["alphatitle"] = "Thing", ["tv_episode"] = 3L, ["tv_episode_title"] = "Pilot",
+                ["poster"] = "p.jpg", ["key_image"] = "k.jpg", ["video_link"] = "https://v", ["video_file"] = "m.mp4",
+                ["content_status"] = "live"
+            });
+
+        Assert.NotNull(QdrantPayloads.Reconcile(existing, source, false));
+        var fields = QdrantPayloads.Differences(existing, source, false).Select(d => d.Field).ToHashSet();
+        Assert.Equal(new HashSet<string>
+        {
+            "image.filename", "image.created", "image.clip_start", "image.clip_end", "movie.alphatitle", "movie.tv_episode",
+            "movie.tv_episode_title", "movie.poster", "movie.key_image", "movie.video_link", "movie.video_file", "movie.content_status"
+        }, fields);
+        Assert.Equal("datetime", QdrantPayloads.RequiredIndexes["image.created"]);
+    }
+
+    [Fact]
     public void Differences_TreatsExplicitNullAsDifferentFromMissing()
     {
         var existing = FromJson("""{"image":{"lens":null},"movie":{}}""");

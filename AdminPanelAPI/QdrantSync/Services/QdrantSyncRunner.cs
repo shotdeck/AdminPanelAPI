@@ -1,6 +1,7 @@
 using AdminPanelAPI.QdrantSync.Models;
 using Microsoft.Extensions.Options;
 using Npgsql;
+using System.Text.Json;
 
 namespace AdminPanelAPI.QdrantSync.Services;
 
@@ -48,6 +49,7 @@ public sealed class QdrantSyncRunner(
             await db.OpenAsync(ct);
             await QdrantPayloads.VerifySourceSchemaAsync(db, ct, includeCinemanet: cinemanet);
         }
+        if (job.Apply) await EnsureIndexesAsync(qdrant, opts, job, ct);
 
         job.Examples ??= new();
         var loggedRecords = job.Examples.Select(e => e.ImageId).Distinct().Count();
@@ -125,6 +127,7 @@ public sealed class QdrantSyncRunner(
             await db.OpenAsync(ct);
             await QdrantPayloads.VerifySourceSchemaAsync(db, ct, includeEmbeddings: true, includeCinemanet: cinemanet);
         }
+        if (job.Apply) await EnsureIndexesAsync(qdrant, opts, job, ct);
 
         job.LastId = job.StartAfterId;
         job.Scanned = job.Found = job.Missing = job.Changed = job.Unchanged = job.Written = 0;
@@ -384,6 +387,24 @@ public sealed class QdrantSyncRunner(
         foreach (var (field, schema) in QdrantCollectionConfig.PayloadIndexes(sourceInfo))
             if (!have.ContainsKey(field))
                 await RetryAsync(job, async () => { await qdrant.CreatePayloadIndexAsync(target, field, schema, ct); return 0; }, ct);
+    }
+
+    /// <summary>Creates any of <see cref="QdrantPayloads.RequiredIndexes"/> the collection doesn't have yet.</summary>
+    private async Task EnsureIndexesAsync(QdrantRestClient qdrant, QdrantSyncOptions opts, QdrantSyncJob job, CancellationToken ct)
+    {
+        var info = await RetryAsync(job, () => qdrant.GetCollectionAsync(opts.Collection, ct), ct);
+        if (info is not { } i) return;
+        var schema = i.TryGetProperty("payload_schema", out var s) && s.ValueKind == JsonValueKind.Object ? s : default;
+        foreach (var (field, type) in QdrantPayloads.RequiredIndexes)
+        {
+            if (schema.ValueKind == JsonValueKind.Object && schema.TryGetProperty(field, out _)) continue;
+            logger.LogInformation("Qdrant job #{JobId}: creating {Type} index on {Field}.", job.Id, type, field);
+            await RetryAsync(job, async () =>
+            {
+                await qdrant.CreatePayloadIndexAsync(opts.Collection, field, JsonSerializer.SerializeToElement(type), ct, wait: false);
+                return 0;
+            }, ct);
+        }
     }
 
     private async Task<bool> HasCinemanetAsync(QdrantRestClient qdrant, QdrantSyncOptions opts, QdrantSyncJob job, CancellationToken ct) =>
