@@ -222,9 +222,9 @@ public sealed class QdrantRestClient(HttpClient http, ILogger logger)
             JsonSerializer.SerializeToUtf8Bytes(config), ct);
     }
 
-    public async Task CreatePayloadIndexAsync(string collection, string field, JsonElement schema, CancellationToken ct)
+    public async Task CreatePayloadIndexAsync(string collection, string field, JsonElement schema, CancellationToken ct, bool wait = true)
     {
-        using var _ = await SendAsync(HttpMethod.Put, $"collections/{Uri.EscapeDataString(collection)}/index?wait=true",
+        using var _ = await SendAsync(HttpMethod.Put, $"collections/{Uri.EscapeDataString(collection)}/index?wait={(wait ? "true" : "false")}",
             JsonSerializer.SerializeToUtf8Bytes(new { field_name = field, field_schema = schema }), ct);
     }
 
