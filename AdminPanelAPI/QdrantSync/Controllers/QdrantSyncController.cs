@@ -150,6 +150,7 @@ public sealed class QdrantSyncController(
             sourceDatabase = string.IsNullOrWhiteSpace(o.SourceConnectionString) ? "ConnectionStrings:Default" : "QdrantSync:SourceConnectionString",
             o.BatchSize,
             o.WriteBatchSize,
+            o.SyncParallelism,
             o.IncludeColorShades,
             nightly = new { o.Nightly.Enabled, o.Nightly.AtUtc, o.Nightly.Apply, o.Nightly.Insert, o.Nightly.WindowHours },
             email = new { configured = o.Email.Configured, o.Email.SmtpHost, o.Email.SmtpPort, o.Email.From, o.Email.To },

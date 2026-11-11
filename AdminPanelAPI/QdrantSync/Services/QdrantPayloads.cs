@@ -108,11 +108,14 @@ public static class QdrantPayloads
     }
 
     /// <summary>The next <paramref name="limit"/> live image ids after <paramref name="afterId"/>.</summary>
-    public static async Task<List<int>> ReadLiveImageIdsAsync(NpgsqlConnection db, int afterId, int limit, CancellationToken ct)
+    public static async Task<List<int>> ReadLiveImageIdsAsync(NpgsqlConnection db, int afterId, int limit, CancellationToken ct,
+        int? endId = null)
     {
         await using var cmd = new NpgsqlCommand(
-            "SELECT idnum FROM frl.frl_images WHERE idnum > @after AND status = 'live' ORDER BY idnum LIMIT @count", db);
+            "SELECT idnum FROM frl.frl_images WHERE idnum > @after" + (endId is null ? "" : " AND idnum <= @end")
+            + " AND status = 'live' ORDER BY idnum LIMIT @count", db);
         cmd.Parameters.AddWithValue("after", afterId);
+        if (endId is int end) cmd.Parameters.AddWithValue("end", end);
         cmd.Parameters.AddWithValue("count", limit);
         var result = new List<int>(limit);
         await using var rdr = await cmd.ExecuteReaderAsync(ct);
@@ -120,7 +123,7 @@ public static class QdrantPayloads
         return result;
     }
 
-    /// <summary>The highest image id in <c>frl_images</c> (0 when empty); used to split a rebuild into slices.</summary>
+    /// <summary>The highest image id in <c>frl_images</c> (0 when empty); used to split a rebuild or sync into slices.</summary>
     public static async Task<int> ReadMaxImageIdAsync(NpgsqlConnection db, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand("SELECT COALESCE(MAX(idnum), 0) FROM frl.frl_images", db);

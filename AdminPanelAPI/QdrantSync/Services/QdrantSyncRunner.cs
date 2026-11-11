@@ -1,6 +1,7 @@
 using AdminPanelAPI.QdrantSync.Models;
 using Microsoft.Extensions.Options;
 using Npgsql;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 
 namespace AdminPanelAPI.QdrantSync.Services;
@@ -10,8 +11,8 @@ namespace AdminPanelAPI.QdrantSync.Services;
 /// payload from Postgres, and rewrites the Qdrant payload where it differs. Postgres is read-only;
 /// Qdrant vectors and payload keys the sync doesn't own are left alone; images missing from
 /// Qdrant are only counted. When the collection has a cinemanet vector, points lacking one get it
-/// added from <c>frl_cinemanet_embeddings</c> (vector-only update). Progress is checkpointed on the
-/// job row after every batch.
+/// added from <c>frl_cinemanet_embeddings</c> (vector-only update). The id range is split into
+/// slices run in parallel (SyncParallelism); each slice is checkpointed on the job row after every batch.
 /// </summary>
 public sealed class QdrantSyncRunner(
     IOptionsMonitor<QdrantSyncOptions> options,
@@ -51,61 +52,88 @@ public sealed class QdrantSyncRunner(
         }
         if (job.Apply) await EnsureIndexesAsync(qdrant, opts, job, ct);
 
+        var parallel = job.MaxRows > 0 ? 1 : Math.Max(1, opts.SyncParallelism);
+        await EnsureSlicesAsync(job, connectionString, parallel, ct);
         job.Examples ??= new();
-        var loggedRecords = job.Examples.Select(e => e.ImageId).Distinct().Count();
+        var logged = new StrongBox<int>(job.Examples.Select(e => e.ImageId).Distinct().Count());
+        using var progress = new SemaphoreSlim(1, 1);
+        return await RunSlicesAsync(job, parallel, (slice, token) =>
+            SyncSliceAsync(instance, job, opts, qdrant, connectionString, cinemanet, slice, progress, logged, token), ct);
+    }
+
+    /// <summary>Syncs one slice batch by batch, checkpointing after each. False if the job was cancelled or taken over.</summary>
+    private async Task<bool> SyncSliceAsync(string instance, QdrantSyncJob job, QdrantSyncOptions opts, QdrantRestClient qdrant,
+        string connectionString, bool cinemanet, RebuildSlice slice, SemaphoreSlim progress, StrongBox<int> logged, CancellationToken ct)
+    {
         var failures = 0;
-        while (job.MaxRows == 0 || job.Scanned < job.MaxRows)
+        while (!slice.Done)
         {
             ct.ThrowIfCancellationRequested();
+            if (job.MaxRows > 0 && job.Scanned >= job.MaxRows) return true;
             var limit = job.MaxRows == 0 ? opts.BatchSize : (int)Math.Min(opts.BatchSize, job.MaxRows - job.Scanned);
             BatchResult batch;
             try
             {
-                batch = await ProcessBatchAsync(connectionString, qdrant, opts, job.LastId, limit, job.Apply, ct, cinemanet);
+                batch = await ProcessBatchAsync(connectionString, qdrant, opts, slice.After, limit, job.Apply, ct, cinemanet, slice.End);
                 failures = 0;
             }
             catch (Exception ex) when (!ct.IsCancellationRequested && IsTransient(ex) && ++failures < MaxConsecutiveFailures)
             {
-                job.Retries++;
-                job.Error = $"retrying after id {job.LastId}: {ex.Message}";
-                logger.LogWarning(ex, "Qdrant sync #{JobId} batch after id {LastId} failed, retry {Attempt}.", job.Id, job.LastId, failures);
-                if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+                logger.LogWarning(ex, "Qdrant sync #{JobId} batch after id {LastId} failed, retry {Attempt}.", job.Id, slice.After, failures);
+                await progress.WaitAsync(ct);
+                try
+                {
+                    job.Retries++;
+                    job.Error = $"retrying after id {slice.After}: {ex.Message}";
+                    if (!await store.CheckpointAsync(instance, job, false, ct)) return false;
+                }
+                finally { progress.Release(); }
                 await Task.Delay(TimeSpan.FromSeconds(30 * failures), ct);
                 continue;
             }
-            if (batch.Ids.Count == 0) break;
 
-            var examplesChanged = false;
-            foreach (var change in batch.Changes)
+            await progress.WaitAsync(ct);
+            try
             {
-                foreach (var diff in change.Differences)
+                var examplesChanged = false;
+                foreach (var change in batch.Changes)
                 {
-                    job.FieldCounts[diff.Field] = job.FieldCounts.GetValueOrDefault(diff.Field) + 1;
-                    if (loggedRecords < opts.MaxLoggedRecords)
-                        job.Examples.Add(new ChangeExample(change.Id, diff.Field, diff.Old, diff.New));
+                    foreach (var diff in change.Differences)
+                    {
+                        job.FieldCounts[diff.Field] = job.FieldCounts.GetValueOrDefault(diff.Field) + 1;
+                        if (logged.Value < opts.MaxLoggedRecords)
+                            job.Examples!.Add(new ChangeExample(change.Id, diff.Field, diff.Old, diff.New));
+                    }
+                    if (logged.Value < opts.MaxLoggedRecords)
+                    {
+                        logged.Value++;
+                        examplesChanged = true;
+                    }
                 }
-                if (loggedRecords < opts.MaxLoggedRecords)
+                if (batch.CinemanetAdded > 0)
+                    job.FieldCounts[CinemanetField] = job.FieldCounts.GetValueOrDefault(CinemanetField) + batch.CinemanetAdded;
+                job.Scanned += batch.Ids.Count;
+                job.Found += batch.Present;
+                job.Missing += batch.Ids.Count - batch.Present;
+                job.Changed += batch.Changes.Count;
+                job.Unchanged += batch.Unchanged;
+                job.Written += batch.Written;
+                if (batch.Ids.Count > 0)
                 {
-                    loggedRecords++;
-                    examplesChanged = true;
+                    slice.After = batch.Ids[^1];
+                    job.LastId = Math.Max(job.LastId, slice.After);
                 }
-            }
-            if (batch.CinemanetAdded > 0)
-                job.FieldCounts[CinemanetField] = job.FieldCounts.GetValueOrDefault(CinemanetField) + batch.CinemanetAdded;
-            job.Scanned += batch.Ids.Count;
-            job.Found += batch.Present;
-            job.Missing += batch.Ids.Count - batch.Present;
-            job.Changed += batch.Changes.Count;
-            job.Unchanged += batch.Unchanged;
-            job.Written += batch.Written;
-            job.LastId = batch.Ids[^1];
-            job.Error = null;
-            if (!await store.CheckpointAsync(instance, job, examplesChanged, ct)) return false;
+                slice.Done = batch.Ids.Count < limit;
+                job.Error = null;
+                if (!await store.CheckpointAsync(instance, job, examplesChanged, ct)) return false;
 
-            if (job.Scanned % opts.LogEveryRows < batch.Ids.Count)
-                logger.LogInformation(
-                    "Qdrant sync #{JobId}: scanned {Scanned:N0} found {Found:N0} missing {Missing:N0} changed {Changed:N0} same {Unchanged:N0} written {Written:N0} last id {LastId}.",
-                    job.Id, job.Scanned, job.Found, job.Missing, job.Changed, job.Unchanged, job.Written, job.LastId);
+                if (job.Scanned % opts.LogEveryRows < batch.Ids.Count)
+                    logger.LogInformation(
+                        "Qdrant sync #{JobId}: scanned {Scanned:N0} found {Found:N0} missing {Missing:N0} changed {Changed:N0} same {Unchanged:N0} written {Written:N0}, {Done}/{Slices} slices done.",
+                        job.Id, job.Scanned, job.Found, job.Missing, job.Changed, job.Unchanged, job.Written,
+                        job.Slices!.Count(s => s.Done), job.Slices!.Count);
+            }
+            finally { progress.Release(); }
         }
         return true;
     }
@@ -222,31 +250,61 @@ public sealed class QdrantSyncRunner(
         if (job.Apply) await EnsureRebuildTargetAsync(qdrant, opts, job, sourceInfo, ct);
 
         var parallel = job.MaxRows > 0 ? 1 : Math.Max(1, opts.RebuildParallelism);
-        if (job.Slices is not { Count: > 0 })
+        await EnsureSlicesAsync(job, connectionString, parallel, ct);
+        using var progress = new SemaphoreSlim(1, 1);
+        if (!await RunSlicesAsync(job, parallel, (slice, token) =>
+                CopySliceAsync(instance, job, opts, qdrant, connectionString, slice, progress, token), ct))
+            return false;
+
+        var reachedEnd = job.Slices.All(s => s.Done);
+        if (job.Apply && reachedEnd)
         {
-            var resumeAfter = Math.Max(job.LastId, job.StartAfterId);
-            var maxId = 0;
-            if (parallel > 1)
+            var threshold = QdrantCollectionConfig.IndexingThreshold(sourceInfo);
+            await RetryAsync(job, async () =>
             {
-                await using var db = new NpgsqlConnection(connectionString);
-                await db.OpenAsync(ct);
-                maxId = await QdrantPayloads.ReadMaxImageIdAsync(db, ct);
-            }
-            job.Slices = PlanSlices(resumeAfter, maxId, parallel * 4);
+                await qdrant.UpdateCollectionAsync(target, new { optimizers_config = new { indexing_threshold = threshold } }, ct);
+                return 0;
+            }, ct);
+            logger.LogInformation("Qdrant rebuild #{JobId}: copy finished, indexing of {Target} turned back on (threshold {Threshold}).",
+                job.Id, target, threshold);
         }
-        var pending = new System.Collections.Concurrent.ConcurrentQueue<RebuildSlice>(job.Slices.Where(s => !s.Done));
-        logger.LogInformation("Qdrant rebuild #{JobId}: {Pending} of {Slices} slices to copy, {Workers} at a time.",
-            job.Id, pending.Count, job.Slices.Count, parallel);
+        return true;
+    }
+
+    /// <summary>Splits the rest of the job into id slices (about 4 per worker) unless it already has them.</summary>
+    private static async Task EnsureSlicesAsync(QdrantSyncJob job, string connectionString, int parallel, CancellationToken ct)
+    {
+        if (job.Slices is { Count: > 0 }) return;
+        var resumeAfter = Math.Max(job.LastId, job.StartAfterId);
+        var maxId = 0;
+        if (parallel > 1)
+        {
+            await using var db = new NpgsqlConnection(connectionString);
+            await db.OpenAsync(ct);
+            maxId = await QdrantPayloads.ReadMaxImageIdAsync(db, ct);
+        }
+        job.Slices = PlanSlices(resumeAfter, maxId, parallel * 4);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="work"/> over the job's unfinished slices, <paramref name="parallel"/> at a time.
+    /// False if a slice stopped because the job was cancelled or taken over.
+    /// </summary>
+    private async Task<bool> RunSlicesAsync(QdrantSyncJob job, int parallel,
+        Func<RebuildSlice, CancellationToken, Task<bool>> work, CancellationToken ct)
+    {
+        var pending = new System.Collections.Concurrent.ConcurrentQueue<RebuildSlice>(job.Slices!.Where(s => !s.Done));
+        logger.LogInformation("Qdrant {Kind} #{JobId}: {Pending} of {Slices} slices to go, {Workers} at a time.",
+            job.Kind, job.Id, pending.Count, job.Slices!.Count, parallel);
 
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        using var progress = new SemaphoreSlim(1, 1);
         var stopped = false;
         var workers = Enumerable.Range(0, parallel).Select(_ => Task.Run(async () =>
         {
             try
             {
                 while (!stop.IsCancellationRequested && pending.TryDequeue(out var slice))
-                    if (!await CopySliceAsync(instance, job, opts, qdrant, connectionString, slice, progress, stop.Token))
+                    if (!await work(slice, stop.Token))
                     {
                         stopped = true;
                         stop.Cancel();
@@ -270,21 +328,7 @@ public sealed class QdrantSyncRunner(
                 throw;
             }
         }
-        if (stopped) return false;
-
-        var reachedEnd = job.Slices.All(s => s.Done);
-        if (job.Apply && reachedEnd)
-        {
-            var threshold = QdrantCollectionConfig.IndexingThreshold(sourceInfo);
-            await RetryAsync(job, async () =>
-            {
-                await qdrant.UpdateCollectionAsync(target, new { optimizers_config = new { indexing_threshold = threshold } }, ct);
-                return 0;
-            }, ct);
-            logger.LogInformation("Qdrant rebuild #{JobId}: copy finished, indexing of {Target} turned back on (threshold {Threshold}).",
-                job.Id, target, threshold);
-        }
-        return true;
+        return !stopped;
     }
 
     /// <summary>
@@ -428,11 +472,11 @@ public sealed class QdrantSyncRunner(
     /// <summary>One batch: read ids after <paramref name="afterId"/>, diff against Qdrant, write changes when applying.</summary>
     public static async Task<BatchResult> ProcessBatchAsync(
         string connectionString, QdrantRestClient qdrant, QdrantSyncOptions opts,
-        int afterId, int limit, bool apply, CancellationToken ct, bool cinemanet = false)
+        int afterId, int limit, bool apply, CancellationToken ct, bool cinemanet = false, int? endId = null)
     {
         await using var db = new NpgsqlConnection(connectionString);
         await db.OpenAsync(ct);
-        var ids = await QdrantPayloads.ReadLiveImageIdsAsync(db, afterId, limit, ct);
+        var ids = await QdrantPayloads.ReadLiveImageIdsAsync(db, afterId, limit, ct, endId);
         if (ids.Count == 0) return new BatchResult(ids, 0, 0, new(), 0);
 
         var remote = await qdrant.GetPayloadsAsync(opts.Collection, ids, ct);

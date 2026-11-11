@@ -9,7 +9,10 @@ public sealed class QdrantSyncOptions
     /// <summary>Optional: read frl tables from here instead of ConnectionStrings:Default. Jobs always live in Default.</summary>
     public string? SourceConnectionString { get; set; }
     public int BatchSize { get; set; } = 2000;
-    public int WriteBatchSize { get; set; } = 100;
+    /// <summary>Sync job: changed points written per Qdrant batch request.</summary>
+    public int WriteBatchSize { get; set; } = 500;
+    /// <summary>Sync job: id slices synced at the same time (1 = one sequential pass).</summary>
+    public int SyncParallelism { get; set; } = 4;
     public bool IncludeColorShades { get; set; }
     public int DbTimeoutSeconds { get; set; } = 180;
     public int LogEveryRows { get; set; } = 10000;
@@ -95,11 +98,11 @@ public sealed class QdrantSyncJob
     public DateTime? StartedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
     public DateTime? FinishedAt { get; set; }
-    /// <summary>Rebuild only: per-slice progress, so a parallel copy resumes each slice where it stopped.</summary>
+    /// <summary>Rebuild and sync: per-slice progress, so a parallel run resumes each slice where it stopped.</summary>
     public List<RebuildSlice>? Slices { get; set; }
 }
 
-/// <summary>Rebuild id range (<see cref="After"/>, <see cref="End"/>]; <see cref="After"/> is its checkpoint. No End = open-ended.</summary>
+/// <summary>Rebuild/sync id range (<see cref="After"/>, <see cref="End"/>]; <see cref="After"/> is its checkpoint. No End = open-ended.</summary>
 public sealed class RebuildSlice
 {
     public int After { get; set; }
