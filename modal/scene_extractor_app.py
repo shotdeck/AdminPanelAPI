@@ -47,7 +47,7 @@ with image.imports():
     max_containers=MAX_CONTAINERS,
     scaledown_window=60 * 3,
     volumes={"/model": model_volume},
-    secrets=[modal.Secret.from_name("r2-credentials")],
+    secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")],
 )
 class TransNetV2Worker:
     @modal.enter()
