@@ -60,7 +60,9 @@ def get_video_metadata(video_path):
         print(f"Failed to read metadata: {e}")
         return None
 
-STILL_URL = "https://crunch.shotdeck.com/assets/images/stills/smthumb/small_{rid}.{ext}"
+# Crunch now answers stills with a login page, so :8889 (movie-server login) is tried first.
+STILL_URLS = ["http://35.89.51.60:8889/file/small_{rid}.{ext}",
+              "https://crunch.shotdeck.com/assets/images/stills/smthumb/small_{rid}.{ext}"]
 STILL_SEARCH_SECONDS = 1.0
 STILL_MIN_SCORE = 0.9
 STILL_MIN_GAIN = 0.02
@@ -68,11 +70,18 @@ STILL_MIN_GAIN = 0.02
 
 def fetch_still(rid: str):
     """The still's small thumbnail as a BGR image, or None."""
+    import base64
+    import os
     import urllib.request
     import cv2
-    for ext in ("jpg", "png", "JPG", "jpeg"):
-        req = urllib.request.Request(STILL_URL.format(rid=rid, ext=ext),
-                                     headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120"})
+    login = f"{os.environ.get('MOVIE_USERNAME', '')}:{os.environ.get('MOVIE_PASSWORD', '')}"
+    for url, ext in ((u, e) for u in STILL_URLS for e in ("jpg", "png", "JPG", "jpeg")):
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120"}
+        if ":8889" in url:
+            if not os.environ.get("MOVIE_USERNAME"):
+                continue
+            headers["Authorization"] = "Basic " + base64.b64encode(login.encode()).decode()
+        req = urllib.request.Request(url.format(rid=rid, ext=ext), headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 data = r.read()

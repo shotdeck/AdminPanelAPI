@@ -42,7 +42,9 @@ FILM_BUCKET = "movies"
 FILM_DECODE_PROCS = 8
 # Clips per recut_film machine; each machine downloads the film from R2 once.
 RECUT_CHUNK = 80
-STILL_URL = "https://crunch.shotdeck.com/assets/images/stills/smthumb/small_{rid}.{ext}"
+# Crunch now answers stills with a login page, so :8889 (movie-server login) is tried first.
+STILL_URLS = ["http://35.89.51.60:8889/file/small_{rid}.{ext}",
+              "https://crunch.shotdeck.com/assets/images/stills/smthumb/small_{rid}.{ext}"]
 # The thumbnail keeps the uploaded file's extension, which isn't always .jpg.
 STILL_EXTS = ["jpg", "png", "JPG", "jpeg"]
 # crunch refuses requests without a browser user agent.
@@ -143,19 +145,23 @@ with image.imports():
         return np.maximum(a[..., :FEATURE_SIZE] @ b[:FEATURE_SIZE], a[..., FEATURE_SIZE:] @ b[FEATURE_SIZE:])
 
     def still_feature(rid):
-        for ext in STILL_EXTS:
-            for attempt in range(3):
-                try:
-                    r = requests.get(STILL_URL.format(rid=rid, ext=ext), headers=STILL_HEADERS, timeout=60)
-                    if r.status_code == 200:
-                        img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
-                        if img is not None:
-                            return feature(img)
-                    elif r.status_code == 404:
-                        break
-                except requests.RequestException:
-                    pass
-                time.sleep(2 * (attempt + 1))
+        auth = (os.environ["MOVIE_USERNAME"], os.environ["MOVIE_PASSWORD"]) if os.environ.get("MOVIE_USERNAME") else None
+        for url in STILL_URLS:
+            for ext in STILL_EXTS:
+                for attempt in range(3):
+                    try:
+                        r = requests.get(url.format(rid=rid, ext=ext), headers=STILL_HEADERS, timeout=60,
+                                         auth=auth if ":8889" in url else None)
+                        if r.status_code == 200:
+                            img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+                            if img is not None:
+                                return feature(img)
+                            break
+                        elif r.status_code in (401, 403, 404):
+                            break
+                    except requests.RequestException:
+                        pass
+                    time.sleep(2 * (attempt + 1))
         return None
 
     def video_features(path):
@@ -326,7 +332,7 @@ def history_lines(hist, best, fps):
     return lines
 
 
-@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials")], timeout=600, max_containers=100)
+@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")], timeout=600, max_containers=100)
 def check_clip(movie_id: int, rid: str) -> dict:
     still = still_feature(rid)
     if still is None:
@@ -360,7 +366,7 @@ def match_window(movie_id: int, centre: float, tag: str, stills: bytes, count: i
     return dict(centre=centre, best=[(float(sc[j, i]), base + i / fps) for j, i in enumerate(idx)])
 
 
-@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials")], timeout=1800, max_containers=MOVIE_SERVER_PARALLEL)
+@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")], timeout=1800, max_containers=MOVIE_SERVER_PARALLEL)
 def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup_prefix: str,
           min_score: float = MATCH_MIN) -> dict:
     still = still_feature(rid)
@@ -407,7 +413,7 @@ def search_film(movie_id: int, stills: bytes, count: int, duration: float, job_t
             for j in range(count)]
 
 
-@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials")], timeout=600)
+@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")], timeout=600)
 def probe_film(movie_id: int) -> dict:
     """Duration and fps of the R2 copy at movies/{id}/{id}.mp4, read with ffprobe over a signed URL."""
     url = connect_r2().generate_presigned_url("get_object", Params={"Bucket": FILM_BUCKET, "Key": f"{movie_id}/{movie_id}.mp4"},
