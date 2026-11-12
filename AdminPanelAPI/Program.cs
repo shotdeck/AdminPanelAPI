@@ -1,4 +1,5 @@
 using AdminPanelAPI.QdrantSync;
+using AdminPanelAPI.VideoLinkCheck;
 using AdminPanelAPI.Bts;
 using AdminPanelAPI.Interfaces;
 using AdminPanelAPI.Services;
@@ -152,6 +153,9 @@ builder.AddBts();
 
 // Postgres -> Qdrant metadata sync (/api/qdrant-sync, nightly worker, report email)
 builder.AddQdrantSync();
+
+// Weekly music video / commercial link check (/api/video-link-check, worker, report email)
+builder.AddVideoLinkCheck();
 
 builder.Services.AddCors(opt =>
 {
