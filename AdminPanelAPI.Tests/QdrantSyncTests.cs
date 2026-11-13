@@ -88,6 +88,29 @@ public class QdrantSyncTests
         Assert.Equal("null", diffs[0].Old);
     }
 
+    [Theory]
+    [InlineData(7.8389223205506395, "7.8389223205506395")]
+    [InlineData(3.7537499999999997, "3.7537499999999997")]
+    [InlineData(3.75375, "3.75375")]
+    [InlineData(12.0, "12")]
+    public void ExactNumber_KeepsEveryDigitPostgresHas(double postgres, string expected)
+    {
+        Assert.Equal(expected, QdrantPayloads.ExactNumber(postgres));
+        Assert.Equal(postgres, double.Parse(QdrantPayloads.ExactNumber(postgres), System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
+    public void Reconcile_ClipTimesAsStrings_ReplaceOldNumbersThenStayUnchanged()
+    {
+        var source = Source(new() { ["movieid"] = 5L, ["clip_start"] = QdrantPayloads.ExactNumber(7.8389223205506395) }, new());
+
+        var oldNumber = FromJson("""{"image":{"movieid":5,"clip_start":7.83892232055064},"movie":{}}""");
+        Assert.Equal(new[] { "image.clip_start" }, QdrantPayloads.Differences(oldNumber, source, false).Select(d => d.Field));
+
+        var asString = FromJson("""{"image":{"movieid":5,"clip_start":"7.8389223205506395"},"movie":{}}""");
+        Assert.Null(QdrantPayloads.Reconcile(asString, source, false));
+    }
+
     [Fact]
     public void Equivalent_ComparesNumbersByValue()
     {
