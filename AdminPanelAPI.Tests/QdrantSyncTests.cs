@@ -89,20 +89,26 @@ public class QdrantSyncTests
     }
 
     [Theory]
-    [InlineData("7.83892232055064", 7.8389223205506395)]
-    [InlineData("0.9175457936507936", 0.9175457936507937)]
-    [InlineData("3.75375", 3.7537499999999997)]
-    public void Equivalent_IgnoresQdrantFloatRoundingOfOneUlp(string qdrant, double postgres)
+    [InlineData(7.8389223205506395, "7.8389223205506395")]
+    [InlineData(3.7537499999999997, "3.7537499999999997")]
+    [InlineData(3.75375, "3.75375")]
+    [InlineData(12.0, "12")]
+    public void ExactNumber_KeepsEveryDigitPostgresHas(double postgres, string expected)
     {
-        Assert.True(QdrantPayloads.Equivalent(JsonSerializer.Deserialize<JsonElement>(qdrant), postgres));
+        Assert.Equal(expected, QdrantPayloads.ExactNumber(postgres));
+        Assert.Equal(postgres, double.Parse(QdrantPayloads.ExactNumber(postgres), System.Globalization.CultureInfo.InvariantCulture));
     }
 
     [Fact]
-    public void Equivalent_StillSeesRealNumberChanges()
+    public void Reconcile_ClipTimesAsStrings_ReplaceOldNumbersThenStayUnchanged()
     {
-        Assert.False(QdrantPayloads.Equivalent(JsonSerializer.Deserialize<JsonElement>("7.8389"), 7.839));
-        Assert.False(QdrantPayloads.Equivalent(JsonSerializer.Deserialize<JsonElement>("10654"), 53270));
-        Assert.False(QdrantPayloads.Equivalent(JsonSerializer.Deserialize<JsonElement>("0"), 1e-15));
+        var source = Source(new() { ["movieid"] = 5L, ["clip_start"] = QdrantPayloads.ExactNumber(7.8389223205506395) }, new());
+
+        var oldNumber = FromJson("""{"image":{"movieid":5,"clip_start":7.83892232055064},"movie":{}}""");
+        Assert.Equal(new[] { "image.clip_start" }, QdrantPayloads.Differences(oldNumber, source, false).Select(d => d.Field));
+
+        var asString = FromJson("""{"image":{"movieid":5,"clip_start":"7.8389223205506395"},"movie":{}}""");
+        Assert.Null(QdrantPayloads.Reconcile(asString, source, false));
     }
 
     [Fact]

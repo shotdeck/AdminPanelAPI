@@ -281,6 +281,8 @@ public static class QdrantPayloads
     /// <summary>
     /// <c>clip_start</c>/<c>clip_end</c> from the image's scene boundary (movieid + filename = randid);
     /// images without a valid one get neither. If there are several, the earliest start wins.
+    /// Written as strings: Qdrant stores some full-precision floats one ULP off, so a number
+    /// would never match Postgres exactly and would be re-synced every run.
     /// </summary>
     private static async Task FetchClipBoundariesAsync(NpgsqlConnection db, List<ImagePoint> points, CancellationToken ct)
     {
@@ -302,8 +304,8 @@ public static class QdrantPayloads
         {
             if (!keyed.TryGetValue((Convert.ToInt64(rdr.GetValue(0), CultureInfo.InvariantCulture), rdr.GetString(1)), out var point))
                 continue;
-            point.Image["clip_start"] = rdr.GetDouble(2);
-            point.Image["clip_end"] = rdr.GetDouble(3);
+            point.Image["clip_start"] = ExactNumber(rdr.GetDouble(2));
+            point.Image["clip_end"] = ExactNumber(rdr.GetDouble(3));
         }
     }
 
@@ -477,19 +479,14 @@ public static class QdrantPayloads
                 var ba = b.EnumerateArray().ToArray();
                 return aa.Length == ba.Length && !aa.Where((v, i) => !JsonEqual(v, ba[i])).Any();
             case JsonValueKind.Number:
-                if (a.TryGetDecimal(out var x) && b.TryGetDecimal(out var y) && x == y) return true;
-                return a.TryGetDouble(out var dx) && b.TryGetDouble(out var dy) && NearlyEqual(dx, dy);
+                return a.TryGetDecimal(out var x) && b.TryGetDecimal(out var y) ? x == y : a.GetRawText() == b.GetRawText();
             default:
                 return a.GetRawText() == b.GetRawText();
         }
     }
 
-    /// <summary>
-    /// Qdrant's JSON parser can land a float one ULP off what was sent (e.g. 7.8389223205506395 comes
-    /// back as 7.83892232055064), so floats are equal within a relative 1e-12.
-    /// </summary>
-    private static bool NearlyEqual(double a, double b) =>
-        a == b || Math.Abs(a - b) <= 1e-12 * Math.Max(Math.Abs(a), Math.Abs(b));
+    /// <summary>The shortest string that round-trips to exactly this double, e.g. "7.8389223205506395".</summary>
+    public static string ExactNumber(double value) => value.ToString("R", CultureInfo.InvariantCulture);
 
     // ---------- Field formatting (matches the original importer) ----------
 
