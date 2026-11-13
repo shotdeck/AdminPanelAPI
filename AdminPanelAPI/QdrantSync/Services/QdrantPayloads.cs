@@ -477,11 +477,19 @@ public static class QdrantPayloads
                 var ba = b.EnumerateArray().ToArray();
                 return aa.Length == ba.Length && !aa.Where((v, i) => !JsonEqual(v, ba[i])).Any();
             case JsonValueKind.Number:
-                return a.TryGetDecimal(out var x) && b.TryGetDecimal(out var y) ? x == y : a.GetRawText() == b.GetRawText();
+                if (a.TryGetDecimal(out var x) && b.TryGetDecimal(out var y) && x == y) return true;
+                return a.TryGetDouble(out var dx) && b.TryGetDouble(out var dy) && NearlyEqual(dx, dy);
             default:
                 return a.GetRawText() == b.GetRawText();
         }
     }
+
+    /// <summary>
+    /// Qdrant's JSON parser can land a float one ULP off what was sent (e.g. 7.8389223205506395 comes
+    /// back as 7.83892232055064), so floats are equal within a relative 1e-12.
+    /// </summary>
+    private static bool NearlyEqual(double a, double b) =>
+        a == b || Math.Abs(a - b) <= 1e-12 * Math.Max(Math.Abs(a), Math.Abs(b));
 
     // ---------- Field formatting (matches the original importer) ----------
 

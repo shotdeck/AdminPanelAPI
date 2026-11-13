@@ -88,6 +88,23 @@ public class QdrantSyncTests
         Assert.Equal("null", diffs[0].Old);
     }
 
+    [Theory]
+    [InlineData("7.83892232055064", 7.8389223205506395)]
+    [InlineData("0.9175457936507936", 0.9175457936507937)]
+    [InlineData("3.75375", 3.7537499999999997)]
+    public void Equivalent_IgnoresQdrantFloatRoundingOfOneUlp(string qdrant, double postgres)
+    {
+        Assert.True(QdrantPayloads.Equivalent(JsonSerializer.Deserialize<JsonElement>(qdrant), postgres));
+    }
+
+    [Fact]
+    public void Equivalent_StillSeesRealNumberChanges()
+    {
+        Assert.False(QdrantPayloads.Equivalent(JsonSerializer.Deserialize<JsonElement>("7.8389"), 7.839));
+        Assert.False(QdrantPayloads.Equivalent(JsonSerializer.Deserialize<JsonElement>("10654"), 53270));
+        Assert.False(QdrantPayloads.Equivalent(JsonSerializer.Deserialize<JsonElement>("0"), 1e-15));
+    }
+
     [Fact]
     public void Equivalent_ComparesNumbersByValue()
     {
