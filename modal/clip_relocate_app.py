@@ -103,6 +103,8 @@ SIFT_FEATURES = 1500
 # Per still, how many of its best 30s windows (pixel match) SIFT checks, and how far around each.
 SIFT_CANDIDATES = 12
 SIFT_SPAN = 1.0
+# Stills per sift_search machine (each downloads the film).
+SIFT_CHUNK = 40
 
 with image.imports():
     import json
@@ -766,7 +768,9 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
             sift_todo = [(rid, cands + [t for t, _ in clip_found[rid]["top"]]) for rid, cands in sift_todo
                          if rid in clip_found]
             set_progress(job_tag, phase="sift search")
-            sift_found = sift_search.remote(movie_id, sift_todo, job_tag)
+            chunks = [sift_todo[i:i + SIFT_CHUNK] for i in range(0, len(sift_todo), SIFT_CHUNK)]
+            for part in sift_search.map([movie_id] * len(chunks), chunks, [job_tag] * len(chunks)):
+                sift_found.update(part)
             report_meta["sift_searched"] = len(sift_todo)
 
         for rid in targets:
