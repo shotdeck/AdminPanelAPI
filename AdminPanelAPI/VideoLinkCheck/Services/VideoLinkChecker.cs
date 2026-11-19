@@ -18,7 +18,11 @@ public sealed class VideoLinkChecker(IHttpClientFactory httpFactory, IOptionsMon
     private static readonly Regex YoutubeQueryId = new(@"[?&]v=([a-zA-Z0-9_-]{11})", RegexOptions.Compiled);
     private static readonly Regex YoutubePathId = new(
         @"(?:youtu\.be/|/(?:embed|shorts|live|v)/)([a-zA-Z0-9_-]{11})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex VimeoId = new(@"(\d{6,12})", RegexOptions.Compiled);
+    private static readonly Regex VimeoIdSegment = new(@"^\d{6,12}$", RegexOptions.Compiled);
+    private static readonly HashSet<string> VimeoContainers = new(StringComparer.OrdinalIgnoreCase)
+        { "showcase", "album", "groups", "channels" };
+    private static readonly Regex VimeoHash = new(@"^[0-9a-f]{6,}$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex VimeoHashQuery = new(@"[?&]h=([0-9a-f]{6,})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public static (Platform Platform, string? CanonicalUrl, string? VideoId, string? Note) Detect(string url)
     {
@@ -40,13 +44,31 @@ public sealed class VideoLinkChecker(IHttpClientFactory httpFactory, IOptionsMon
 
         if (lower.Contains("vimeo.com"))
         {
-            var m = VimeoId.Match(url);
-            return m.Success
-                ? (Platform.Vimeo, $"https://vimeo.com/{m.Groups[1].Value}", m.Groups[1].Value, null)
-                : (Platform.Unknown, null, null, "bad vimeo url");
+            var (id, hash) = VimeoIdAndHash(url);
+            if (id is null) return (Platform.Unknown, null, null, "bad vimeo url");
+            return (Platform.Vimeo, hash is null ? $"https://vimeo.com/{id}" : $"https://vimeo.com/{id}/{hash}", id, null);
         }
 
         return (Platform.Unknown, null, null, "not youtube/vimeo");
+    }
+
+    /// <summary>
+    /// The video id is the first numeric path segment that isn't a showcase/group/channel/album id,
+    /// and unlisted videos also need their privacy hash: vimeo.com/{id}/{hash} or player.vimeo.com/video/{id}?h={hash}.
+    /// </summary>
+    private static (string? Id, string? Hash) VimeoIdAndHash(string url)
+    {
+        var absolute = url.StartsWith("//") ? "https:" + url : url.Contains("://") ? url : "https://" + url;
+        if (!Uri.TryCreate(absolute, UriKind.Absolute, out var uri))
+            return (null, null);
+        var segments = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var i = Array.FindIndex(segments, VimeoIdSegment.IsMatch);
+        while (i > 0 && VimeoContainers.Contains(segments[i - 1]))
+            i = Array.FindIndex(segments, i + 1, VimeoIdSegment.IsMatch);
+        if (i < 0) return (null, null);
+        var hash = i + 1 < segments.Length && VimeoHash.IsMatch(segments[i + 1]) ? segments[i + 1] : null;
+        if (hash is null && VimeoHashQuery.Match(uri.Query) is { Success: true } q) hash = q.Groups[1].Value;
+        return (segments[i], hash);
     }
 
     public async Task<LinkCheckResult> CheckAsync(MovieLink row, CancellationToken ct)
@@ -66,7 +88,7 @@ public sealed class VideoLinkChecker(IHttpClientFactory httpFactory, IOptionsMon
         {
             try
             {
-                var (status, note) = await OEmbedAsync(oembed, ct);
+                var (status, note) = await OEmbedAsync(platform, oembed, ct);
                 return Result(row, name, videoId!, status, note);
             }
             catch (Exception ex) when (!ct.IsCancellationRequested &&
@@ -84,7 +106,7 @@ public sealed class VideoLinkChecker(IHttpClientFactory httpFactory, IOptionsMon
         return Result(row, name, videoId!, "error", lastError);
     }
 
-    private async Task<(string Status, string? Note)> OEmbedAsync(string url, CancellationToken ct)
+    private async Task<(string Status, string? Note)> OEmbedAsync(Platform platform, string url, CancellationToken ct)
     {
         var http = httpFactory.CreateClient(VideoLinkCheckSetup.HttpClientName);
         using var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
@@ -92,8 +114,18 @@ public sealed class VideoLinkChecker(IHttpClientFactory httpFactory, IOptionsMon
         var code = (int)resp.StatusCode;
         if (resp.StatusCode == HttpStatusCode.TooManyRequests || code >= 500)
             throw new TransientHttpException($"oembed {code} {resp.StatusCode}");
-        return ("unavailable", resp.StatusCode == HttpStatusCode.NotFound ? "oembed 404" : $"oembed {code} {resp.StatusCode}");
+        return ("unavailable", $"oembed {code} {UnavailableReason(platform, code) ?? resp.StatusCode.ToString()}");
     }
+
+    public static string? UnavailableReason(Platform platform, int code) => (platform, code) switch
+    {
+        (Platform.Youtube, 401) => "embedding disabled",
+        (Platform.Youtube, 403) => "private",
+        (Platform.Youtube, 404) => "removed or not found",
+        (Platform.Vimeo, 403) => "embedding restricted",
+        (Platform.Vimeo, 404) => "private, removed or not found",
+        _ => null,
+    };
 
     private static LinkCheckResult Result(MovieLink row, string platform, string videoId, string status, string? note) =>
         new(row.Id, row.Title, row.MediaType, row.Url, platform, videoId, status, DateTime.UtcNow, note);
