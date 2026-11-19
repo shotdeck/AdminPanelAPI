@@ -19,6 +19,8 @@ public sealed class VideoLinkChecker(IHttpClientFactory httpFactory, IOptionsMon
     private static readonly Regex YoutubePathId = new(
         @"(?:youtu\.be/|/(?:embed|shorts|live|v)/)([a-zA-Z0-9_-]{11})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex VimeoIdSegment = new(@"^\d{6,12}$", RegexOptions.Compiled);
+    private static readonly HashSet<string> VimeoContainers = new(StringComparer.OrdinalIgnoreCase)
+        { "showcase", "album", "groups", "channels" };
     private static readonly Regex VimeoHash = new(@"^[0-9a-f]{6,}$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex VimeoHashQuery = new(@"[?&]h=([0-9a-f]{6,})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
@@ -51,15 +53,18 @@ public sealed class VideoLinkChecker(IHttpClientFactory httpFactory, IOptionsMon
     }
 
     /// <summary>
-    /// The video id is the last numeric path segment (showcase/group/channel URLs carry their own id first),
+    /// The video id is the first numeric path segment that isn't a showcase/group/channel/album id,
     /// and unlisted videos also need their privacy hash: vimeo.com/{id}/{hash} or player.vimeo.com/video/{id}?h={hash}.
     /// </summary>
     private static (string? Id, string? Hash) VimeoIdAndHash(string url)
     {
-        if (!Uri.TryCreate(url.Contains("://") ? url : "https://" + url, UriKind.Absolute, out var uri))
+        var absolute = url.StartsWith("//") ? "https:" + url : url.Contains("://") ? url : "https://" + url;
+        if (!Uri.TryCreate(absolute, UriKind.Absolute, out var uri))
             return (null, null);
         var segments = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        var i = Array.FindLastIndex(segments, VimeoIdSegment.IsMatch);
+        var i = Array.FindIndex(segments, VimeoIdSegment.IsMatch);
+        while (i > 0 && VimeoContainers.Contains(segments[i - 1]))
+            i = Array.FindIndex(segments, i + 1, VimeoIdSegment.IsMatch);
         if (i < 0) return (null, null);
         var hash = i + 1 < segments.Length && VimeoHash.IsMatch(segments[i + 1]) ? segments[i + 1] : null;
         if (hash is null && VimeoHashQuery.Match(uri.Query) is { Success: true } q) hash = q.Groups[1].Value;

@@ -35,6 +35,10 @@ public class VideoLinkCheckTests
     [InlineData("https://vimeo.com/829232989/9218dc744f?turnstile=0.0Hhl.9ixP.aebe", "https://vimeo.com/829232989/9218dc744f")]
     [InlineData("https://player.vimeo.com/video/880468217?h=c983fbb771", "https://vimeo.com/880468217/c983fbb771")]
     [InlineData("https://player.vimeo.com/video/76979871?h=abc", "https://vimeo.com/76979871")]
+    [InlineData("https://vimeo.com/882661335/1234567890", "https://vimeo.com/882661335/1234567890")]
+    [InlineData("https://vimeo.com/channels/1234567/987654", "https://vimeo.com/987654")]
+    [InlineData("//player.vimeo.com/video/76979871", "https://vimeo.com/76979871")]
+    [InlineData("vimeo.com/76979871", "https://vimeo.com/76979871")]
     public void Detect_Vimeo(string url, string expectedCanonical)
     {
         var (platform, canonical, videoId, _) = Detect(url);
