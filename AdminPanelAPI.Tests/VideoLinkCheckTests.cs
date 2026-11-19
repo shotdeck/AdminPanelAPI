@@ -14,6 +14,8 @@ public class VideoLinkCheckTests
     [InlineData("https://www.youtube.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ")]
     [InlineData("https://youtube.com/shorts/dQw4w9WgXcQ", "dQw4w9WgXcQ")]
     [InlineData(" https://m.youtube.com/watch?feature=share&v=dQw4w9WgXcQ ", "dQw4w9WgXcQ")]
+    [InlineData("https://www.youtube.com/watch?v=MS91knuzoOA&rco=1&ab_channel=PearljamVEVO", "MS91knuzoOA")]
+    [InlineData("https://www.youtube.com/watch?app=desktop&v=SfWx2-L71dY", "SfWx2-L71dY")]
     public void Detect_Youtube(string url, string id)
     {
         var (platform, canonical, videoId, _) = Detect(url);
@@ -23,15 +25,22 @@ public class VideoLinkCheckTests
     }
 
     [Theory]
-    [InlineData("https://vimeo.com/123456789", "123456789")]
-    [InlineData("https://player.vimeo.com/video/76979871?h=abc", "76979871")]
-    [InlineData("https://vimeo.com/channels/staffpicks/987654", "987654")]
-    public void Detect_Vimeo(string url, string id)
+    [InlineData("https://vimeo.com/123456789", "https://vimeo.com/123456789")]
+    [InlineData("https://vimeo.com/1087852317?activityReferer=1", "https://vimeo.com/1087852317")]
+    [InlineData("https://vimeo.com/channels/staffpicks/987654", "https://vimeo.com/987654")]
+    [InlineData("https://vimeo.com/showcase/8872348/video/305495226", "https://vimeo.com/305495226")]
+    [InlineData("https://vimeo.com/groups/708643/videos/850581957", "https://vimeo.com/850581957")]
+    [InlineData("https://vimeo.com/882661335/03dc74d2f5", "https://vimeo.com/882661335/03dc74d2f5")]
+    [InlineData("https://vimeo.com/1172123163/fd716c5967?fl=pl&fe=vl", "https://vimeo.com/1172123163/fd716c5967")]
+    [InlineData("https://vimeo.com/829232989/9218dc744f?turnstile=0.0Hhl.9ixP.aebe", "https://vimeo.com/829232989/9218dc744f")]
+    [InlineData("https://player.vimeo.com/video/880468217?h=c983fbb771", "https://vimeo.com/880468217/c983fbb771")]
+    [InlineData("https://player.vimeo.com/video/76979871?h=abc", "https://vimeo.com/76979871")]
+    public void Detect_Vimeo(string url, string expectedCanonical)
     {
         var (platform, canonical, videoId, _) = Detect(url);
         Assert.Equal(Platform.Vimeo, platform);
-        Assert.Equal(id, videoId);
-        Assert.Equal($"https://vimeo.com/{id}", canonical);
+        Assert.Equal(expectedCanonical, canonical);
+        Assert.StartsWith($"https://vimeo.com/{videoId}", canonical);
     }
 
     [Theory]
