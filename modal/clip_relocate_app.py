@@ -4,14 +4,15 @@ matched against a different cut of the film).
 
 1. Every clip in clips_9s/<movie_id>/<randid>.mp4 is matched against its still.
    A clip is flagged when the best-matching frame is away from the 4.5s centre
-   (or the clip is missing). A low score alone doesn't flag a clip: stills with
-   a different grade score low even when the clip is right.
+   (or the clip is missing), or when it scores under MATCH_MIN and SIFT keypoint
+   matching (which ignores grading) doesn't find the still at the centre either.
 2. The whole film is pulled from the movie server (:8888 /extract-clip) in 30s
    windows and every frame is matched against every flagged still at once.
 3. Each still found in the film gets a new 9s clip centred on its frame (or as
    near as the film's start allows), which must have the still there before it
    is used. With recut_all every still is searched for and recut, not only the
-   flagged ones; a clip that already matched keeps its clip if its still can't
+   flagged ones. A flagged still the pixel match can't find is looked for with
+   SIFT at its best pixel-match candidates and history times. A clip that already matched keeps its clip if its still can't
    be found or the recut fails. With apply the old
    clip and its 3 previews are copied to clips_9s_backup_<date>/<movie_id>/,
    the new clip is uploaded and the old previews are deleted.
@@ -81,6 +82,17 @@ MOVIE_SERVER_PARALLEL = 4
 # A row/column is border when nearly all of it is below this level.
 BORDER_LEVEL = 24
 FEATURE_SIZE = 96 * 40
+# Stills from a different grade score 0.4-0.8 on the pixel feature even at the right frame, but
+# SIFT keypoints (on CLAHE greyscale) still line up: right frames give 20-500 RANSAC inliers,
+# wrong ones mostly under 12, but a featureless frame (sky, water) can reach 25. A clip whose
+# centre frame reaches SIFT_MIN_INLIERS is kept; a frame found in the film needs SIFT_FOUND_MIN.
+SIFT_MIN_INLIERS = 30
+SIFT_FOUND_MIN = 40
+SIFT_WIDTH = 480
+SIFT_FEATURES = 1500
+# Per still, how many of its best 30s windows (pixel match) SIFT checks, and how far around each.
+SIFT_CANDIDATES = 12
+SIFT_SPAN = 1.0
 
 with image.imports():
     import json
@@ -147,6 +159,10 @@ with image.imports():
         return np.maximum(a[..., :FEATURE_SIZE] @ b[:FEATURE_SIZE], a[..., FEATURE_SIZE:] @ b[FEATURE_SIZE:])
 
     def still_feature(rid):
+        img = still_image(rid)
+        return feature(img) if img is not None else None
+
+    def still_image(rid):
         auth = (os.environ["MOVIE_USERNAME"], os.environ["MOVIE_PASSWORD"]) if os.environ.get("MOVIE_USERNAME") else None
         for url in STILL_URLS:
             for ext in STILL_EXTS:
@@ -157,7 +173,7 @@ with image.imports():
                         if r.status_code == 200:
                             img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
                             if img is not None:
-                                return feature(img)
+                                return img
                             break
                         elif r.status_code in (401, 403, 404):
                             break
@@ -188,6 +204,64 @@ with image.imports():
         c = min(len(sc) - 1, int(round(expected * fps)))
         return dict(best_t=i / fps, best=float(sc[i]), centre=float(sc[max(0, c - 1):c + 2].max()),
                     expected_t=expected)
+
+    def sift_prep(img):
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        box = content_box(cv2.resize(g, (192, 108), interpolation=cv2.INTER_AREA))
+        if box:
+            h, w = g.shape
+            y0, y1, x0, x1 = box
+            g = g[y0 * h // 108:y1 * h // 108, x0 * w // 192:x1 * w // 192]
+        g = cv2.resize(g, (SIFT_WIDTH, max(8, round(g.shape[0] * SIFT_WIDTH / g.shape[1]))),
+                       interpolation=cv2.INTER_AREA)
+        return cv2.createCLAHE(2.0, (8, 8)).apply(g)
+
+    def sift_keys(img):
+        return cv2.SIFT_create(SIFT_FEATURES).detectAndCompute(sift_prep(img), None)
+
+    def sift_inliers(keys, img):
+        """RANSAC homography inliers between the still's keypoints and a frame's."""
+        kp, des = keys
+        if des is None or len(kp) < 8:
+            return 0
+        kp2, des2 = cv2.SIFT_create(SIFT_FEATURES).detectAndCompute(sift_prep(img), None)
+        if des2 is None or len(kp2) < 8:
+            return 0
+        good = [p[0] for p in cv2.BFMatcher().knnMatch(des, des2, k=2)
+                if len(p) == 2 and p[0].distance < 0.75 * p[1].distance]
+        if len(good) < 8:
+            return 0
+        _, mask = cv2.findHomography(np.float32([kp[g.queryIdx].pt for g in good]),
+                                     np.float32([kp2[g.trainIdx].pt for g in good]), cv2.RANSAC, 5.0)
+        return int(mask.sum()) if mask is not None else 0
+
+    def sift_best(keys, path, t0, t1, step=2):
+        """Most SIFT inliers (count, time) among every step-th frame of path in [t0, t1]."""
+        cap = cv2.VideoCapture(path)
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t0) * 1000)
+        best, n = (0, None), 0
+        while True:
+            ok, f = cap.read()
+            if not ok:
+                break
+            t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+            if t > t1:
+                break
+            n += 1
+            if t < t0 or n % step:
+                continue
+            k = sift_inliers(keys, f)
+            if k > best[0]:
+                best = (k, t)
+        cap.release()
+        return best
+
+    def sift_at_centre(keys, path, expected=CLIP_CENTRE):
+        """SIFT inliers near the expected time, and the clip's best, for a clip that scores weakly."""
+        best, best_t = sift_best(keys, path, 0.0, CLIP_SECONDS + 1, step=3)
+        centre, _ = sift_best(keys, path, expected - CENTRE_TOLERANCE, expected + CENTRE_TOLERANCE, step=1)
+        return dict(sift_inliers=centre, sift_best=best, sift_best_t=best_t,
+                    sift_ok=centre >= SIFT_MIN_INLIERS and centre >= 0.5 * best)
 
     def at_centre(m):
         return m is not None and (
@@ -263,8 +337,9 @@ with image.imports():
         cap.release()
         return out
 
-    def recut_from(movie_id, rid, still, src, found_t, apply, backup_prefix, min_score, out, src_offset=0.0):
-        """Cut the 9s clip centred on found_t from src (which starts at src_offset), verify, upload."""
+    def recut_from(movie_id, rid, img, src, found_t, apply, backup_prefix, min_score, out, src_offset=0.0):
+        """Cut the 9s clip centred on found_t from src (which starts at src_offset), verify, upload.
+        A negative min_score (a still found by SIFT) is verified with SIFT instead of the pixel match."""
         start = max(0.0, found_t - CLIP_CENTRE - src_offset)
         subprocess.run([
             "ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-i", src, "-t", f"{CLIP_SECONDS:g}",
@@ -272,8 +347,13 @@ with image.imports():
             "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
         ], check=True)
         # A still in the film's first 4.5s sits before the centre of its clip.
-        m = best_in_clip(still, out, expected=found_t - src_offset - start)
-        if m is None or m["best"] < min_score or not at_centre(m):
+        expected = found_t - src_offset - start
+        m = best_in_clip(feature(img), out, expected=expected)
+        if m is not None and min_score < 0:
+            m.update(sift_at_centre(sift_keys(img), out, expected))
+            if not m["sift_ok"]:
+                return dict(rid=rid, status="failed", reason="verify_failed", **m)
+        elif m is None or m["best"] < min_score or not at_centre(m):
             return dict(rid=rid, status="failed", reason="verify_failed", **(m or {}))
         if apply:
             r2 = connect_r2()
@@ -336,9 +416,10 @@ def history_lines(hist, best, fps):
 
 @app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")], timeout=600, max_containers=100)
 def check_clip(movie_id: int, rid: str) -> dict:
-    still = still_feature(rid)
-    if still is None:
+    img = still_image(rid)
+    if img is None:
         return dict(rid=rid, status="no_still")
+    still = feature(img)
     r2 = connect_r2()
     with tempfile.TemporaryDirectory() as d:
         path = f"{d}/{rid}.mp4"
@@ -347,9 +428,13 @@ def check_clip(movie_id: int, rid: str) -> dict:
         except Exception:
             return dict(rid=rid, status="flagged", reason="no_clip")
         m = best_in_clip(still, path)
+        if m is not None and m["best"] < MATCH_MIN:
+            m.update(sift_at_centre(sift_keys(img), path))
     if m is None:
         return dict(rid=rid, status="flagged", reason="unreadable_clip")
     if m["best"] < MATCH_MIN:
+        if m["sift_ok"]:
+            return dict(rid=rid, status="ok", reason=None, **m)
         return dict(rid=rid, status="flagged", reason="weak_match", **m)
     return dict(rid=rid, status="ok" if at_centre(m) else "flagged", reason=None if at_centre(m) else "off_centre", **m)
 
@@ -373,7 +458,7 @@ def match_window(movie_id: int, centre: float, tag: str, stills: bytes, count: i
 @app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")], timeout=1800, max_containers=MOVIE_SERVER_PARALLEL)
 def recut(movie_id: int, rid: str, found_t: float, tag: str, apply: bool, backup_prefix: str,
           min_score: float = MATCH_MIN) -> dict:
-    still = still_feature(rid)
+    still = still_image(rid)
     centre = max(WINDOW_SECONDS / 2, found_t)
     base = centre - WINDOW_SECONDS / 2
     with tempfile.TemporaryDirectory() as d:
@@ -417,6 +502,36 @@ def search_film(movie_id: int, stills: bytes, count: int, duration: float, job_t
             for j in range(count)]
 
 
+def sift_search_one(path, rid, candidates):
+    img = still_image(rid)
+    if img is None:
+        return rid, (0, None)
+    keys = sift_keys(img)
+    best = (0, None)
+    for c in candidates:
+        k = sift_best(keys, path, c - SIFT_SPAN, c + SIFT_SPAN)
+        if k[0] > best[0]:
+            best = k
+    return rid, best
+
+
+@app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")],
+              cpu=FILM_DECODE_PROCS, memory=16384, timeout=4 * 3600)
+def sift_search(movie_id: int, items: list, job_tag: str) -> dict:
+    """items: [(rid, [candidate times])]. Returns {rid: (inliers, time)}, the best SIFT match near any candidate."""
+    from concurrent.futures import ProcessPoolExecutor
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/film.mp4"
+        if not download_film(movie_id, path):
+            raise RuntimeError(f"Could not download movie {movie_id} from R2 or :8889.")
+        out = {}
+        with ProcessPoolExecutor(FILM_DECODE_PROCS) as pool:
+            for rid, best in pool.map(sift_search_one, [path] * len(items), *zip(*items)):
+                out[rid] = best
+                set_progress(job_tag, sift_checked=len(out))
+    return out
+
+
 @app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")], timeout=600)
 def probe_film(movie_id: int) -> dict:
     """Duration and fps of the R2 copy at movies/{id}/{id}.mp4, read with ffprobe over a signed URL."""
@@ -448,7 +563,7 @@ def recut_film(movie_id: int, items: list, job_tag: str, apply: bool, backup_pre
         def one(item):
             rid, found_t, min_score = item
             try:
-                return recut_from(movie_id, rid, still_feature(rid), path, found_t, apply, backup_prefix,
+                return recut_from(movie_id, rid, still_image(rid), path, found_t, apply, backup_prefix,
                                   min_score, f"{d}/{rid}.mp4")
             except Exception as ex:
                 return dict(rid=rid, status="failed", reason=f"recut_error: {ex}"[:300])
@@ -549,7 +664,7 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
             report_meta["drift_fit"] = dict(a=round(lines[0][1], 6), b=round(lines[0][2], 3))
         report_meta["history_lines"] = [dict(divisor=round(d, 3), a=round(a, 6), b=round(b, 3), slack=sl)
                                         for d, a, b, sl in lines]
-        found, min_scores = [], {}
+        found, min_scores, picked = [], {}, {}
         for rid in targets:
             e = report[rid]
             s, t = best.get(rid, (-1.0, None))
@@ -567,8 +682,34 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
                     s, t = max(near)
                     e["found_via"] = "drift_fit"
                     min_scores[rid] = DRIFT_MATCH_MIN
+            picked[rid] = (s, t)
+
+        # Flagged stills the pixel match can't place: try SIFT at their best windows and history times.
+        sift_todo = []
+        for rid in targets:
+            s, t = picked[rid]
+            if whole_film and report[rid]["flagged"] and rid in window_best and (t is None or s < min_scores[rid]):
+                cands = [wt for _, wt in sorted(window_best[rid], reverse=True)[:SIFT_CANDIDATES]]
+                if hist_frame.get(rid) is not None:
+                    cands += [a * hist_frame[rid] / d + b for d, a, b, _ in lines]
+                sift_todo.append((rid, [c for c in cands if c is not None and 0 <= c <= duration + 60]))
+        sift_found = {}
+        if sift_todo:
+            set_progress(job_tag, phase="sift search", sift_total=len(sift_todo), sift_checked=0)
+            sift_found = sift_search.remote(movie_id, sift_todo, job_tag)
+            report_meta["sift_searched"] = len(sift_todo)
+
+        for rid in targets:
+            e = report[rid]
+            s, t = picked[rid]
+            k, kt = sift_found.get(rid, (0, None))
+            if (t is None or s < min_scores[rid]) and kt is not None and k >= SIFT_FOUND_MIN:
+                s, t = s, kt
+                e["found_via"] = "sift"
+                e["sift_found_inliers"] = k
+                min_scores[rid] = -1.0
             e["found_score"] = s if t is not None else None
-            if t is None or s < min_scores[rid]:
+            if t is None or (s < min_scores[rid] and min_scores[rid] >= 0):
                 if e["flagged"]:
                     e["status"] = "not_found"
                 else:
