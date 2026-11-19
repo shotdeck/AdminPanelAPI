@@ -47,6 +47,10 @@ clip_image = image.pip_install("torch", "open_clip_torch", "pillow")
 # with its CLIP best time for review when that scores at least CLIP_REVIEW_MIN.
 CLIP_RATE = 2
 CLIP_REVIEW_MIN = 0.7
+# A SIFT find must also look like the still to CLIP (best within 1s of it): SIFT alone can match a
+# still to a film leader or title card. Films shorter than SIFT_FILM_MIN (stubs) get neither search.
+CLIP_CONFIRM_MIN = 0.55
+SIFT_FILM_MIN = 600
 # Clips per recut_film machine; each machine downloads the film from R2 once.
 RECUT_CHUNK = 80
 # Crunch now answers stills with a login page, so :8889 (movie-server login) is tried first.
@@ -541,7 +545,8 @@ def sift_search(movie_id: int, items: list, job_tag: str) -> dict:
 @app.function(image=clip_image, gpu="A10G", cpu=8, memory=16384, timeout=2 * 3600,
               secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")])
 def clip_candidates(movie_id: int, rids: list) -> dict:
-    """Per still, [(time, CLIP score)] for its SIFT_CANDIDATES best distinct moments in the film."""
+    """Per still: "top", [(time, CLIP score)] for its SIFT_CANDIDATES best distinct moments in the
+    film, and "scores", its CLIP score at every sampled moment (float16, CLIP_RATE per second)."""
     import open_clip
     import torch
     from PIL import Image
@@ -588,7 +593,8 @@ def clip_candidates(movie_id: int, rids: list) -> dict:
                 picks.append(int(i))
             if len(picks) == SIFT_CANDIDATES:
                 break
-        out[rid] = [(c / CLIP_RATE, float(scores[j, c])) for c in picks]
+        out[rid] = dict(top=[(c / CLIP_RATE, float(scores[j, c])) for c in picks],
+                        scores=scores[j].astype(np.float16))
     return out
 
 
@@ -748,7 +754,8 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         sift_todo = []
         for rid in targets:
             s, t = picked[rid]
-            if whole_film and report[rid]["flagged"] and rid in window_best and (t is None or s < min_scores[rid]):
+            if (whole_film and duration >= SIFT_FILM_MIN and report[rid]["flagged"] and rid in window_best
+                    and (t is None or s < min_scores[rid])):
                 cands = [wt for _, wt in sorted(window_best[rid], reverse=True)[:SIFT_CANDIDATES]]
                 if hist_frame.get(rid) is not None:
                     cands += [a * hist_frame[rid] / d + b for d, a, b, _ in lines]
@@ -760,7 +767,8 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
                 clip_found = clip_candidates.remote(movie_id, [rid for rid, _ in sift_todo])
             except Exception as ex:
                 report_meta["clip_error"] = str(ex)[:300]
-            sift_todo = [(rid, cands + [t for t, _ in clip_found.get(rid, [])]) for rid, cands in sift_todo]
+            sift_todo = [(rid, cands + [t for t, _ in clip_found[rid]["top"]]) for rid, cands in sift_todo
+                         if rid in clip_found]
             set_progress(job_tag, phase="sift search")
             sift_found = sift_search.remote(movie_id, sift_todo, job_tag)
             report_meta["sift_searched"] = len(sift_todo)
@@ -769,15 +777,23 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
             e = report[rid]
             s, t = picked[rid]
             k, kt = sift_found.get(rid, (0, None))
-            if (t is None or s < min_scores[rid]) and kt is not None and k >= SIFT_FOUND_MIN:
+            clip_at = None
+            if kt is not None and rid in clip_found:
+                sc = clip_found[rid]["scores"]
+                i = int(round(kt * CLIP_RATE))
+                clip_at = float(sc[max(0, i - CLIP_RATE):i + CLIP_RATE + 1].max()) if 0 <= i < len(sc) + CLIP_RATE else None
+            if kt is not None:
+                e["sift_found_clip"] = clip_at
+            if ((t is None or s < min_scores[rid]) and kt is not None and k >= SIFT_FOUND_MIN
+                    and clip_at is not None and clip_at >= CLIP_CONFIRM_MIN):
                 s, t = None, kt
                 e["found_via"] = "sift"
                 e["sift_found_inliers"] = k
                 min_scores[rid] = -1.0
             e["found_score"] = s if t is not None else None
             if t is None or (min_scores[rid] >= 0 and s < min_scores[rid]):
-                if clip_found.get(rid):
-                    e["clip_time"], e["clip_score"] = clip_found[rid][0]
+                if clip_found.get(rid) and clip_found[rid]["top"]:
+                    e["clip_time"], e["clip_score"] = clip_found[rid]["top"][0]
                     e["clip_review"] = e["clip_score"] >= CLIP_REVIEW_MIN
                 if e["flagged"]:
                     e["status"] = "not_found"
