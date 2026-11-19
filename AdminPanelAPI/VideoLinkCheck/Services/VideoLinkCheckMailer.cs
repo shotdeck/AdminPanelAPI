@@ -72,7 +72,7 @@ public sealed class VideoLinkCheckMailer(
     private async Task SendAsync(VideoLinkCheckJob job, Smtp smtp, string recipients, CancellationToken ct)
     {
         var all = await store.GetResultsAsync(job, issuesOnly: false, ct);
-        var issues = all.Where(r => r.Status != "active").ToList();
+        var issues = all.Where(VideoLinkCheckReport.IsIssue).ToList();
         var csvUrl = $"{options.CurrentValue.PublicBaseUrl.TrimEnd('/')}/api/video-link-check/jobs/{job.Id}/results.csv";
 
         using var message = new MailMessage
