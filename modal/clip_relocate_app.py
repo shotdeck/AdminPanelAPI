@@ -779,7 +779,7 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
                 sc = clip_found[rid]["scores"]
                 i = int(round(mt * CLIP_RATE))
                 c = float(sc[max(0, i - CLIP_RATE):i + CLIP_RATE + 1].max()) if 0 <= i < len(sc) + CLIP_RATE else None
-                if c is not None and (clip_at is None or c > clip_at):
+                if c is not None and c > (e.get("sift_found_clip") or -1.0):
                     e["sift_found_clip"] = c
                 if c is not None and c >= CLIP_CONFIRM_MIN:
                     k, kt, clip_at = mk, mt, c
