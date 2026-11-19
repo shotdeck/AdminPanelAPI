@@ -515,20 +515,16 @@ def search_film(movie_id: int, stills: bytes, count: int, duration: float, job_t
 def sift_search_one(path, rid, candidates):
     img = still_image(rid)
     if img is None:
-        return rid, (0, None)
+        return rid, []
     keys = sift_keys(img)
-    best = (0, None)
-    for c in candidates:
-        k = sift_best(keys, path, c - SIFT_SPAN, c + SIFT_SPAN)
-        if k[0] > best[0]:
-            best = k
-    return rid, best
+    found = [sift_best(keys, path, c - SIFT_SPAN, c + SIFT_SPAN) for c in candidates]
+    return rid, sorted((k for k in found if k[1] is not None), reverse=True)
 
 
 @app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")],
               cpu=FILM_DECODE_PROCS, memory=16384, timeout=4 * 3600)
 def sift_search(movie_id: int, items: list, job_tag: str) -> dict:
-    """items: [(rid, [candidate times])]. Returns {rid: (inliers, time)}, the best SIFT match near any candidate."""
+    """items: [(rid, [candidate times])]. Returns {rid: [(inliers, time)]}, the best SIFT match near each candidate, best first."""
     from concurrent.futures import ProcessPoolExecutor
     with tempfile.TemporaryDirectory() as d:
         path = f"{d}/film.mp4"
@@ -536,8 +532,8 @@ def sift_search(movie_id: int, items: list, job_tag: str) -> dict:
             raise RuntimeError(f"Could not download movie {movie_id} from R2 or :8889.")
         out = {}
         with ProcessPoolExecutor(FILM_DECODE_PROCS) as pool:
-            for rid, best in pool.map(sift_search_one, [path] * len(items), *zip(*items)):
-                out[rid] = best
+            for rid, matches in pool.map(sift_search_one, [path] * len(items), *zip(*items)):
+                out[rid] = matches
                 set_progress(job_tag, sift_checked=len(out))
     return out
 
@@ -776,16 +772,19 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
         for rid in targets:
             e = report[rid]
             s, t = picked[rid]
-            k, kt = sift_found.get(rid, (0, None))
-            clip_at = None
-            if kt is not None and rid in clip_found:
+            k, kt, clip_at = 0, None, None
+            for mk, mt in sift_found.get(rid, []):
+                if mk < SIFT_FOUND_MIN or rid not in clip_found:
+                    break
                 sc = clip_found[rid]["scores"]
-                i = int(round(kt * CLIP_RATE))
-                clip_at = float(sc[max(0, i - CLIP_RATE):i + CLIP_RATE + 1].max()) if 0 <= i < len(sc) + CLIP_RATE else None
-            if kt is not None:
-                e["sift_found_clip"] = clip_at
-            if ((t is None or s < min_scores[rid]) and kt is not None and k >= SIFT_FOUND_MIN
-                    and clip_at is not None and clip_at >= CLIP_CONFIRM_MIN):
+                i = int(round(mt * CLIP_RATE))
+                c = float(sc[max(0, i - CLIP_RATE):i + CLIP_RATE + 1].max()) if 0 <= i < len(sc) + CLIP_RATE else None
+                if c is not None and (clip_at is None or c > clip_at):
+                    e["sift_found_clip"] = c
+                if c is not None and c >= CLIP_CONFIRM_MIN:
+                    k, kt, clip_at = mk, mt, c
+                    break
+            if (t is None or s < min_scores[rid]) and kt is not None:
                 s, t = None, kt
                 e["found_via"] = "sift"
                 e["sift_found_inliers"] = k
