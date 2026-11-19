@@ -503,7 +503,7 @@ WHERE NOT EXISTS (SELECT 1 FROM frl.frl_imagehistory WHERE imageid = @i AND note
                 cmd.Parameters.AddWithValue("i", imageId);
                 cmd.Parameters.AddWithValue("action", HistoryAction);
                 cmd.Parameters.AddWithValue("notes",
-                    $"Frame #{frame}, Score: {img.FoundScore?.ToString("F3", CultureInfo.InvariantCulture)}, Relocated: {tag}");
+                    $"Frame #{frame}, Score: {(img.FoundScore ?? img.RecutScore)?.ToString("F3", CultureInfo.InvariantCulture)}, Relocated: {tag}");
                 cmd.Parameters.AddWithValue("like", $"%{tag}");
                 await cmd.ExecuteNonQueryAsync(ct);
             }
