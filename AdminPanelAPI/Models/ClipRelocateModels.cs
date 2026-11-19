@@ -54,6 +54,12 @@ namespace AdminPanelAPI.Models
         [JsonPropertyName("recut_score")] public double? RecutScore { get; set; }
         /// <summary>"drift_fit" when the still was accepted below the normal match score because it sits where the movie's drift line predicts.</summary>
         [JsonPropertyName("found_via")] public string? FoundVia { get; set; }
+        /// <summary>SIFT inliers at found_time when found_via is "sift".</summary>
+        [JsonPropertyName("sift_found_inliers")] public int? SiftFoundInliers { get; set; }
+        /// <summary>For a still not found: CLIP's best time and score in the film, and whether that is worth reviewing.</summary>
+        [JsonPropertyName("clip_time")] public double? ClipTime { get; set; }
+        [JsonPropertyName("clip_score")] public double? ClipScore { get; set; }
+        [JsonPropertyName("clip_review")] public bool? ClipReview { get; set; }
     }
 
     public class ClipRelocateModalResult
