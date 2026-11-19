@@ -100,6 +100,8 @@ public class SshTunnelService : IHostedService, IDisposable
 
         var backoffMs = _configuration.GetValue<int>("SshTunnel:ReconnectDelayMs", 2000);
         var delayMs = backoffMs;
+        var probeIntervalMs = _configuration.GetValue<int>("SshTunnel:HealthProbeIntervalMs", 30_000);
+        var probeFailuresBeforeReconnect = Math.Max(1, _configuration.GetValue<int>("SshTunnel:HealthProbeFailuresBeforeReconnect", 3));
 
         var usingInlineKey = !string.IsNullOrWhiteSpace(_sshPrivateKey);
         _keySource = usingInlineKey ? "SSH_PRIVATE_KEY" : $"file:{sshKeyPath}";
@@ -213,14 +215,42 @@ public class SshTunnelService : IHostedService, IDisposable
                 if (!_tunnelReady.Task.IsCompleted)
                     _tunnelReady.SetResult(); // signal readiness once
 
-                // --- Supervise: stay here until dropped or cancelled ---
+                // --- Supervise: stay here until dropped, wedged or cancelled ---
+                // An SSH session can stay "connected" while the server stops
+                // answering channel opens, so probe the database through the
+                // forward too and rebuild the tunnel after repeated failures.
+                var lastProbe = DateTime.UtcNow;
+                var probeFailures = 0;
                 while (!ct.IsCancellationRequested && _sshClient.IsConnected && _portForward.IsStarted)
                 {
                     await Task.Delay(1000, ct);
+
+                    if (DateTime.UtcNow - lastProbe < TimeSpan.FromMilliseconds(probeIntervalMs))
+                        continue;
+                    lastProbe = DateTime.UtcNow;
+
+                    if (await LocalForwardReachesDatabaseAsync(ct))
+                    {
+                        probeFailures = 0;
+                        continue;
+                    }
+
+                    probeFailures++;
+                    _logger.LogWarning(
+                        "Database unreachable through the SSH tunnel ({Failures}/{Max})",
+                        probeFailures, probeFailuresBeforeReconnect);
+                    if (probeFailures >= probeFailuresBeforeReconnect)
+                    {
+                        RecordError(new TimeoutException(
+                            $"Database unreachable through the tunnel {probeFailures} times in a row; reconnecting"));
+                        break;
+                    }
                 }
 
                 if (!ct.IsCancellationRequested)
                     _logger.LogWarning("SSH tunnel no longer active; reconnecting");
+
+                NpgsqlConnection.ClearAllPools();
             }
             catch (OperationCanceledException)
             {
@@ -262,13 +292,21 @@ public class SshTunnelService : IHostedService, IDisposable
 
         try
         {
-            await using var conn = new NpgsqlConnection(connStr);
+            // Unpooled with short timeouts: a pooled socket can look fine
+            // while new connections through the forward hang.
+            var csb = new NpgsqlConnectionStringBuilder(connStr)
+            {
+                Pooling = false,
+                Timeout = 10,
+                CommandTimeout = 10
+            };
+            await using var conn = new NpgsqlConnection(csb.ConnectionString);
             await conn.OpenAsync(ct);
             await using var cmd = new NpgsqlCommand("SELECT 1;", conn);
             await cmd.ExecuteScalarAsync(ct);
             return true;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             throw;
         }
