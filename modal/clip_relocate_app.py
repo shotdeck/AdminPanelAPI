@@ -58,6 +58,8 @@ CLIP_CENTRE = 4.5
 WINDOW_SECONDS = 30
 # A frame at least this similar to the still is the still.
 MATCH_MIN = 0.9
+# How much a film frame must beat a weak_match clip's own best score to replace it.
+WEAK_MATCH_GAIN = 0.05
 # The best frame may be this far from the centre before a clip is flagged...
 CENTRE_TOLERANCE = 0.5
 # ...unless the centre frame scores within this of it (static shots).
@@ -347,6 +349,8 @@ def check_clip(movie_id: int, rid: str) -> dict:
         m = best_in_clip(still, path)
     if m is None:
         return dict(rid=rid, status="flagged", reason="unreadable_clip")
+    if m["best"] < MATCH_MIN:
+        return dict(rid=rid, status="flagged", reason="weak_match", **m)
     return dict(rid=rid, status="ok" if at_centre(m) else "flagged", reason=None if at_centre(m) else "off_centre", **m)
 
 
@@ -550,7 +554,11 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
             e = report[rid]
             s, t = best.get(rid, (-1.0, None))
             min_scores[rid] = MATCH_MIN
-            if (t is None or s < MATCH_MIN) and hist_frame.get(rid) is not None:
+            # A centred clip flagged only for a weak score is replaced only by a clearly better frame.
+            weak = e.get("reason") == "weak_match"
+            if weak:
+                min_scores[rid] = max(MATCH_MIN, (e.get("best") or 0.0) + WEAK_MATCH_GAIN)
+            if not weak and (t is None or s < MATCH_MIN) and hist_frame.get(rid) is not None:
                 near = [(ws, wt) for d, a, b, slack in lines
                         for ws, wt in window_best.get(rid, [])
                         if abs(wt - (a * hist_frame[rid] / d + b)) <= DRIFT_TOLERANCE and ws >= DRIFT_MATCH_MIN
