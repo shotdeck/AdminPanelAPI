@@ -41,6 +41,12 @@ MOVIE_SERVER = "http://35.89.51.60:8888"
 MOVIE_FILE_URL = "http://35.89.51.60:8889/movie/{movie_id}.mp4"
 FILM_BUCKET = "movies"
 FILM_DECODE_PROCS = 8
+clip_image = image.pip_install("torch", "open_clip_torch", "pillow")
+# CLIP finds a graded still's scene when the pixel match can't: its best moments (sampled at
+# CLIP_RATE fps) are added to SIFT's candidates, and a still SIFT still can't confirm is reported
+# with its CLIP best time for review when that scores at least CLIP_REVIEW_MIN.
+CLIP_RATE = 2
+CLIP_REVIEW_MIN = 0.7
 # Clips per recut_film machine; each machine downloads the film from R2 once.
 RECUT_CHUNK = 80
 # Crunch now answers stills with a login page, so :8889 (movie-server login) is tried first.
@@ -532,6 +538,60 @@ def sift_search(movie_id: int, items: list, job_tag: str) -> dict:
     return out
 
 
+@app.function(image=clip_image, gpu="A10G", cpu=8, memory=16384, timeout=2 * 3600,
+              secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")])
+def clip_candidates(movie_id: int, rids: list) -> dict:
+    """Per still, [(time, CLIP score)] for its SIFT_CANDIDATES best distinct moments in the film."""
+    import open_clip
+    import torch
+    from PIL import Image
+    model, _, pre = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+    model = model.cuda().eval().half()
+
+    def embed(imgs):
+        x = torch.stack([pre(Image.fromarray(cv2.cvtColor(i, cv2.COLOR_BGR2RGB))) for i in imgs]).cuda().half()
+        with torch.no_grad():
+            return torch.nn.functional.normalize(model.encode_image(x).float(), dim=-1).cpu().numpy()
+
+    stills = {rid: still_image(rid) for rid in rids}
+    rids = [r for r in rids if stills[r] is not None]
+    if not rids:
+        return {}
+    w, h = 320, 180
+    frames = []
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/film.mp4"
+        if not download_film(movie_id, path):
+            raise RuntimeError(f"Could not download movie {movie_id} from R2 or :8889.")
+        p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", path, "-vf", f"fps={CLIP_RATE},scale={w}:{h}",
+                              "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], stdout=subprocess.PIPE)
+        batch = []
+        while True:
+            b = p.stdout.read(w * h * 3)
+            if len(b) < w * h * 3:
+                break
+            batch.append(np.frombuffer(b, np.uint8).reshape(h, w, 3))
+            if len(batch) == 256:
+                frames.append(embed(batch))
+                batch = []
+        if batch:
+            frames.append(embed(batch))
+        p.wait()
+    if not frames:
+        return {}
+    scores = embed([stills[r] for r in rids]) @ np.concatenate(frames).T
+    out = {}
+    for j, rid in enumerate(rids):
+        picks = []
+        for i in np.argsort(-scores[j]):
+            if all(abs(int(i) - c) > 2 * CLIP_RATE for c in picks):
+                picks.append(int(i))
+            if len(picks) == SIFT_CANDIDATES:
+                break
+        out[rid] = [(c / CLIP_RATE, float(scores[j, c])) for c in picks]
+    return out
+
+
 @app.function(image=image, secrets=[modal.Secret.from_name("r2-credentials"), modal.Secret.from_name("movie-server")], timeout=600)
 def probe_film(movie_id: int) -> dict:
     """Duration and fps of the R2 copy at movies/{id}/{id}.mp4, read with ffprobe over a signed URL."""
@@ -693,9 +753,15 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
                 if hist_frame.get(rid) is not None:
                     cands += [a * hist_frame[rid] / d + b for d, a, b, _ in lines]
                 sift_todo.append((rid, [c for c in cands if c is not None and 0 <= c <= duration + 60]))
-        sift_found = {}
+        sift_found, clip_found = {}, {}
         if sift_todo:
-            set_progress(job_tag, phase="sift search", sift_total=len(sift_todo), sift_checked=0)
+            set_progress(job_tag, phase="clip search", sift_total=len(sift_todo), sift_checked=0)
+            try:
+                clip_found = clip_candidates.remote(movie_id, [rid for rid, _ in sift_todo])
+            except Exception as ex:
+                report_meta["clip_error"] = str(ex)[:300]
+            sift_todo = [(rid, cands + [t for t, _ in clip_found.get(rid, [])]) for rid, cands in sift_todo]
+            set_progress(job_tag, phase="sift search")
             sift_found = sift_search.remote(movie_id, sift_todo, job_tag)
             report_meta["sift_searched"] = len(sift_todo)
 
@@ -710,6 +776,9 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
                 min_scores[rid] = -1.0
             e["found_score"] = s if t is not None else None
             if t is None or (s < min_scores[rid] and min_scores[rid] >= 0):
+                if clip_found.get(rid):
+                    e["clip_time"], e["clip_score"] = clip_found[rid][0]
+                    e["clip_review"] = e["clip_score"] >= CLIP_REVIEW_MIN
                 if e["flagged"]:
                     e["status"] = "not_found"
                 else:
