@@ -770,12 +770,12 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
             s, t = picked[rid]
             k, kt = sift_found.get(rid, (0, None))
             if (t is None or s < min_scores[rid]) and kt is not None and k >= SIFT_FOUND_MIN:
-                s, t = s, kt
+                s, t = None, kt
                 e["found_via"] = "sift"
                 e["sift_found_inliers"] = k
                 min_scores[rid] = -1.0
             e["found_score"] = s if t is not None else None
-            if t is None or (s < min_scores[rid] and min_scores[rid] >= 0):
+            if t is None or (min_scores[rid] >= 0 and s < min_scores[rid]):
                 if clip_found.get(rid):
                     e["clip_time"], e["clip_score"] = clip_found[rid][0]
                     e["clip_review"] = e["clip_score"] >= CLIP_REVIEW_MIN
