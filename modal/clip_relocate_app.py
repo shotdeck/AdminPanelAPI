@@ -50,6 +50,9 @@ CLIP_REVIEW_MIN = 0.7
 # A SIFT find must also look like the still to CLIP (best within 1s of it): SIFT alone can match a
 # still to a film leader or title card. Films shorter than SIFT_FILM_MIN (stubs) get neither search.
 CLIP_CONFIRM_MIN = 0.55
+# A flagged still that neither the pixel match nor SIFT can place is recut at CLIP's best moment
+# when it scores at least this. It may be a second or two off within the scene, so it is not verified.
+CLIP_RECUT_MIN = 0.75
 SIFT_FILM_MIN = 600
 # Clips per recut_film machine; each machine downloads the film from R2 once.
 RECUT_CHUNK = 80
@@ -351,7 +354,7 @@ with image.imports():
 
     def recut_from(movie_id, rid, img, src, found_t, apply, backup_prefix, min_score, out, src_offset=0.0):
         """Cut the 9s clip centred on found_t from src (which starts at src_offset), verify, upload.
-        A negative min_score (a still found by SIFT) is verified with SIFT instead of the pixel match."""
+        A min_score of -1 (a still found by SIFT) is verified with SIFT instead of the pixel match; -2 (CLIP) is not verified."""
         start = max(0.0, found_t - CLIP_CENTRE - src_offset)
         subprocess.run([
             "ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-i", src, "-t", f"{CLIP_SECONDS:g}",
@@ -361,7 +364,9 @@ with image.imports():
         # A still in the film's first 4.5s sits before the centre of its clip.
         expected = found_t - src_offset - start
         m = best_in_clip(feature(img), out, expected=expected)
-        if m is not None and min_score < 0:
+        if m is not None and min_score <= -2:
+            pass
+        elif m is not None and min_score < 0:
             m.update(sift_at_centre(sift_keys(img), out, expected))
             if not m["sift_ok"]:
                 return dict(rid=rid, status="failed", reason="verify_failed", **m)
@@ -793,6 +798,13 @@ def relocate_movie(movie_id: int, images: list, fps: float, apply: bool, job_tag
                 e["found_via"] = "sift"
                 e["sift_found_inliers"] = k
                 min_scores[rid] = -1.0
+            top = clip_found[rid]["top"] if clip_found.get(rid) else []
+            if (e["flagged"] and top and top[0][1] >= CLIP_RECUT_MIN
+                    and (t is None or (min_scores[rid] >= 0 and s < min_scores[rid]))):
+                s, t = None, top[0][0]
+                e["found_via"] = "clip"
+                e["clip_time"], e["clip_score"] = top[0]
+                min_scores[rid] = -2.0
             e["found_score"] = s if t is not None else None
             if t is None or (min_scores[rid] >= 0 and s < min_scores[rid]):
                 if clip_found.get(rid) and clip_found[rid]["top"]:
