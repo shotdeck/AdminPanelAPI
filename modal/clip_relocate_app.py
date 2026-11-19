@@ -347,6 +347,8 @@ def check_clip(movie_id: int, rid: str) -> dict:
         m = best_in_clip(still, path)
     if m is None:
         return dict(rid=rid, status="flagged", reason="unreadable_clip")
+    if m["best"] < MATCH_MIN:
+        return dict(rid=rid, status="flagged", reason="weak_match", **m)
     return dict(rid=rid, status="ok" if at_centre(m) else "flagged", reason=None if at_centre(m) else "off_centre", **m)
 
 
