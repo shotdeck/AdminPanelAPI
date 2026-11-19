@@ -68,8 +68,40 @@ public class VideoLinkCheckTests
             new LinkCheckResult(7, "Say \"Hi\", Bye", "music video", "https://youtu.be/x", "youtube", "x", "unavailable", at, "oembed 404", "active"),
         });
         var lines = csv.Split("\r\n");
-        Assert.Equal("id,title,media_type,url,platform,video_id,status,checked_at_iso,note,previous_status", lines[0]);
-        Assert.Equal("7,\"Say \"\"Hi\"\", Bye\",music video,https://youtu.be/x,youtube,x,unavailable,2026-11-12T10:00:00.0000000Z,oembed 404,active", lines[1]);
+        Assert.Equal("id,title,media_type,url,platform,video_id,status,checked_at_iso,note,previous_status,site_embed_issue", lines[0]);
+        Assert.Equal("7,\"Say \"\"Hi\"\", Bye\",music video,https://youtu.be/x,youtube,x,unavailable,2026-11-12T10:00:00.0000000Z,oembed 404,active,", lines[1]);
+    }
+
+    [Theory]
+    [InlineData("https://vimeo.com/305495226")]
+    [InlineData("https://vimeo.com/showcase/8872348/video/305495226")]
+    [InlineData("https://vimeo.com/1087852317?activityReferer=1")]
+    [InlineData("https://player.vimeo.com/video/880468217?h=c983fbb771")]
+    [InlineData("https://www.youtube.com/watch?v=MS91knuzoOA&rco=1&ab_channel=PearljamVEVO")]
+    [InlineData("https://youtu.be/dQw4w9WgXcQ")]
+    [InlineData("https://youtu.be/dQw4w9WgXcQ?si=abc")]
+    [InlineData("https://youtube.com/shorts/dQw4w9WgXcQ")]
+    [InlineData("https://www.dailymotion.com/video/x7")]
+    public void SiteEmbed_MatchesChecker(string url) => Assert.Null(SiteEmbed.Problem(url));
+
+    [Theory]
+    [InlineData("https://vimeo.com/882661335/03dc74d2f5", "site embeds https://player.vimeo.com/video/03dc74d2f5 (wrong id)")]
+    [InlineData("https://vimeo.com/829232989/9218dc744f?turnstile=0.abc", "site embeds https://player.vimeo.com/video/9218dc744f?turnstile=0.abc (wrong id)")]
+    [InlineData("https://vimeo.com/305495226/", "site embeds https://player.vimeo.com/video/ (wrong id)")]
+    [InlineData("dQw4w9WgXcQ", "site shows no video for this link")]
+    [InlineData("https://www.youtube.com/live/dQw4w9WgXcQ", "site shows no video for this link")]
+    public void SiteEmbed_FlagsBrokenEmbeds(string url, string problem) => Assert.Equal(problem, SiteEmbed.Problem(url));
+
+    [Fact]
+    public void IssuesInclude_ActiveLinksBrokenOnSite()
+    {
+        var at = DateTime.UtcNow;
+        var broken = new LinkCheckResult(1, "a", "music video", "https://vimeo.com/882661335/03dc74d2f5", "vimeo", "882661335", "active", at, null);
+        var fine = broken with { Url = "https://vimeo.com/305495226", VideoId = "305495226" };
+        Assert.True(VideoLinkCheckReport.IsIssue(broken));
+        Assert.False(VideoLinkCheckReport.IsIssue(fine));
+        Assert.True(VideoLinkCheckReport.IsIssue(fine with { Status = "unavailable" }));
+        Assert.Null(VideoLinkCheckReport.SiteEmbedIssue(broken with { Status = "unavailable" }));
     }
 
     [Fact]

@@ -5,11 +5,11 @@ using AdminPanelAPI.VideoLinkCheck.Models;
 
 namespace AdminPanelAPI.VideoLinkCheck.Services;
 
-/// <summary>The link-check CSV (same columns as the console checker, plus previous_status) and email text.</summary>
+/// <summary>The link-check CSV (same columns as the console checker, plus previous_status and site_embed_issue) and email text.</summary>
 public static class VideoLinkCheckReport
 {
     public static readonly string[] Header =
-        { "id", "title", "media_type", "url", "platform", "video_id", "status", "checked_at_iso", "note", "previous_status" };
+        { "id", "title", "media_type", "url", "platform", "video_id", "status", "checked_at_iso", "note", "previous_status", "site_embed_issue" };
 
     public static string FileName(VideoLinkCheckJob job, bool issuesOnly) =>
         $"video-links-{job.Id}-{(job.FinishedAt ?? job.CreatedAt):yyyy-MM-dd}-{(issuesOnly ? "issues" : "all")}.csv";
@@ -23,7 +23,7 @@ public static class VideoLinkCheckReport
             {
                 r.MovieId.ToString(CultureInfo.InvariantCulture), r.Title, r.MediaType, r.Url, r.Platform, r.VideoId,
                 r.Status, DateTime.SpecifyKind(r.CheckedAt, DateTimeKind.Utc).ToString("o", CultureInfo.InvariantCulture),
-                r.Note ?? "", r.PreviousStatus ?? "",
+                r.Note ?? "", r.PreviousStatus ?? "", SiteEmbedIssue(r) ?? "",
             });
         return sb.ToString();
     }
@@ -40,6 +40,12 @@ public static class VideoLinkCheckReport
 
     public static string Escape(string value) =>
         value.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0 ? "\"" + value.Replace("\"", "\"\"") + "\"" : value;
+
+    /// <summary>Live on YouTube/Vimeo, but the website's embed of this link won't play it.</summary>
+    public static string? SiteEmbedIssue(LinkCheckResult r) => r.Status == "active" ? SiteEmbed.Problem(r.Url) : null;
+
+    /// <summary>Rows for the issues CSV: not active, or active but broken on the site.</summary>
+    public static bool IsIssue(LinkCheckResult r) => r.Status != "active" || SiteEmbedIssue(r) != null;
 
     /// <summary>Unavailable now, active in the previous check.</summary>
     public static bool IsNewlyUnavailable(LinkCheckResult r) => r.Status == "unavailable" && r.PreviousStatus == "active";
@@ -65,6 +71,9 @@ public static class VideoLinkCheckReport
         sb.AppendLine($"Unknown platform: {job.UnknownPlatform:N0}");
         sb.AppendLine($"Errors:           {job.Errors:N0}");
 
+        var siteBroken = issues.Where(r => SiteEmbedIssue(r) != null).ToList();
+        sb.AppendLine($"Active but broken on the site: {siteBroken.Count:N0}");
+
         var newly = issues.Where(IsNewlyUnavailable).ToList();
         if (newly.Count > 0)
         {
@@ -74,8 +83,16 @@ public static class VideoLinkCheckReport
                 sb.AppendLine($"  {r.MovieId}  {r.Title} [{r.MediaType}]  {r.Url}  ({r.Note})");
         }
 
+        if (siteBroken.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"Active, but the site's embed won't play them{(siteBroken.Count > maxListed ? $" (first {maxListed} of {siteBroken.Count:N0})" : "")}:");
+            foreach (var r in siteBroken.Take(maxListed))
+                sb.AppendLine($"  {r.MovieId}  {r.Title} [{r.MediaType}]  {r.Url}  ({SiteEmbedIssue(r)})");
+        }
+
         sb.AppendLine();
-        sb.AppendLine("Attached: every link that isn't active, and the full list.");
+        sb.AppendLine("Attached: every link that isn't active or is broken on the site, and the full list.");
         sb.AppendLine($"Full CSV: {csvUrl}");
         return sb.ToString();
     }

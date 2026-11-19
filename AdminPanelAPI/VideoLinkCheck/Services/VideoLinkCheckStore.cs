@@ -350,7 +350,7 @@ WHERE j.id = @id AND j.claimed_by = @me AND j.status = 'running' RETURNING j.id"
 SELECT r.movie_id, r.title, r.media_type, r.url, r.platform, r.video_id, r.status, r.checked_at, r.note, pr.status
 FROM {Results} r
 LEFT JOIN {Results} pr ON pr.job_id = @prev AND pr.movie_id = r.movie_id
-WHERE r.job_id = @id{(issuesOnly ? " AND r.status <> 'active'" : "")}
+WHERE r.job_id = @id
 ORDER BY r.movie_id", conn) { CommandTimeout = Math.Max(30, _options.CurrentValue.DbTimeoutSeconds) };
         cmd.Parameters.AddWithValue("id", job.Id);
         cmd.Parameters.Add(new NpgsqlParameter("prev", NpgsqlDbType.Bigint) { Value = (object?)job.PreviousJobId ?? DBNull.Value });
@@ -360,7 +360,7 @@ ORDER BY r.movie_id", conn) { CommandTimeout = Math.Max(30, _options.CurrentValu
             list.Add(new LinkCheckResult(r.GetInt64(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4),
                 r.GetString(5), r.GetString(6), r.GetDateTime(7), r.IsDBNull(8) ? null : r.GetString(8),
                 r.IsDBNull(9) ? null : r.GetString(9)));
-        return list;
+        return issuesOnly ? list.Where(VideoLinkCheckReport.IsIssue).ToList() : list;
     }
 
     public async Task SetEmailStatusAsync(long id, string status, CancellationToken ct)

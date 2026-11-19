@@ -54,7 +54,7 @@ public sealed class VideoLinkCheckController(
         return job == null ? NotFound() : job;
     }
 
-    /// <summary>The job's results as CSV (all movies, or only links that aren't active).</summary>
+    /// <summary>The job's results as CSV (all movies, or only links that aren't active or are broken on the site).</summary>
     [HttpGet("jobs/{id:long}/results.csv")]
     public async Task<IActionResult> ResultsCsv(long id, [FromQuery] bool issuesOnly = false, CancellationToken ct = default)
     {
