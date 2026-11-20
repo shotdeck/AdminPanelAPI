@@ -43,7 +43,7 @@ public interface IMovieProcessingJobRepository
 
     Task<List<string>> GetBoundaryFilenamesAsync(int movieId, CancellationToken cancellationToken);
 
-    Task<List<string>> GetLiveImageFilenamesAsync(int movieId, CancellationToken cancellationToken);
+    Task<List<string>> GetClipImageFilenamesAsync(int movieId, CancellationToken cancellationToken);
 
     Task<List<ClipPreviewBoundary>> GetSceneBoundariesAsync(int movieId, CancellationToken cancellationToken);
 
@@ -68,6 +68,15 @@ public interface IMovieProcessingJobRepository
 public class MovieProcessingJobRepository : IMovieProcessingJobRepository
 {
     /// <summary>Limits preview candidates to images a Motion filter can select.</summary>
+    // Images that get clips: live ones, plus non-deleted ones in a title being prepared
+    // (listed content_status, and a drop date or content_priority 0, but not both).
+    public const string ClipEligibleImage = @"(i.status = 'live' OR (i.status <> 'deleted' AND EXISTS (
+    SELECT 1 FROM frl.frl_movies cm
+    WHERE cm.idnum = i.movieid
+      AND cm.status = 'live'
+      AND cm.content_status IN ('Upload Untagged', 'Uploaded Untagged', 'Tagging In Progress', 'Tagging Complete', 'Ready to Drop', 'Complete Live')
+      AND (cm.drop_date IS NOT NULL) <> COALESCE(cm.content_priority = 0, false))))";
+
     private const string MotionTagPredicate = @"
   AND EXISTS (
         SELECT 1
@@ -148,13 +157,13 @@ WHERE id = @id;";
         if (limit <= 0)
             return new List<int>();
 
-        const string sql = @"
+        const string sql = $@"
 SELECT DISTINCT i.movieid
 FROM frl.frl_images i
 JOIN frl.frl_imagehistory h
   ON h.imageid = i.idnum
  AND h.action = 'Shot Time Autodetected'
-WHERE i.status = 'live'
+WHERE {ClipEligibleImage}
   AND i.movieid IS NOT NULL
   AND i.movieid > 0
   AND i.randid IS NOT NULL
@@ -207,13 +216,13 @@ LIMIT @limit;";
         if (limit <= 0)
             return new List<int>();
 
-        const string sql = @"
+        const string sql = $@"
 SELECT DISTINCT i.movieid
 FROM frl.frl_images i
 JOIN frl.frl_imagehistory h
   ON h.imageid = i.idnum
  AND h.action = 'Shot Time Autodetected'
-WHERE i.status = 'live'
+WHERE {ClipEligibleImage}
   AND i.movieid IS NOT NULL
   AND i.movieid > 0
   AND i.randid IS NOT NULL
@@ -268,14 +277,14 @@ LIMIT @limit;";
     int limit,
     CancellationToken cancellationToken)
     {
-        const string sql = @"
+        const string sql = $@"
 WITH clips AS (
     SELECT DISTINCT i.movieid, i.randid
     FROM frl.frl_images i
     JOIN frl.frl_imagehistory h
       ON h.imageid = i.idnum
      AND h.action = 'Shot Time Autodetected'
-    WHERE i.status = 'live'
+    WHERE {ClipEligibleImage}
       AND i.movieid IS NOT NULL
       AND i.movieid > 0
       AND i.randid IS NOT NULL
@@ -349,15 +358,15 @@ WHERE movieid = @movieid
         return await ReadFilenamesAsync(sql, movieId, cancellationToken);
     }
 
-    public async Task<List<string>> GetLiveImageFilenamesAsync(
+    public async Task<List<string>> GetClipImageFilenamesAsync(
     int movieId,
     CancellationToken cancellationToken)
     {
-        const string sql = @"
+        const string sql = $@"
 SELECT DISTINCT i.randid
 FROM frl.frl_images i
 WHERE i.movieid = @movieid
-  AND i.status = 'live'
+  AND {ClipEligibleImage}
   AND i.randid IS NOT NULL;";
 
         return await ReadFilenamesAsync(sql, movieId, cancellationToken);
@@ -417,7 +426,7 @@ JOIN frl.frl_image_scene_boundaries sb
   ON sb.movieid = i.movieid
  AND sb.filename = i.randid
 WHERE i.idnum > @after_idnum
-  AND i.status = 'live'
+  AND {ClipEligibleImage}
   AND sb.start_time IS NOT NULL
   AND sb.end_time IS NOT NULL
   AND sb.end_time > sb.start_time
@@ -467,7 +476,7 @@ FROM frl.frl_images i
 JOIN frl.frl_image_scene_boundaries sb
   ON sb.movieid = i.movieid
  AND sb.filename = i.randid
-WHERE i.status = 'live'
+WHERE {ClipEligibleImage}
   AND sb.start_time IS NOT NULL
   AND sb.end_time IS NOT NULL
   AND sb.end_time > sb.start_time
