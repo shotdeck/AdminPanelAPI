@@ -68,9 +68,9 @@ public interface IMovieProcessingJobRepository
 public class MovieProcessingJobRepository : IMovieProcessingJobRepository
 {
     /// <summary>Limits preview candidates to images a Motion filter can select.</summary>
-    // Images that get clips: live ones, plus non-deleted ones in a title being prepared
+    // Images that get clips: live ones, plus tagging ones in a title being prepared
     // (listed content_status, and a drop date or content_priority 0).
-    public const string ClipEligibleImage = @"(i.status = 'live' OR (i.status <> 'deleted' AND EXISTS (
+    public const string ClipEligibleImage = @"(i.status = 'live' OR (i.status IN ('tagging in progress', 'tagging complete') AND EXISTS (
     SELECT 1 FROM frl.frl_movies cm
     WHERE cm.idnum = i.movieid
       AND cm.status = 'live'
