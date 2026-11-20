@@ -228,7 +228,7 @@ SELECT i.idnum, split_part(i.filename, '.', 1),
         WHERE h.imageid = i.idnum AND h.action = @action AND h.notes ~ 'Frame #[0-9]+'
         ORDER BY h.timestamp DESC NULLS LAST, h.idnum DESC LIMIT 1)
 FROM frl.frl_images i
-WHERE i.movieid = @m AND i.status::text = 'live'
+WHERE i.movieid = @m AND " + MovieProcessingJobRepository.ClipEligibleImage + @"
 ORDER BY i.idnum", conn))
             {
                 cmd.Parameters.AddWithValue("m", movieId);

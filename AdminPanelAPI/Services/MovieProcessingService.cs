@@ -290,7 +290,7 @@ namespace AdminPanelAPI.Services
         {
             var clipFiles = await ListClipFilesFromR2Async(movieId, cancellationToken);
             var boundaries = await _repo.GetBoundaryFilenamesAsync(movieId, cancellationToken);
-            var images = await _repo.GetLiveImageFilenamesAsync(movieId, cancellationToken);
+            var images = await _repo.GetClipImageFilenamesAsync(movieId, cancellationToken);
 
             var clipSet = new HashSet<string>(clipFiles, StringComparer.OrdinalIgnoreCase);
             var boundarySet = new HashSet<string>(boundaries, StringComparer.OrdinalIgnoreCase);
@@ -317,7 +317,7 @@ namespace AdminPanelAPI.Services
             List<string> clipFiles,
             CancellationToken cancellationToken)
         {
-            var images = await _repo.GetLiveImageFilenamesAsync(movieId, cancellationToken);
+            var images = await _repo.GetClipImageFilenamesAsync(movieId, cancellationToken);
             var clipSet = new HashSet<string>(clipFiles, StringComparer.OrdinalIgnoreCase);
 
             return images.Any(f => !clipSet.Contains(f));
