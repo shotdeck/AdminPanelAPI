@@ -69,13 +69,13 @@ public class MovieProcessingJobRepository : IMovieProcessingJobRepository
 {
     /// <summary>Limits preview candidates to images a Motion filter can select.</summary>
     // Images that get clips: live ones, plus non-deleted ones in a title being prepared
-    // (listed content_status, and a drop date or content_priority 0, but not both).
+    // (listed content_status, and a drop date or content_priority 0).
     public const string ClipEligibleImage = @"(i.status = 'live' OR (i.status <> 'deleted' AND EXISTS (
     SELECT 1 FROM frl.frl_movies cm
     WHERE cm.idnum = i.movieid
       AND cm.status = 'live'
       AND cm.content_status IN ('Upload Untagged', 'Uploaded Untagged', 'Tagging In Progress', 'Tagging Complete', 'Ready to Drop', 'Complete Live')
-      AND (cm.drop_date IS NOT NULL) <> COALESCE(cm.content_priority = 0, false))))";
+      AND (cm.drop_date IS NOT NULL OR cm.content_priority = 0))))";
 
     private const string MotionTagPredicate = @"
   AND EXISTS (
