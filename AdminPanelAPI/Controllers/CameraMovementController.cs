@@ -59,7 +59,7 @@ namespace ShotDeckSearch.Controllers
 
             await EnsureOpenAsync(ct);
 
-            const string sql = @"
+            const string sql = $@"
 SELECT i.idnum,
        i.movieid,
        i.randid,
@@ -70,7 +70,7 @@ SELECT i.idnum,
 FROM frl.frl_images i
 INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid
-WHERE i.status = 'live'
+WHERE {MovieProcessingJobRepository.ClipEligibleImage}
   AND NOT EXISTS (
       SELECT 1 FROM frl.frl_join_images_camera_movements cm
       WHERE cm.imageid = i.idnum
@@ -646,7 +646,7 @@ FROM frl.frl_camera_movement_failures;";
             await EnsureOpenAsync(ct);
 
             // 1. Get images for this movie that need analysis
-            const string queueSql = @"
+            const string queueSql = $@"
 SELECT i.idnum,
        i.movieid,
        i.randid,
@@ -655,7 +655,7 @@ SELECT i.idnum,
 FROM frl.frl_images i
 INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid
-WHERE i.status = 'live'
+WHERE {MovieProcessingJobRepository.ClipEligibleImage}
   AND i.movieid = @movieId
   AND NOT EXISTS (
       SELECT 1 FROM frl.frl_join_images_camera_movements cm
@@ -1442,7 +1442,7 @@ CROSS JOIN LATERAL (
         FROM frl.frl_images i
         INNER JOIN frl.frl_image_scene_boundaries sb
             ON sb.movieid = i.movieid AND sb.filename = i.randid
-        WHERE i.movieid = mt.idnum AND i.status = 'live'
+        WHERE i.movieid = mt.idnum AND {MovieProcessingJobRepository.ClipEligibleImage}
     ) x
 ) c
 WHERE c.total > 0

@@ -284,7 +284,7 @@ WITH candidates AS (
     INNER JOIN frl.frl_image_scene_boundaries sb
         ON sb.movieid = i.movieid AND sb.filename = i.randid
     LEFT JOIN frl.frl_movies m ON m.idnum = i.movieid
-    WHERE i.status = 'live'
+    WHERE {MovieProcessingJobRepository.ClipEligibleImage}
       AND NOT EXISTS (
           SELECT 1 FROM frl.frl_join_images_camera_movements cm
           WHERE cm.imageid = i.idnum)
@@ -355,7 +355,7 @@ DELETE FROM frl.frl_camera_movement_claims WHERE imageid = ANY(@ids);";
         public const string MovieJobActiveSql = "status IN ('queued', 'running')";
 
         /// <summary>
-        /// Live images of a title that still need analysing (have a clip, not
+        /// Clip-eligible images of a title that still need analysing (have a clip, not
         /// yet analysed, not parked after repeated failures).
         /// </summary>
         public async Task<int> CountMovieRemainingAsync(int movieId, CancellationToken ct)
@@ -366,7 +366,7 @@ FROM frl.frl_images i
 INNER JOIN frl.frl_image_scene_boundaries sb
     ON sb.movieid = i.movieid AND sb.filename = i.randid
 WHERE i.movieid = @movieId
-  AND i.status = 'live'
+  AND {MovieProcessingJobRepository.ClipEligibleImage}
   AND NOT EXISTS (
       SELECT 1 FROM frl.frl_join_images_camera_movements cm
       WHERE cm.imageid = i.idnum)
@@ -386,12 +386,12 @@ WHERE i.movieid = @movieId
         /// </summary>
         public async Task<int> AssignAnalyzedMovieImagesAsync(int movieId, string owner, CancellationToken ct)
         {
-            const string sql = @"
+            const string sql = $@"
 WITH unowned AS (
     SELECT i.idnum AS imageid
     FROM frl.frl_images i
     WHERE i.movieid = @movieId
-      AND i.status = 'live'
+      AND {MovieProcessingJobRepository.ClipEligibleImage}
       AND EXISTS (
           SELECT 1 FROM frl.frl_join_images_camera_movements cm
           WHERE cm.imageid = i.idnum)
