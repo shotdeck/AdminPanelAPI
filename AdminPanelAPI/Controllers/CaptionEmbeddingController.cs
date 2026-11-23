@@ -1,3 +1,4 @@
+using AdminPanelAPI.Services;
 using Microsoft.AspNetCore.Mvc;
 
 namespace AdminPanelAPI.Controllers
@@ -34,6 +35,7 @@ namespace AdminPanelAPI.Controllers
         }
 
         [HttpPost("start-batch")]
+        [RequiresBackgroundWorkers]
         public async Task<IActionResult> StartBatch(
             [FromQuery] int batchSize = 50,
             CancellationToken cancellationToken = default)
@@ -54,6 +56,7 @@ namespace AdminPanelAPI.Controllers
         }
 
         [HttpPost("process-all")]
+        [RequiresBackgroundWorkers]
         public async Task<IActionResult> ProcessAll(
             [FromQuery] int concurrency = 20,
             [FromQuery] bool skipCaption = false,

@@ -1,3 +1,6 @@
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Filters;
+
 namespace AdminPanelAPI.Services
 {
     /// <summary>
@@ -18,6 +21,26 @@ namespace AdminPanelAPI.Services
             if (Enabled(configuration))
                 services.AddHostedService<T>();
             return services;
+        }
+    }
+
+    /// <summary>
+    /// For endpoints that hand a job to an in-process queue: on a slot without
+    /// workers nothing would ever pick it up, so refuse before touching any data.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Method | AttributeTargets.Class)]
+    public sealed class RequiresBackgroundWorkersAttribute : ActionFilterAttribute
+    {
+        public override void OnActionExecuting(ActionExecutingContext context)
+        {
+            var configuration = context.HttpContext.RequestServices.GetRequiredService<IConfiguration>();
+            if (BackgroundWorkers.Enabled(configuration)) return;
+
+            context.Result = new ObjectResult(new
+            {
+                error = "Background workers are disabled on this instance; submit jobs to the production API."
+            })
+            { StatusCode = StatusCodes.Status503ServiceUnavailable };
         }
     }
 }

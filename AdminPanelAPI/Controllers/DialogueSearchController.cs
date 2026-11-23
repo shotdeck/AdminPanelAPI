@@ -1,3 +1,4 @@
+using AdminPanelAPI.Services;
 using AdminPanelAPI.Models;
 using Amazon.Runtime;
 using Amazon.S3;
@@ -58,6 +59,7 @@ namespace AdminPanelAPI.Controllers
         /// Upload an MP4 file to R2 and queue it for dialogue transcription.
         /// </summary>
         [HttpPost("upload/{movieId:int}")]
+        [RequiresBackgroundWorkers]
         [RequestSizeLimit(MaxUploadSizeBytes)]
         [RequestFormLimits(MultipartBodyLengthLimit = MaxUploadSizeBytes)]
         public async Task<IActionResult> UploadAndTranscribe(
@@ -77,6 +79,7 @@ namespace AdminPanelAPI.Controllers
         /// which is looked up in frl_movies (title + year) to find the idnum.
         /// </summary>
         [HttpPost("upload")]
+        [RequiresBackgroundWorkers]
         [RequestSizeLimit(MaxUploadSizeBytes)]
         [RequestFormLimits(MultipartBodyLengthLimit = MaxUploadSizeBytes)]
         public async Task<IActionResult> UploadAndTranscribeByFileName(
@@ -211,6 +214,7 @@ namespace AdminPanelAPI.Controllers
         /// Queue a single movie for dialogue transcription.
         /// </summary>
         [HttpPost("transcribe/{movieId:int}")]
+        [RequiresBackgroundWorkers]
         public async Task<IActionResult> TranscribeMovie(
             int movieId,
             [FromQuery] string? r2Key = null,
@@ -243,6 +247,7 @@ namespace AdminPanelAPI.Controllers
         /// Queue a batch of untranscribed movies for dialogue transcription.
         /// </summary>
         [HttpPost("transcribe-batch")]
+        [RequiresBackgroundWorkers]
         public async Task<IActionResult> TranscribeBatch(
             [FromQuery] int count = 50,
             CancellationToken cancellationToken = default)
@@ -381,6 +386,7 @@ namespace AdminPanelAPI.Controllers
         /// if it already has words). Reuses the transcription job pipeline.
         /// </summary>
         [HttpPost("segment/{movieId:int}")]
+        [RequiresBackgroundWorkers]
         public async Task<IActionResult> SegmentMovie(
             int movieId,
             [FromQuery] string? r2Key = null,
@@ -406,6 +412,7 @@ namespace AdminPanelAPI.Controllers
         /// their existing mapping first) — used to repair bad segment offsets.
         /// </summary>
         [HttpPost("segment-batch")]
+        [RequiresBackgroundWorkers]
         public async Task<IActionResult> SegmentBatch(
             [FromQuery] int count = 25,
             [FromQuery] bool force = false,
