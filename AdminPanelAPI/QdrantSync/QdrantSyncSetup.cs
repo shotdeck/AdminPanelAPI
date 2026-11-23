@@ -1,3 +1,4 @@
+using AdminPanelAPI.Services;
 using AdminPanelAPI.QdrantSync.Models;
 using AdminPanelAPI.QdrantSync.Services;
 using Microsoft.Extensions.Options;
@@ -23,6 +24,6 @@ public static class QdrantSyncSetup
         services.AddSingleton<QdrantSyncStore>();
         services.AddSingleton<QdrantSyncRunner>();
         services.AddSingleton<QdrantSyncMailer>();
-        services.AddHostedService<QdrantSyncWorker>();
+        services.AddBackgroundWorker<QdrantSyncWorker>(builder.Configuration);
     }
 }

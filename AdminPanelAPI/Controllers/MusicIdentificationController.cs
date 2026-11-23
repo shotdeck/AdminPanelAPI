@@ -65,6 +65,7 @@ namespace AdminPanelAPI.Controllers
         /// is resolved from the movies bucket by convention (movies/{movieId}/*.mp4).
         /// </summary>
         [HttpPost("identify/{movieId:int}")]
+        [RequiresBackgroundWorkers]
         public async Task<IActionResult> IdentifyMovie(
             int movieId,
             [FromQuery] string? r2Key = null,

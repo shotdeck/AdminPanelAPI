@@ -74,29 +74,32 @@ builder.Services.AddScoped<IClipPreviewService, ClipPreviewService>();
 // Singleton so one start call can keep cutting previews in the background while
 // the status endpoint reports on it.
 builder.Services.AddSingleton<IClipPreviewMotionRunner, ClipPreviewMotionRunner>();
-builder.Services.AddHostedService<ClipPreviewRunResumeService>();
+builder.Services.AddBackgroundWorker<ClipPreviewRunResumeService>(builder.Configuration);
 
 builder.Services.AddScoped<IMovieProcessingService, MovieProcessingService>();
 
-builder.Services.AddSingleton<MovieWorkerDiagnostics>();
-builder.Services.AddHostedService<MovieProcessingWorker>();
+builder.Services.AddSingleton(new MovieWorkerDiagnostics
+{
+    WorkersEnabled = BackgroundWorkers.Enabled(builder.Configuration)
+});
+builder.Services.AddBackgroundWorker<MovieProcessingWorker>(builder.Configuration);
 
 // Relocate-clips jobs: find each still's real frame in the film and recut its clip.
 builder.Services.AddScoped<ClipRelocateService>();
-builder.Services.AddHostedService<ClipRelocateWorker>();
+builder.Services.AddBackgroundWorker<ClipRelocateWorker>(builder.Configuration);
 
 // Caption embedding batch processing
 builder.Services.AddSingleton<ICaptionEmbeddingJobQueue, CaptionEmbeddingJobQueue>();
 builder.Services.AddScoped<ICaptionEmbeddingJobRepository, CaptionEmbeddingJobRepository>();
 builder.Services.AddScoped<ICaptionEmbeddingService, CaptionEmbeddingService>();
-builder.Services.AddHostedService<CaptionEmbeddingWorker>();
+builder.Services.AddBackgroundWorker<CaptionEmbeddingWorker>(builder.Configuration);
 
 
 // Dialogue search transcription pipeline
 builder.Services.AddSingleton<IDialogueJobQueue, DialogueJobQueue>();
 builder.Services.AddScoped<IDialogueTranscriptionJobRepository, DialogueTranscriptionJobRepository>();
 builder.Services.AddScoped<IDialogueTranscriptionService, DialogueTranscriptionService>();
-builder.Services.AddHostedService<DialogueTranscriptionWorker>();
+builder.Services.AddBackgroundWorker<DialogueTranscriptionWorker>(builder.Configuration);
 
 // Music identification pipeline (music detection + ACRCloud)
 builder.Services.AddSingleton<IMusicJobQueue, MusicJobQueue>();
@@ -106,7 +109,7 @@ builder.Services.AddHttpClient<ISoundtrackReconciliationService, SoundtrackRecon
 builder.Services.AddHttpClient<IStreamingLinkService, StreamingLinkService>();
 builder.Services.AddHttpClient<ITrackDetailsService, TrackDetailsService>();
 builder.Services.AddScoped<IAudioIdentifyService, AudioIdentifyService>();
-builder.Services.AddHostedService<MusicIdentificationWorker>();
+builder.Services.AddBackgroundWorker<MusicIdentificationWorker>(builder.Configuration);
 
 // Movie source files in R2 (dashboard file browser)
 builder.Services.AddSingleton<IMovieFileStorageService, MovieFileStorageService>();
@@ -122,22 +125,22 @@ builder.Services.AddSingleton<ITmdbService, TmdbService>();
 
 // Describes and analyses a movie as soon as its SF proxy exists, so a tagger
 // who finishes watching finds the walkthrough and the proposals waiting.
-builder.Services.AddHostedService<MoviePreparationWorker>();
+builder.Services.AddBackgroundWorker<MoviePreparationWorker>(builder.Configuration);
 
 // Reads the technical terms off the frames a tagger has kept, so they are there
 // when the tagger opens an image rather than fetched while they wait.
-builder.Services.AddHostedService<KeyImageTagWorker>();
+builder.Services.AddBackgroundWorker<KeyImageTagWorker>(builder.Configuration);
 
 // Cuts the picture of a frame picked while watching just after it is picked,
 // rather than making the tagger wait on the cut as they pick.
 builder.Services.AddScoped<IKeyImageStillService, KeyImageStillService>();
-builder.Services.AddHostedService<KeyImageStillWorker>();
+builder.Services.AddBackgroundWorker<KeyImageStillWorker>(builder.Configuration);
 
 // Camera-movement QC: shared analysis pipeline plus a worker that keeps a bank
 // of pre-analysed images so a reviewer's fetch is an instant assignment.
 builder.Services.AddScoped<CameraMovementAnalysisService>();
-builder.Services.AddHostedService<CameraMovementBankWorker>();
-builder.Services.AddHostedService<CameraMovementMovieFetchWorker>();
+builder.Services.AddBackgroundWorker<CameraMovementBankWorker>(builder.Configuration);
+builder.Services.AddBackgroundWorker<CameraMovementMovieFetchWorker>(builder.Configuration);
 
 // Keyword warmup at startup (singleton, creates scope manually)
 builder.Services.AddHostedService<KeywordWarmupService>();

@@ -1,3 +1,4 @@
+using AdminPanelAPI.Services;
 using System.Net;
 using AdminPanelAPI.VideoLinkCheck.Models;
 using AdminPanelAPI.VideoLinkCheck.Services;
@@ -29,6 +30,6 @@ public static class VideoLinkCheckSetup
         services.AddSingleton<VideoLinkCheckStore>();
         services.AddSingleton<VideoLinkChecker>();
         services.AddSingleton<VideoLinkCheckMailer>();
-        services.AddHostedService<VideoLinkCheckWorker>();
+        services.AddBackgroundWorker<VideoLinkCheckWorker>(builder.Configuration);
     }
 }
