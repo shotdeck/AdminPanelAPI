@@ -233,7 +233,7 @@ WHERE id IN (
     ORDER BY id
     LIMIT @limit
 )
-RETURNING id, image_key;";
+RETURNING id, COALESCE(cropped_key, image_key);";
 
             await using var cmd = new NpgsqlCommand(sql, connection);
             cmd.Parameters.AddWithValue("@limit", limit);
@@ -294,12 +294,14 @@ ON CONFLICT (key_image_id, category) DO UPDATE
         ai_confidence = EXCLUDED.ai_confidence,
         options       = EXCLUDED.options;
 
+-- A frame put back to pending while it was being read (its crop changed)
+-- stays pending, so it is read again off its new picture.
 UPDATE frl.frl_movie_key_images
 SET tag_status = 'tagged',
     tag_model_version = @modelVersion,
     tag_error = NULL,
     tagged_at = now()
-WHERE id = @id;";
+WHERE id = @id AND tag_status = 'running';";
 
             await using var cmd = new NpgsqlCommand(sql, connection);
             cmd.Parameters.AddWithValue("@id", id);
@@ -589,7 +591,7 @@ WHERE id = ANY(@ids) AND exported_at IS NULL;";
             NpgsqlConnection connection, int limit, CancellationToken ct)
         {
             const string sql = @"
-SELECT k.id, k.movie_id, k.image_key, t.category,
+SELECT k.id, k.movie_id, COALESCE(k.cropped_key, k.image_key), t.category,
        COALESCE(t.value, t.ai_value),
        t.value IS NOT NULL AND t.value IS DISTINCT FROM t.ai_value
 FROM frl.frl_movie_key_images k

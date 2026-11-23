@@ -87,8 +87,9 @@ LIMIT @limit;";
             // the position in seconds that holds.
             var fromProxy = variant?.SlimKey != null;
             var askFrame = fromProxy ? null : frameNumber;
+            var ratios = await KeyImageCrop.RatiosAsync(_connection, movieId, ct);
             var result = await _analysis.CutStillAsync(
-                sourceKey, askFrame, askFrame.HasValue ? null : positionSeconds, ct);
+                sourceKey, askFrame, askFrame.HasValue ? null : positionSeconds, ratios, ct);
             if (!result.IsSuccess)
                 throw new InvalidOperationException(result.Body);
 
@@ -105,15 +106,26 @@ LIMIT @limit;";
                 ? number
                 : frameNumber;
 
+            // The crop is settled before the still is published, so the two
+            // land together.
+            var (crop, cropSource, croppedKey) =
+                await ResolveCropAsync(id, pictureKey, document.RootElement, ct);
+
             const string saveSql = @"
 UPDATE frl.frl_movie_key_images
 SET image_key = @imageKey,
-    frame_number = COALESCE(@frame, frame_number)
+    frame_number = COALESCE(@frame, frame_number),
+    crop_x = @x, crop_y = @y, crop_w = @w, crop_h = @h,
+    crop_source = @source, cropped_key = @croppedKey
 WHERE id = @id;";
             await using (var save = new NpgsqlCommand(saveSql, _connection))
             {
                 save.Parameters.AddWithValue("@imageKey", pictureKey);
                 save.Parameters.AddWithValue("@frame", (object?)cutFrame ?? DBNull.Value);
+                KeyImageCrop.AddBox(save, crop);
+                save.Parameters.Add(new NpgsqlParameter("@source", NpgsqlTypes.NpgsqlDbType.Varchar)
+                { Value = (object?)cropSource ?? DBNull.Value });
+                save.Parameters.AddWithValue("@croppedKey", (object?)croppedKey ?? DBNull.Value);
                 save.Parameters.AddWithValue("@id", id);
                 await save.ExecuteNonQueryAsync(ct);
             }
@@ -123,6 +135,54 @@ WHERE id = @id;";
             await KeyImageTagStore.QueueOneAsync(_connection, id, ct);
 
             return pictureKey;
+        }
+
+        /// <summary>
+        /// A crop a tagger chose is cut again on the new still; otherwise the
+        /// still's own bar reading is taken.
+        /// </summary>
+        private async Task<(CropBox? Crop, string? Source, string? CroppedKey)> ResolveCropAsync(
+            long id, string pictureKey, JsonElement cut, CancellationToken ct)
+        {
+            string? source = null;
+            CropBox? chosen = null;
+            const string sql = "SELECT " + KeyImageCrop.Columns +
+                " FROM frl.frl_movie_key_images WHERE id = @id;";
+            await using (var cmd = new NpgsqlCommand(sql, _connection))
+            {
+                cmd.Parameters.AddWithValue("@id", id);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                {
+                    chosen = KeyImageCrop.Read(reader, 0);
+                    source = reader.IsDBNull(4) ? null : reader.GetString(4);
+                }
+            }
+
+            if (source == "tagger")
+            {
+                string? croppedKey = null;
+                if (chosen != null)
+                {
+                    // A crop that fails to cut does not hold the still back: the
+                    // frame is published with the tagger's crop kept and no cut
+                    // copy, so applying the crop again in the editor finishes it.
+                    var result = await _analysis.CropAsync(new[] { pictureKey }, chosen, ct);
+                    if (result.IsSuccess)
+                    {
+                        using var doc = JsonDocument.Parse(result.Body);
+                        if (doc.RootElement.TryGetProperty("cropped", out var map) &&
+                            map.TryGetProperty(pictureKey, out var key))
+                            croppedKey = key.GetString();
+                    }
+                }
+                return (chosen, "tagger", croppedKey);
+            }
+
+            var auto = KeyImageCrop.Read(cut);
+            var autoKey = auto != null && cut.TryGetProperty("croppedKey", out var cutKey)
+                ? cutKey.GetString() : null;
+            return (auto, auto == null ? null : "auto", autoKey);
         }
     }
 }

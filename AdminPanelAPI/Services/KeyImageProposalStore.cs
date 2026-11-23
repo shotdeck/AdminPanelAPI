@@ -66,6 +66,12 @@ WHERE movie_id = @movieId AND decision = 'proposed'" +
             var looks = new List<decimal>();
             var stories = new List<decimal>();
             var keys = new List<string>();
+            // -1 stands for "no crop"; Npgsql arrays of nullable numbers are awkward.
+            var cropX = new List<double>();
+            var cropY = new List<double>();
+            var cropW = new List<double>();
+            var cropH = new List<double>();
+            var croppedKeys = new List<string?>();
 
             foreach (var proposal in proposals.EnumerateArray())
             {
@@ -79,6 +85,14 @@ WHERE movie_id = @movieId AND decision = 'proposed'" +
                 looks.Add(Half(proposal, "look"));
                 stories.Add(Half(proposal, "story"));
                 keys.Add(imageKey);
+                var crop = KeyImageCrop.Read(proposal);
+                cropX.Add(crop?.X ?? -1);
+                cropY.Add(crop?.Y ?? -1);
+                cropW.Add(crop?.W ?? -1);
+                cropH.Add(crop?.H ?? -1);
+                croppedKeys.Add(crop != null &&
+                    proposal.TryGetProperty("croppedKey", out var cut) &&
+                    cut.GetString() is { Length: > 0 } cutKey ? cutKey : null);
             }
 
             if (positions.Count == 0)
@@ -87,16 +101,27 @@ WHERE movie_id = @movieId AND decision = 'proposed'" +
             const string sql = @"
 INSERT INTO frl.frl_movie_key_images
     (movie_id, position_seconds, frame_number, score, look_score, story_score,
-     story_from, image_key, source, decision)
+     story_from, image_key, source, decision,
+     crop_x, crop_y, crop_w, crop_h, crop_source, cropped_key)
 SELECT @movieId, position, frame, score, look, story, @storyFrom, image_key,
-       'ai', 'proposed'
-FROM unnest(@positions, @frames, @scores, @looks, @stories, @keys)
-    AS proposal(position, frame, score, look, story, image_key)
+       'ai', 'proposed',
+       NULLIF(cx, -1), NULLIF(cy, -1), NULLIF(cw, -1), NULLIF(ch, -1),
+       CASE WHEN cx = -1 THEN NULL ELSE 'auto' END, cropped_key
+FROM unnest(@positions, @frames, @scores, @looks, @stories, @keys,
+            @cropX::numeric[], @cropY::numeric[], @cropW::numeric[], @cropH::numeric[],
+            @croppedKeys::text[])
+    AS proposal(position, frame, score, look, story, image_key, cx, cy, cw, ch, cropped_key)
 ON CONFLICT (movie_id, position_seconds, COALESCE(story_from, '')) DO UPDATE
     SET score       = EXCLUDED.score,
         look_score  = EXCLUDED.look_score,
         story_score = EXCLUDED.story_score,
-        image_key   = EXCLUDED.image_key
+        image_key   = EXCLUDED.image_key,
+        crop_x      = EXCLUDED.crop_x,
+        crop_y      = EXCLUDED.crop_y,
+        crop_w      = EXCLUDED.crop_w,
+        crop_h      = EXCLUDED.crop_h,
+        crop_source = EXCLUDED.crop_source,
+        cropped_key = EXCLUDED.cropped_key
     WHERE frl.frl_movie_key_images.decision = 'proposed'
       AND frl.frl_movie_key_images.source = 'ai';
 
@@ -115,6 +140,13 @@ WHERE movie_id = @movieId
             cmd.Parameters.AddWithValue("@looks", looks.ToArray());
             cmd.Parameters.AddWithValue("@stories", stories.ToArray());
             cmd.Parameters.AddWithValue("@keys", keys.ToArray());
+            cmd.Parameters.AddWithValue("@cropX", cropX.ToArray());
+            cmd.Parameters.AddWithValue("@cropY", cropY.ToArray());
+            cmd.Parameters.AddWithValue("@cropW", cropW.ToArray());
+            cmd.Parameters.AddWithValue("@cropH", cropH.ToArray());
+            cmd.Parameters.Add(new NpgsqlParameter("@croppedKeys",
+                NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Text)
+            { Value = croppedKeys.Select(k => (object?)k ?? DBNull.Value).ToArray() });
             cmd.Parameters.AddWithValue(
                 "@storyFrom", (object?)storyFrom ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync(ct);

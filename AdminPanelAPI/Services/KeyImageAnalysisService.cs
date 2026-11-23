@@ -19,7 +19,7 @@ namespace AdminPanelAPI.Services
         /// </summary>
         Task<TranscodeResult> StartAsync(
             string sourceKey, int movieId, string? description, string? storyFrom,
-            CancellationToken ct);
+            string? ratios, CancellationToken ct);
 
         Task<TranscodeResult> GetJobAsync(string jobId, bool includeProposals, CancellationToken ct);
 
@@ -30,7 +30,15 @@ namespace AdminPanelAPI.Services
         /// Unlike an analysis this is a single decode, so it answers inline.
         /// </summary>
         Task<TranscodeResult> CutStillAsync(
-            string sourceKey, int? frameNumber, double? seconds, CancellationToken ct);
+            string sourceKey, int? frameNumber, double? seconds, string? ratios,
+            CancellationToken ct);
+
+        /// <summary>
+        /// Cut each still at <paramref name="imageKeys"/> to one crop and put the
+        /// copy beside it; answers {"cropped": {imageKey: croppedKey}}.
+        /// </summary>
+        Task<TranscodeResult> CropAsync(
+            IReadOnlyList<string> imageKeys, CropBox crop, CancellationToken ct);
     }
 
     public sealed class KeyImageAnalysisService : IKeyImageAnalysisService
@@ -54,13 +62,15 @@ namespace AdminPanelAPI.Services
 
         public Task<TranscodeResult> StartAsync(
             string sourceKey, int movieId, string? description, string? storyFrom,
-            CancellationToken ct)
+            string? ratios, CancellationToken ct)
         {
             var query = $"?key={Uri.EscapeDataString(sourceKey)}&movie_id={movieId}";
             if (!string.IsNullOrWhiteSpace(description))
                 query += $"&description={Uri.EscapeDataString(description)}";
             if (!string.IsNullOrWhiteSpace(storyFrom))
                 query += $"&story_from={Uri.EscapeDataString(storyFrom)}";
+            if (!string.IsNullOrWhiteSpace(ratios))
+                query += $"&ratios={Uri.EscapeDataString(ratios)}";
             if (!string.IsNullOrWhiteSpace(_bucketName))
                 query += $"&bucket={Uri.EscapeDataString(_bucketName)}";
 
@@ -79,7 +89,8 @@ namespace AdminPanelAPI.Services
             SendAsync(HttpMethod.Get, $"/analysis?key={Uri.EscapeDataString(sourceKey)}", ct);
 
         public Task<TranscodeResult> CutStillAsync(
-            string sourceKey, int? frameNumber, double? seconds, CancellationToken ct)
+            string sourceKey, int? frameNumber, double? seconds, string? ratios,
+            CancellationToken ct)
         {
             var query = $"?key={Uri.EscapeDataString(sourceKey)}";
             if (frameNumber.HasValue)
@@ -89,11 +100,23 @@ namespace AdminPanelAPI.Services
             if (!string.IsNullOrWhiteSpace(_bucketName))
                 query += $"&bucket={Uri.EscapeDataString(_bucketName)}";
 
+            if (!string.IsNullOrWhiteSpace(ratios))
+                query += $"&ratios={Uri.EscapeDataString(ratios)}";
+
             return SendAsync(HttpMethod.Post, "/still" + query, ct);
         }
 
+        public Task<TranscodeResult> CropAsync(
+            IReadOnlyList<string> imageKeys, CropBox crop, CancellationToken ct) =>
+            SendAsync(HttpMethod.Post, "/crop", ct, JsonSerializer.Serialize(new
+            {
+                imageKeys,
+                crop = new { x = crop.X, y = crop.Y, w = crop.W, h = crop.H },
+                bucket = _bucketName
+            }));
+
         private async Task<TranscodeResult> SendAsync(
-            HttpMethod method, string pathAndQuery, CancellationToken ct)
+            HttpMethod method, string pathAndQuery, CancellationToken ct, string? json = null)
         {
             var client = _httpClientFactory.CreateClient();
             // A finished job hands back a thousand-odd proposals, which is a
@@ -101,6 +124,8 @@ namespace AdminPanelAPI.Services
             client.Timeout = TimeSpan.FromSeconds(120);
 
             using var request = new HttpRequestMessage(method, _baseUrl + pathAndQuery);
+            if (json != null)
+                request.Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
             try
             {
                 using var response = await client.SendAsync(request, ct);
