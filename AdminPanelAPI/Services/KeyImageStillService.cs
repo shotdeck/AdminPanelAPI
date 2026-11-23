@@ -106,20 +106,29 @@ LIMIT @limit;";
                 ? number
                 : frameNumber;
 
+            // The crop is settled before the still is published with it, so a
+            // crop that fails to cut leaves the frame waiting for its still.
+            var (crop, cropSource, croppedKey) =
+                await ResolveCropAsync(id, pictureKey, document.RootElement, ct);
+
             const string saveSql = @"
 UPDATE frl.frl_movie_key_images
 SET image_key = @imageKey,
-    frame_number = COALESCE(@frame, frame_number)
+    frame_number = COALESCE(@frame, frame_number),
+    crop_x = @x, crop_y = @y, crop_w = @w, crop_h = @h,
+    crop_source = @source, cropped_key = @croppedKey
 WHERE id = @id;";
             await using (var save = new NpgsqlCommand(saveSql, _connection))
             {
                 save.Parameters.AddWithValue("@imageKey", pictureKey);
                 save.Parameters.AddWithValue("@frame", (object?)cutFrame ?? DBNull.Value);
+                KeyImageCrop.AddBox(save, crop);
+                save.Parameters.Add(new NpgsqlParameter("@source", NpgsqlTypes.NpgsqlDbType.Varchar)
+                { Value = (object?)cropSource ?? DBNull.Value });
+                save.Parameters.AddWithValue("@croppedKey", (object?)croppedKey ?? DBNull.Value);
                 save.Parameters.AddWithValue("@id", id);
                 await save.ExecuteNonQueryAsync(ct);
             }
-
-            await SaveCropAsync(id, pictureKey, document.RootElement, ct);
 
             // A frame picked while watching only gets a picture in R2 here, so
             // this is the first moment its terms can be read.
@@ -132,7 +141,7 @@ WHERE id = @id;";
         /// A crop a tagger chose is cut again on the new still; otherwise the
         /// still's own bar reading is taken.
         /// </summary>
-        private async Task SaveCropAsync(
+        private async Task<(CropBox? Crop, string? Source, string? CroppedKey)> ResolveCropAsync(
             long id, string pictureKey, JsonElement cut, CancellationToken ct)
         {
             string? source = null;
@@ -163,15 +172,13 @@ WHERE id = @id;";
                         map.TryGetProperty(pictureKey, out var key))
                         croppedKey = key.GetString();
                 }
-                await KeyImageCrop.SaveAsync(_connection, id, chosen, "tagger", croppedKey, null, ct);
-                return;
+                return (chosen, "tagger", croppedKey);
             }
 
             var auto = KeyImageCrop.Read(cut);
             var autoKey = auto != null && cut.TryGetProperty("croppedKey", out var cutKey)
                 ? cutKey.GetString() : null;
-            await KeyImageCrop.SaveAsync(
-                _connection, id, auto, auto == null ? null : "auto", autoKey, null, ct);
+            return (auto, auto == null ? null : "auto", autoKey);
         }
     }
 }
