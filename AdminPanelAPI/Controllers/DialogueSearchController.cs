@@ -79,7 +79,6 @@ namespace AdminPanelAPI.Controllers
         /// which is looked up in frl_movies (title + year) to find the idnum.
         /// </summary>
         [HttpPost("upload")]
-        [RequiresBackgroundWorkers]
         [RequestSizeLimit(MaxUploadSizeBytes)]
         [RequestFormLimits(MultipartBodyLengthLimit = MaxUploadSizeBytes)]
         public async Task<IActionResult> UploadAndTranscribeByFileName(
@@ -88,6 +87,10 @@ namespace AdminPanelAPI.Controllers
             [FromQuery] bool music = false,
             CancellationToken cancellationToken = default)
         {
+            if ((transcribe || music)
+                && !BackgroundWorkers.Enabled(HttpContext.RequestServices.GetRequiredService<IConfiguration>()))
+                return RequiresBackgroundWorkersAttribute.Refusal();
+
             if (file == null || file.Length == 0)
                 return BadRequest(new { error = "No file provided." });
 

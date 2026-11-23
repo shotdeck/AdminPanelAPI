@@ -36,11 +36,13 @@ namespace AdminPanelAPI.Services
             var configuration = context.HttpContext.RequestServices.GetRequiredService<IConfiguration>();
             if (BackgroundWorkers.Enabled(configuration)) return;
 
-            context.Result = new ObjectResult(new
-            {
-                error = "Background workers are disabled on this instance; submit jobs to the production API."
-            })
-            { StatusCode = StatusCodes.Status503ServiceUnavailable };
+            context.Result = Refusal();
         }
+
+        public static ObjectResult Refusal() => new(new
+        {
+            error = "Background workers are disabled on this instance; submit jobs to the production API."
+        })
+        { StatusCode = StatusCodes.Status503ServiceUnavailable };
     }
 }
