@@ -294,12 +294,14 @@ ON CONFLICT (key_image_id, category) DO UPDATE
         ai_confidence = EXCLUDED.ai_confidence,
         options       = EXCLUDED.options;
 
+-- A frame put back to pending while it was being read (its crop changed)
+-- stays pending, so it is read again off its new picture.
 UPDATE frl.frl_movie_key_images
 SET tag_status = 'tagged',
     tag_model_version = @modelVersion,
     tag_error = NULL,
     tagged_at = now()
-WHERE id = @id;";
+WHERE id = @id AND tag_status = 'running';";
 
             await using var cmd = new NpgsqlCommand(sql, connection);
             cmd.Parameters.AddWithValue("@id", id);

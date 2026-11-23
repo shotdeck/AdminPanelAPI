@@ -801,7 +801,7 @@ SELECT id, movie_id, image_key FROM frl.frl_movie_key_images WHERE id = ANY(@ids
 UPDATE frl.frl_movie_key_images
 SET tag_status = 'pending', tag_error = NULL
 WHERE id = ANY(@ids) AND image_key IS NOT NULL
-  AND tags_confirmed_at IS NULL AND tag_status IS DISTINCT FROM 'running';";
+  AND tags_confirmed_at IS NULL;";
             await using (var cmd = new NpgsqlCommand(requeue, _connection))
             {
                 cmd.Parameters.AddWithValue("@ids", rows.Select(row => row.Id).ToArray());
