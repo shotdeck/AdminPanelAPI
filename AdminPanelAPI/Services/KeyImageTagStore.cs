@@ -233,7 +233,7 @@ WHERE id IN (
     ORDER BY id
     LIMIT @limit
 )
-RETURNING id, image_key;";
+RETURNING id, COALESCE(cropped_key, image_key);";
 
             await using var cmd = new NpgsqlCommand(sql, connection);
             cmd.Parameters.AddWithValue("@limit", limit);
@@ -589,7 +589,7 @@ WHERE id = ANY(@ids) AND exported_at IS NULL;";
             NpgsqlConnection connection, int limit, CancellationToken ct)
         {
             const string sql = @"
-SELECT k.id, k.movie_id, k.image_key, t.category,
+SELECT k.id, k.movie_id, COALESCE(k.cropped_key, k.image_key), t.category,
        COALESCE(t.value, t.ai_value),
        t.value IS NOT NULL AND t.value IS DISTINCT FROM t.ai_value
 FROM frl.frl_movie_key_images k

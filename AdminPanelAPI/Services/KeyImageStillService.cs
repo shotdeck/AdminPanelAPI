@@ -87,8 +87,9 @@ LIMIT @limit;";
             // the position in seconds that holds.
             var fromProxy = variant?.SlimKey != null;
             var askFrame = fromProxy ? null : frameNumber;
+            var ratios = await KeyImageCrop.RatiosAsync(_connection, movieId, ct);
             var result = await _analysis.CutStillAsync(
-                sourceKey, askFrame, askFrame.HasValue ? null : positionSeconds, ct);
+                sourceKey, askFrame, askFrame.HasValue ? null : positionSeconds, ratios, ct);
             if (!result.IsSuccess)
                 throw new InvalidOperationException(result.Body);
 
@@ -118,11 +119,59 @@ WHERE id = @id;";
                 await save.ExecuteNonQueryAsync(ct);
             }
 
+            await SaveCropAsync(id, pictureKey, document.RootElement, ct);
+
             // A frame picked while watching only gets a picture in R2 here, so
             // this is the first moment its terms can be read.
             await KeyImageTagStore.QueueOneAsync(_connection, id, ct);
 
             return pictureKey;
+        }
+
+        /// <summary>
+        /// A crop a tagger chose is cut again on the new still; otherwise the
+        /// still's own bar reading is taken.
+        /// </summary>
+        private async Task SaveCropAsync(
+            long id, string pictureKey, JsonElement cut, CancellationToken ct)
+        {
+            string? source = null;
+            CropBox? chosen = null;
+            const string sql = "SELECT " + KeyImageCrop.Columns +
+                " FROM frl.frl_movie_key_images WHERE id = @id;";
+            await using (var cmd = new NpgsqlCommand(sql, _connection))
+            {
+                cmd.Parameters.AddWithValue("@id", id);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                {
+                    chosen = KeyImageCrop.Read(reader, 0);
+                    source = reader.IsDBNull(4) ? null : reader.GetString(4);
+                }
+            }
+
+            if (source == "tagger")
+            {
+                string? croppedKey = null;
+                if (chosen != null)
+                {
+                    var result = await _analysis.CropAsync(new[] { pictureKey }, chosen, ct);
+                    if (!result.IsSuccess)
+                        throw new InvalidOperationException(result.Body);
+                    using var doc = JsonDocument.Parse(result.Body);
+                    if (doc.RootElement.TryGetProperty("cropped", out var map) &&
+                        map.TryGetProperty(pictureKey, out var key))
+                        croppedKey = key.GetString();
+                }
+                await KeyImageCrop.SaveAsync(_connection, id, chosen, "tagger", croppedKey, null, ct);
+                return;
+            }
+
+            var auto = KeyImageCrop.Read(cut);
+            var autoKey = auto != null && cut.TryGetProperty("croppedKey", out var cutKey)
+                ? cutKey.GetString() : null;
+            await KeyImageCrop.SaveAsync(
+                _connection, id, auto, auto == null ? null : "auto", autoKey, null, ct);
         }
     }
 }

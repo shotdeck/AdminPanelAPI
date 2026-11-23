@@ -209,6 +209,22 @@ namespace ShotDeckSearch.Controllers
             public string? ActingUser { get; set; }
         }
 
+        public sealed class KeyImageCropRequest
+        {
+            public long[]? Ids { get; set; }
+            /// <summary>Fractions of the frame; null or the whole frame for no crop.</summary>
+            public CropBoxDto? Crop { get; set; }
+            public string? ActingUser { get; set; }
+        }
+
+        public sealed class CropBoxDto
+        {
+            public double X { get; set; }
+            public double Y { get; set; }
+            public double W { get; set; }
+            public double H { get; set; }
+        }
+
         public sealed class TagChangeExportRequest
         {
             public long[]? Ids { get; set; }
@@ -505,7 +521,8 @@ RETURNING watch_position_seconds, watch_duration_seconds, status;";
 
             const string sql = @"
 SELECT id, movie_id, position_seconds, thumbnail, captured_by, created_at,
-       frame_number, source, score, image_key, look_score, story_score
+       frame_number, source, score, image_key, look_score, story_score,
+       " + KeyImageCrop.Columns + @"
 FROM frl.frl_movie_key_images
 WHERE movie_id = @movieId AND decision = 'kept'
 ORDER BY position_seconds;";
@@ -518,8 +535,12 @@ ORDER BY position_seconds;";
             while (await reader.ReadAsync(ct))
             {
                 var imageKey = reader.IsDBNull(9) ? null : reader.GetString(9);
+                var (crop, cropSource, croppedKey) = KeyImageCrop.Json(reader, 12);
                 images.Add(new
                 {
+                    crop,
+                    cropSource,
+                    croppedUrl = croppedKey == null ? null : _storage.CreateDownloadUrl(croppedKey, false),
                     id = reader.GetInt64(0),
                     movieId = reader.GetInt32(1),
                     positionSeconds = (double)reader.GetDecimal(2),
@@ -702,6 +723,94 @@ WHERE id = @id;";
         }
 
         /// <summary>Drop a frame the tagger picked by mistake.</summary>
+        /// <summary>
+        /// Set one crop on several key images at once. The uncropped stills are
+        /// left as they are; each gets a cut copy that its terms are read from,
+        /// so frames whose terms are not confirmed yet are read again.
+        /// </summary>
+        [HttpPut("key-images/crop")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        public async Task<IActionResult> CropKeyImages(
+            [FromBody] KeyImageCropRequest request, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+
+            var ids = (request.Ids ?? Array.Empty<long>()).Distinct().ToArray();
+            if (ids.Length == 0 || ids.Length > 500)
+                return BadRequest(new { error = "Give between 1 and 500 ids." });
+            var crop = request.Crop == null
+                ? null
+                : new CropBox(request.Crop.X, request.Crop.Y, request.Crop.W, request.Crop.H);
+            if (crop != null && !crop.IsValid)
+                return BadRequest(new { error = "The crop must lie inside the frame." });
+            if (crop is { IsFull: true })
+                crop = null;
+
+            var rows = new List<(long Id, int MovieId, string? ImageKey)>();
+            const string sql = @"
+SELECT id, movie_id, image_key FROM frl.frl_movie_key_images WHERE id = ANY(@ids);";
+            await using (var cmd = new NpgsqlCommand(sql, _connection))
+            {
+                cmd.Parameters.AddWithValue("@ids", ids);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                    rows.Add((reader.GetInt64(0), reader.GetInt32(1),
+                        reader.IsDBNull(2) ? null : reader.GetString(2)));
+            }
+
+            var actingUser = (request.ActingUser ?? "").Trim();
+            foreach (var movieId in rows.Select(row => row.MovieId).Distinct())
+                if (!await CanCaptureAsync(movieId, actingUser, ct))
+                    return StatusCode(403, new { error = "That movie is not allocated to you." });
+
+            var cropped = new Dictionary<string, string>();
+            var keys = rows.Where(row => row.ImageKey != null)
+                .Select(row => row.ImageKey!).Distinct().ToList();
+            if (crop != null && keys.Count > 0)
+            {
+                var result = await _analysis.CropAsync(keys, crop, ct);
+                if (!result.IsSuccess)
+                    return StatusCode(502, new { error = "The crop could not be cut.", detail = result.Body });
+                using var document = JsonDocument.Parse(result.Body);
+                if (document.RootElement.TryGetProperty("cropped", out var map))
+                    foreach (var entry in map.EnumerateObject())
+                        if (entry.Value.GetString() is { Length: > 0 } value)
+                            cropped[entry.Name] = value;
+            }
+
+            var images = new List<object>();
+            foreach (var row in rows)
+            {
+                // A row with no still yet keeps the crop, and has it cut when its still is.
+                var croppedKey = row.ImageKey != null && cropped.TryGetValue(row.ImageKey, out var cut)
+                    ? cut : null;
+                await KeyImageCrop.SaveAsync(
+                    _connection, row.Id, crop, "tagger", croppedKey,
+                    actingUser.Length == 0 ? null : actingUser, ct);
+                images.Add(new
+                {
+                    id = row.Id,
+                    crop = crop == null ? null : new { x = crop.X, y = crop.Y, w = crop.W, h = crop.H },
+                    cropSource = "tagger",
+                    croppedUrl = croppedKey == null ? null : _storage.CreateDownloadUrl(croppedKey, false)
+                });
+            }
+
+            const string requeue = @"
+UPDATE frl.frl_movie_key_images
+SET tag_status = 'pending', tag_error = NULL
+WHERE id = ANY(@ids) AND image_key IS NOT NULL
+  AND tags_confirmed_at IS NULL AND tag_status IS DISTINCT FROM 'running';";
+            await using (var cmd = new NpgsqlCommand(requeue, _connection))
+            {
+                cmd.Parameters.AddWithValue("@ids", rows.Select(row => row.Id).ToArray());
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            return Ok(new { images });
+        }
+
         [HttpDelete("key-images/{id:long}")]
         [ProducesResponseType(StatusCodes.Status204NoContent)]
         [ProducesResponseType(StatusCodes.Status403Forbidden)]
@@ -786,9 +895,10 @@ WHERE id = @id;";
 
             // The plot is what a run is judged against unless it is asked for
             // the walkthrough by name.
+            var ratios = await KeyImageCrop.RatiosAsync(_connection, request.MovieId, ct);
             var result = await _analysis.StartAsync(
                 sourceKey, request.MovieId, description,
-                storyFrom.Length == 0 ? "description" : storyFrom, ct);
+                storyFrom.Length == 0 ? "description" : storyFrom, ratios, ct);
             return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
         }
 
@@ -1074,7 +1184,7 @@ WHERE id = @id;";
                 });
 
             const string columns = @"id, position_seconds, frame_number, score, image_key,
-       created_at, look_score, story_score, source, story_from";
+       created_at, look_score, story_score, source, story_from, " + KeyImageCrop.Columns;
 
             var window =
                 (fromSeconds.HasValue ? " AND position_seconds >= @fromSeconds" : "") +
@@ -1117,8 +1227,12 @@ LIMIT @limit OFFSET @offset";
                 while (await reader.ReadAsync(ct))
                 {
                     var imageKey = reader.IsDBNull(4) ? null : reader.GetString(4);
+                    var (crop, cropSource, croppedKey) = KeyImageCrop.Json(reader, 10);
                     proposals.Add(new
                     {
+                        crop,
+                        cropSource,
+                        croppedUrl = croppedKey == null ? null : _storage.CreateDownloadUrl(croppedKey, false),
                         id = reader.GetInt64(0),
                         movieId,
                         positionSeconds = (double)reader.GetDecimal(1),
@@ -2240,7 +2354,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_fmki_movie_position_story
 CREATE INDEX IF NOT EXISTS idx_fmki_movie_decision
     ON frl.frl_movie_key_images (movie_id, decision);"
                 + MoviePreparationStore.Schema + KeyImageTagStore.Schema
-                + TrainingRunStore.Schema;
+                + TrainingRunStore.Schema + KeyImageCrop.Schema;
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
         }

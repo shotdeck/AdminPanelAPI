@@ -246,9 +246,10 @@ namespace AdminPanelAPI.Services
             // walkthrough is being prepared the way is left open instead, so the
             // run reads the ratings taken from it and falls back to the plot if
             // they never arrived.
+            var ratios = await KeyImageCrop.RatiosAsync(connection, movieId, ct);
             var result = await analysis.StartAsync(
                 sourceKey, movieId, description,
-                _walkthrough ? null : "description", ct);
+                _walkthrough ? null : "description", ratios, ct);
 
             var (jobId, error) = JobFrom(result);
             await MoviePreparationStore.SetJobAsync(
