@@ -24,6 +24,8 @@ namespace AdminPanelAPI.Services
 
         public int ConfiguredParallelism { get; set; }
 
+        public bool WorkersEnabled { get; set; } = true;
+
         public void LoopStarted(int workerNumber)
         {
             _loops[workerNumber] = new LoopState { StartedAt = DateTime.UtcNow };
@@ -69,6 +71,7 @@ namespace AdminPanelAPI.Services
         {
             return new
             {
+                workersEnabled = WorkersEnabled,
                 configuredParallelism = ConfiguredParallelism,
                 loopsStarted = _loops.Count,
                 nowUtc = DateTime.UtcNow,
