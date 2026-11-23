@@ -106,8 +106,8 @@ LIMIT @limit;";
                 ? number
                 : frameNumber;
 
-            // The crop is settled before the still is published with it, so a
-            // crop that fails to cut leaves the frame waiting for its still.
+            // The crop is settled before the still is published, so the two
+            // land together.
             var (crop, cropSource, croppedKey) =
                 await ResolveCropAsync(id, pictureKey, document.RootElement, ct);
 
@@ -164,13 +164,17 @@ WHERE id = @id;";
                 string? croppedKey = null;
                 if (chosen != null)
                 {
+                    // A crop that fails to cut does not hold the still back: the
+                    // frame is published with the tagger's crop kept and no cut
+                    // copy, so applying the crop again in the editor finishes it.
                     var result = await _analysis.CropAsync(new[] { pictureKey }, chosen, ct);
-                    if (!result.IsSuccess)
-                        throw new InvalidOperationException(result.Body);
-                    using var doc = JsonDocument.Parse(result.Body);
-                    if (doc.RootElement.TryGetProperty("cropped", out var map) &&
-                        map.TryGetProperty(pictureKey, out var key))
-                        croppedKey = key.GetString();
+                    if (result.IsSuccess)
+                    {
+                        using var doc = JsonDocument.Parse(result.Body);
+                        if (doc.RootElement.TryGetProperty("cropped", out var map) &&
+                            map.TryGetProperty(pictureKey, out var key))
+                            croppedKey = key.GetString();
+                    }
                 }
                 return (chosen, "tagger", croppedKey);
             }
