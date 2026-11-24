@@ -1960,10 +1960,12 @@ HAVING COUNT(DISTINCT camera_movements) = @includeCount";
 )"
                 : "";
 
-            // Status filter on the first included movement
+            // Status and confidence filters on the first included movement
             var statusClause = !string.IsNullOrWhiteSpace(request.Status)
                 ? " AND cm.status = @status"
                 : "";
+            if (request.MinConf.HasValue) statusClause += " AND cm.confidence >= @minConf";
+            if (request.MaxConf.HasValue) statusClause += " AND cm.confidence <= @maxConf";
 
             var offset = (page - 1) * pageSize;
 
@@ -1990,6 +1992,8 @@ WHERE cm.camera_movements = @firstMovement
                 countCmd.Parameters.AddWithValue($"@exc{i}", exclude[i]);
             if (!string.IsNullOrWhiteSpace(request.Status))
                 countCmd.Parameters.AddWithValue("@status", request.Status);
+            if (request.MinConf.HasValue) countCmd.Parameters.AddWithValue("@minConf", (float)request.MinConf.Value);
+            if (request.MaxConf.HasValue) countCmd.Parameters.AddWithValue("@maxConf", (float)request.MaxConf.Value);
             AddCutLengthParams(countCmd, request.MinLen, request.MaxLen);
             if (ownerActive) countCmd.Parameters.AddWithValue("@owner", request.Owner!.Trim());
             if (movieActive) countCmd.Parameters.AddWithValue("@movieId", request.MovieId!.Value);
@@ -2032,6 +2036,8 @@ LIMIT @limit OFFSET @offset;";
                 cmd.Parameters.AddWithValue($"@exc{i}", exclude[i]);
             if (!string.IsNullOrWhiteSpace(request.Status))
                 cmd.Parameters.AddWithValue("@status", request.Status);
+            if (request.MinConf.HasValue) cmd.Parameters.AddWithValue("@minConf", (float)request.MinConf.Value);
+            if (request.MaxConf.HasValue) cmd.Parameters.AddWithValue("@maxConf", (float)request.MaxConf.Value);
             AddCutLengthParams(cmd, request.MinLen, request.MaxLen);
             if (ownerActive) cmd.Parameters.AddWithValue("@owner", request.Owner!.Trim());
             if (movieActive) cmd.Parameters.AddWithValue("@movieId", request.MovieId!.Value);
@@ -3241,6 +3247,8 @@ VALUES (@imageid, @action, @original, @corrected, @confidence);";
             public string? Sort { get; set; }
             public double? MinLen { get; set; }
             public double? MaxLen { get; set; }
+            public double? MinConf { get; set; }
+            public double? MaxConf { get; set; }
             public string? Owner { get; set; }
             public int? MovieId { get; set; }
         }
