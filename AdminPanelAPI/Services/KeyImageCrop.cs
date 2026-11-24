@@ -18,6 +18,9 @@ namespace AdminPanelAPI.Services
     /// is at cropped_key, and is what the technical tags are read from.
     /// crop_source is "auto" when bar detection set it and "tagger" once
     /// somebody has, so a later re-cut of the still keeps a tagger's choice.
+    /// crop_check marks an auto crop the detector had to guess (a frame too
+    /// dark to read, or bars that matched none of the film's boxes); it stays
+    /// until a tagger sets the crop.
     /// </summary>
     public static class KeyImageCrop
     {
@@ -30,10 +33,11 @@ ALTER TABLE frl.frl_movie_key_images
     ADD COLUMN IF NOT EXISTS crop_source VARCHAR(16),
     ADD COLUMN IF NOT EXISTS cropped_key TEXT,
     ADD COLUMN IF NOT EXISTS cropped_by  VARCHAR(120),
-    ADD COLUMN IF NOT EXISTS cropped_at  TIMESTAMPTZ;";
+    ADD COLUMN IF NOT EXISTS cropped_at  TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS crop_check  BOOLEAN NOT NULL DEFAULT false;";
 
         /// <summary>The select list that <see cref="Json"/> reads, in order.</summary>
-        public const string Columns = "crop_x, crop_y, crop_w, crop_h, crop_source, cropped_key";
+        public const string Columns = "crop_x, crop_y, crop_w, crop_h, crop_source, cropped_key, crop_check";
 
         public static CropBox? Read(JsonElement owner, string name = "crop")
         {
@@ -51,16 +55,21 @@ ALTER TABLE frl.frl_movie_key_images
                 (double)reader.GetDecimal(first), (double)reader.GetDecimal(first + 1),
                 (double)reader.GetDecimal(first + 2), (double)reader.GetDecimal(first + 3));
 
-        /// <summary>crop, cropSource and croppedKey for a row read with <see cref="Columns"/>.</summary>
-        public static (object? Crop, string? Source, string? CroppedKey) Json(
+        /// <summary>crop, cropSource, croppedKey and cropCheck for a row read with <see cref="Columns"/>.</summary>
+        public static (object? Crop, string? Source, string? CroppedKey, bool Check) Json(
             NpgsqlDataReader reader, int first)
         {
             var box = Read(reader, first);
             return (
                 box == null ? null : new { x = box.X, y = box.Y, w = box.W, h = box.H },
                 reader.IsDBNull(first + 4) ? null : reader.GetString(first + 4),
-                reader.IsDBNull(first + 5) ? null : reader.GetString(first + 5));
+                reader.IsDBNull(first + 5) ? null : reader.GetString(first + 5),
+                !reader.IsDBNull(first + 6) && reader.GetBoolean(first + 6));
         }
+
+        /// <summary>Whether a proposal says its auto crop is a guess.</summary>
+        public static bool ReadCheck(JsonElement owner) =>
+            owner.TryGetProperty("cropCheck", out var check) && check.ValueKind == JsonValueKind.True;
 
         public static async Task SaveAsync(
             NpgsqlConnection connection, long id, CropBox? crop, string? source,
@@ -71,7 +80,8 @@ UPDATE frl.frl_movie_key_images
 SET crop_x = @x, crop_y = @y, crop_w = @w, crop_h = @h,
     crop_source = @source, cropped_key = @croppedKey,
     cropped_by = COALESCE(@by, cropped_by),
-    cropped_at = CASE WHEN @source = 'tagger' THEN now() ELSE cropped_at END
+    cropped_at = CASE WHEN @source = 'tagger' THEN now() ELSE cropped_at END,
+    crop_check = CASE WHEN @source = 'tagger' THEN false ELSE crop_check END
 WHERE id = @id;";
             await using var cmd = new NpgsqlCommand(sql, connection);
             AddBox(cmd, crop);
