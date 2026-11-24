@@ -459,8 +459,42 @@ WHERE idnum = ANY(@ids);";
             if (string.IsNullOrWhiteSpace(request.Key))
                 return BadRequest(new { error = "key is required" });
 
-            return Relay(await _transcode.CreateJobAsync(
-                request.Key, request.Preset, request.Overwrite, ct));
+            var result = await _transcode.CreateJobAsync(
+                request.Key, request.Preset, request.Overwrite, ct);
+            if (result.IsSuccess)
+                await AnalyseWhenMadeAsync(request.Key, result.Body, ct);
+            return Relay(result);
+        }
+
+        /// <summary>
+        /// An SF encode in a movie's folder is the movie's new proxy, so its key
+        /// images are extracted as soon as it is made: the preparation worker
+        /// follows the encode and starts the analysis off it.
+        /// </summary>
+        private async Task AnalyseWhenMadeAsync(string key, string body, CancellationToken ct)
+        {
+            var slash = key.IndexOf('/');
+            if (slash <= 0 || !int.TryParse(key[..slash], out var movieId) || movieId <= 0)
+                return;
+
+            try
+            {
+                using var document = JsonDocument.Parse(body);
+                if (!document.RootElement.TryGetProperty("jobId", out var id) ||
+                    id.GetString() is not { Length: > 0 } jobId)
+                    return;
+
+                var connection = _connection.Value;
+                if (connection.State != ConnectionState.Open)
+                    await connection.OpenAsync(ct);
+                await MoviePreparationStore.EnsureTableAsync(connection, ct);
+                await MoviePreparationStore.AwaitSfAsync(connection, movieId, key, jobId, ct);
+            }
+            catch (Exception ex) when (ex is JsonException or NpgsqlException or InvalidOperationException)
+            {
+                // The encode itself has started; only the automatic follow-on is lost.
+                _logger.LogWarning(ex, "Could not queue key images for movie {MovieId} after its SF encode.", movieId);
+            }
         }
 
         [HttpGet("transcode/{jobId}")]

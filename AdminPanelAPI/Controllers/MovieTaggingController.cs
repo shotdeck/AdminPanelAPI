@@ -862,6 +862,20 @@ WHERE id = ANY(@ids) AND image_key IS NOT NULL
             // same run twice over.
             var preparation = await MoviePreparationStore.GetAsync(_connection, request.MovieId, ct);
             if (!request.Force &&
+                preparation?.AnalysisStatus == MoviePreparationStore.Waiting)
+            {
+                return Conflict(new
+                {
+                    error = "The SF proxy is still being made; the key images are " +
+                            "extracted by themselves once it is.",
+                    stage = preparation.AnalysisStage,
+                    progress = preparation.AnalysisProgress,
+                    startedAt = preparation.StartedAt,
+                    automatic = true
+                });
+            }
+
+            if (!request.Force &&
                 preparation?.AnalysisStatus == MoviePreparationStore.Running &&
                 preparation.AnalysisJobId is { Length: > 0 })
             {
@@ -900,6 +914,9 @@ WHERE id = ANY(@ids) AND image_key IS NOT NULL
             var result = await _analysis.StartAsync(
                 sourceKey, request.MovieId, description,
                 storyFrom.Length == 0 ? "description" : storyFrom, ratios, ct);
+            if (result.IsSuccess && JobId(result.Body) is { } jobId)
+                await MoviePreparationStore.RecordAnalysisAsync(
+                    _connection, request.MovieId, sourceKey, jobId, ct);
             return Content(result.Body, "application/json", System.Text.Encoding.UTF8);
         }
 
@@ -933,6 +950,23 @@ WHERE id = ANY(@ids) AND image_key IS NOT NULL
             return row == null
                 ? Ok(new { movieId, prepared = false })
                 : Ok(Preparation(row));
+        }
+
+        private static string? JobId(string body)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(body);
+                return document.RootElement.TryGetProperty("jobId", out var id) &&
+                       id.ValueKind == JsonValueKind.String &&
+                       id.GetString() is { Length: > 0 } value
+                    ? value
+                    : null;
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
         }
 
         private static object Preparation(MoviePreparationRow row) => new
