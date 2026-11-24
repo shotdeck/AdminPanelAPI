@@ -535,11 +535,12 @@ ORDER BY position_seconds;";
             while (await reader.ReadAsync(ct))
             {
                 var imageKey = reader.IsDBNull(9) ? null : reader.GetString(9);
-                var (crop, cropSource, croppedKey) = KeyImageCrop.Json(reader, 12);
+                var (crop, cropSource, croppedKey, cropCheck) = KeyImageCrop.Json(reader, 12);
                 images.Add(new
                 {
                     crop,
                     cropSource,
+                    cropCheck,
                     croppedUrl = croppedKey == null ? null : _storage.CreateDownloadUrl(croppedKey, false),
                     id = reader.GetInt64(0),
                     movieId = reader.GetInt32(1),
@@ -1164,6 +1165,7 @@ WHERE id = ANY(@ids) AND image_key IS NOT NULL
             [FromQuery] double? toSeconds = null,
             [FromQuery] string? storyFrom = null,
             [FromQuery] string? decision = null,
+            [FromQuery] bool cropCheck = false,
             CancellationToken ct = default)
         {
             await EnsureReadyAsync(ct);
@@ -1189,7 +1191,8 @@ WHERE id = ANY(@ids) AND image_key IS NOT NULL
             var window =
                 (fromSeconds.HasValue ? " AND position_seconds >= @fromSeconds" : "") +
                 (toSeconds.HasValue ? " AND position_seconds <= @toSeconds" : "") +
-                (run.Length == 0 ? "" : " AND story_from = @storyFrom");
+                (run.Length == 0 ? "" : " AND story_from = @storyFrom") +
+                (cropCheck ? " AND crop_check" : "");
 
             var page = @"
 SELECT " + columns + @"
@@ -1227,11 +1230,12 @@ LIMIT @limit OFFSET @offset";
                 while (await reader.ReadAsync(ct))
                 {
                     var imageKey = reader.IsDBNull(4) ? null : reader.GetString(4);
-                    var (crop, cropSource, croppedKey) = KeyImageCrop.Json(reader, 10);
+                    var (crop, cropSource, croppedKey, check) = KeyImageCrop.Json(reader, 10);
                     proposals.Add(new
                     {
                         crop,
                         cropSource,
+                        cropCheck = check,
                         croppedUrl = croppedKey == null ? null : _storage.CreateDownloadUrl(croppedKey, false),
                         id = reader.GetInt64(0),
                         movieId,
@@ -1250,9 +1254,12 @@ LIMIT @limit OFFSET @offset";
             }
 
             var runs = await RunsAsync(movieId, wanted, ct);
-            var total = run.Length > 0
-                ? runs.TryGetValue(run, out var counted) ? counted : 0
-                : await CountDecidedAsync(movieId, wanted, fromSeconds, toSeconds, ct);
+            var total = cropCheck
+                ? await CountDecidedAsync(movieId, wanted, fromSeconds, toSeconds, ct,
+                    cropCheck: true, storyFrom: run.Length > 0 ? run : null)
+                : run.Length > 0
+                    ? runs.TryGetValue(run, out var counted) ? counted : 0
+                    : await CountDecidedAsync(movieId, wanted, fromSeconds, toSeconds, ct);
 
             return Ok(new
             {
@@ -1301,17 +1308,23 @@ GROUP BY 1;";
             string decision,
             double? fromSeconds,
             double? toSeconds,
-            CancellationToken ct)
+            CancellationToken ct,
+            bool cropCheck = false,
+            string? storyFrom = null)
         {
             var sql = @"
 SELECT count(*) FROM frl.frl_movie_key_images
 WHERE movie_id = @movieId AND decision = @decision" +
                 (fromSeconds.HasValue ? " AND position_seconds >= @fromSeconds" : "") +
-                (toSeconds.HasValue ? " AND position_seconds <= @toSeconds" : "") + ";";
+                (toSeconds.HasValue ? " AND position_seconds <= @toSeconds" : "") +
+                (storyFrom != null ? " AND story_from = @storyFrom" : "") +
+                (cropCheck ? " AND crop_check" : "") + ";";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
             cmd.Parameters.AddWithValue("@movieId", movieId);
             cmd.Parameters.AddWithValue("@decision", decision);
+            if (storyFrom != null)
+                cmd.Parameters.AddWithValue("@storyFrom", storyFrom);
             if (fromSeconds.HasValue)
                 cmd.Parameters.AddWithValue("@fromSeconds", (decimal)fromSeconds.Value);
             if (toSeconds.HasValue)

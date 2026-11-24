@@ -72,6 +72,7 @@ WHERE movie_id = @movieId AND decision = 'proposed'" +
             var cropW = new List<double>();
             var cropH = new List<double>();
             var croppedKeys = new List<string?>();
+            var cropChecks = new List<bool>();
 
             foreach (var proposal in proposals.EnumerateArray())
             {
@@ -93,6 +94,7 @@ WHERE movie_id = @movieId AND decision = 'proposed'" +
                 croppedKeys.Add(crop != null &&
                     proposal.TryGetProperty("croppedKey", out var cut) &&
                     cut.GetString() is { Length: > 0 } cutKey ? cutKey : null);
+                cropChecks.Add(KeyImageCrop.ReadCheck(proposal));
             }
 
             if (positions.Count == 0)
@@ -102,15 +104,16 @@ WHERE movie_id = @movieId AND decision = 'proposed'" +
 INSERT INTO frl.frl_movie_key_images
     (movie_id, position_seconds, frame_number, score, look_score, story_score,
      story_from, image_key, source, decision,
-     crop_x, crop_y, crop_w, crop_h, crop_source, cropped_key)
+     crop_x, crop_y, crop_w, crop_h, crop_source, cropped_key, crop_check)
 SELECT @movieId, position, frame, score, look, story, @storyFrom, image_key,
        'ai', 'proposed',
        NULLIF(cx, -1), NULLIF(cy, -1), NULLIF(cw, -1), NULLIF(ch, -1),
-       CASE WHEN cx = -1 THEN NULL ELSE 'auto' END, cropped_key
+       CASE WHEN cx = -1 THEN NULL ELSE 'auto' END, cropped_key, crop_check
 FROM unnest(@positions, @frames, @scores, @looks, @stories, @keys,
             @cropX::numeric[], @cropY::numeric[], @cropW::numeric[], @cropH::numeric[],
-            @croppedKeys::text[])
-    AS proposal(position, frame, score, look, story, image_key, cx, cy, cw, ch, cropped_key)
+            @croppedKeys::text[], @cropChecks::boolean[])
+    AS proposal(position, frame, score, look, story, image_key, cx, cy, cw, ch, cropped_key,
+                crop_check)
 ON CONFLICT (movie_id, position_seconds, COALESCE(story_from, '')) DO UPDATE
     SET score       = EXCLUDED.score,
         look_score  = EXCLUDED.look_score,
@@ -121,7 +124,8 @@ ON CONFLICT (movie_id, position_seconds, COALESCE(story_from, '')) DO UPDATE
         crop_w      = EXCLUDED.crop_w,
         crop_h      = EXCLUDED.crop_h,
         crop_source = EXCLUDED.crop_source,
-        cropped_key = EXCLUDED.cropped_key
+        cropped_key = EXCLUDED.cropped_key,
+        crop_check  = EXCLUDED.crop_check
     WHERE frl.frl_movie_key_images.decision = 'proposed'
       AND frl.frl_movie_key_images.source = 'ai';
 
@@ -147,6 +151,7 @@ WHERE movie_id = @movieId
             cmd.Parameters.Add(new NpgsqlParameter("@croppedKeys",
                 NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Text)
             { Value = croppedKeys.Select(k => (object?)k ?? DBNull.Value).ToArray() });
+            cmd.Parameters.AddWithValue("@cropChecks", cropChecks.ToArray());
             cmd.Parameters.AddWithValue(
                 "@storyFrom", (object?)storyFrom ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync(ct);
