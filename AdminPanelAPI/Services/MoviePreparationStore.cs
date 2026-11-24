@@ -39,7 +39,8 @@ namespace AdminPanelAPI.Services
         public bool Running =>
             WalkthroughStatus == "running" ||
             StoryStatus == "running" ||
-            AnalysisStatus == "running";
+            AnalysisStatus == "running" ||
+            AnalysisStatus == "waiting";
     }
 
     /// <summary>Reads and writes the preparation row for a movie.</summary>
@@ -49,6 +50,13 @@ namespace AdminPanelAPI.Services
         public const string Completed = "completed";
         public const string Error = "error";
         public const string Idle = "idle";
+
+        /// <summary>
+        /// The movie's SF proxy is still being made; the analysis starts once
+        /// it is. The SF job's id sits in analysis_job_id meanwhile.
+        /// </summary>
+        public const string Waiting = "waiting";
+        public const string SfStage = "sf-encode";
 
         /// <summary>
         /// Mirrors migrations/035 and 036, so a slot that has not had migrations run
@@ -117,7 +125,7 @@ ALTER TABLE frl.frl_movie_preparation
 SELECT {Columns} FROM frl.frl_movie_preparation
 WHERE walkthrough_status = 'running'
    OR story_status = 'running'
-   OR analysis_status = 'running'
+   OR analysis_status IN ('running', 'waiting')
 ORDER BY started_at;";
             await using var cmd = new NpgsqlCommand(sql, connection);
 
@@ -209,7 +217,7 @@ RETURNING movie_id;";
             var sql = $@"
 UPDATE frl.frl_movie_preparation
 SET {job}_job_id = @jobId, {job}_status = @status, {job}_error = @error,
-    {job}_progress = 0, updated_at = now()
+    {job}_stage = NULL, {job}_progress = 0, updated_at = now()
 WHERE movie_id = @movieId;";
 
             await using var cmd = new NpgsqlCommand(sql, connection);
@@ -217,6 +225,68 @@ WHERE movie_id = @movieId;";
             cmd.Parameters.AddWithValue("@jobId", (object?)jobId ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@status", status);
             cmd.Parameters.AddWithValue("@error", (object?)error ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        /// <summary>
+        /// An analysis a tagger started, so the worker stores its frames even
+        /// if they close the window, a reopened window can follow it, and the
+        /// sweep does not start a second run off the same proxy.
+        /// </summary>
+        public static Task RecordAnalysisAsync(
+            NpgsqlConnection connection, int movieId, string sourceKey, string jobId,
+            CancellationToken ct) =>
+            UpsertAnalysisAsync(connection, movieId, sourceKey, jobId, Running, null, ct);
+
+        /// <summary>
+        /// An SF proxy being made for the movie: the analysis is started off it
+        /// once the encode finishes. Leaves a movie alone that is mid-run.
+        /// </summary>
+        public static Task AwaitSfAsync(
+            NpgsqlConnection connection, int movieId, string masterKey, string sfJobId,
+            CancellationToken ct) =>
+            UpsertAnalysisAsync(connection, movieId, masterKey, sfJobId, Waiting, SfStage, ct);
+
+        private static async Task UpsertAnalysisAsync(
+            NpgsqlConnection connection, int movieId, string sourceKey, string jobId,
+            string status, string? stage, CancellationToken ct)
+        {
+            const string sql = @"
+INSERT INTO frl.frl_movie_preparation
+    (movie_id, source_key, analysis_job_id, analysis_status, analysis_stage,
+     started_at, updated_at)
+VALUES (@movieId, @sourceKey, @jobId, @status, @stage, now(), now())
+ON CONFLICT (movie_id) DO UPDATE
+    SET source_key         = EXCLUDED.source_key,
+        analysis_job_id    = EXCLUDED.analysis_job_id,
+        analysis_status    = EXCLUDED.analysis_status,
+        analysis_stage     = EXCLUDED.analysis_stage,
+        analysis_progress  = 0,
+        analysis_proposals = NULL,
+        analysis_error     = NULL,
+        started_at         = now(),
+        updated_at         = now()
+    WHERE frl.frl_movie_preparation.walkthrough_status <> 'running'
+      AND frl.frl_movie_preparation.story_status <> 'running';";
+
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@sourceKey", sourceKey);
+            cmd.Parameters.AddWithValue("@jobId", jobId);
+            cmd.Parameters.AddWithValue("@status", status);
+            cmd.Parameters.AddWithValue("@stage", (object?)stage ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        public static async Task SetSourceAsync(
+            NpgsqlConnection connection, int movieId, string sourceKey, CancellationToken ct)
+        {
+            const string sql = @"
+UPDATE frl.frl_movie_preparation SET source_key = @sourceKey, updated_at = now()
+WHERE movie_id = @movieId;";
+            await using var cmd = new NpgsqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@movieId", movieId);
+            cmd.Parameters.AddWithValue("@sourceKey", sourceKey);
             await cmd.ExecuteNonQueryAsync(ct);
         }
 

@@ -58,11 +58,11 @@ namespace AdminPanelAPI.Services
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
+            // Switched off, the bucket is not swept, but jobs already in flight
+            // (a tagger's run, or one waiting on an SF encode) are still
+            // followed and their frames stored.
             if (!_enabled)
-            {
-                _logger.LogInformation("Automatic movie preparation is switched off.");
-                return;
-            }
+                _logger.LogInformation("Automatic movie preparation sweep is switched off.");
 
             try
             {
@@ -79,7 +79,7 @@ namespace AdminPanelAPI.Services
             {
                 try
                 {
-                    if (DateTimeOffset.UtcNow >= nextScan)
+                    if (_enabled && DateTimeOffset.UtcNow >= nextScan)
                     {
                         await ScanAsync(stoppingToken);
                         nextScan = DateTimeOffset.UtcNow + ScanEvery;
@@ -284,7 +284,10 @@ namespace AdminPanelAPI.Services
                     row.StoryJobId is { Length: > 0 } storyJob)
                     await PollStoryAsync(services, connection, row, storyJob, ct);
 
-                if (row.AnalysisStatus == MoviePreparationStore.Running &&
+                if (row.AnalysisStatus == MoviePreparationStore.Waiting &&
+                    row.AnalysisJobId is { Length: > 0 } sfJob)
+                    await PollSfAsync(services, connection, row.MovieId, sfJob, ct);
+                else if (row.AnalysisStatus == MoviePreparationStore.Running &&
                     row.AnalysisJobId is { Length: > 0 } analysisJob)
                     await PollAnalysisAsync(services, connection, row.MovieId, analysisJob, ct);
             }
@@ -358,6 +361,64 @@ namespace AdminPanelAPI.Services
                     "Story rating for movie {MovieId} {Status}.", row.MovieId, status);
                 await StartAnalysisAsync(services, connection, row.MovieId, row.SourceKey, ct);
             }
+        }
+
+        /// <summary>
+        /// An SF encode made from the Movie Files page: once it is done the
+        /// movie is prepared off the new proxy, as the sweep would have.
+        /// </summary>
+        private async Task PollSfAsync(
+            IServiceProvider services,
+            NpgsqlConnection connection,
+            int movieId,
+            string jobId,
+            CancellationToken ct)
+        {
+            var transcode = services.GetRequiredService<IMovieTranscodeService>();
+            var result = await transcode.GetJobAsync(jobId, ct);
+            if (!result.IsSuccess)
+                return;
+
+            using var document = JsonDocument.Parse(result.Body);
+            var job = document.RootElement;
+            var status = Text(job, "status");
+
+            if (status is "error" or "cancelled")
+            {
+                await MoviePreparationStore.SetProgressAsync(
+                    connection, movieId, "analysis", MoviePreparationStore.Error,
+                    MoviePreparationStore.SfStage, Number(job, "progress"), null,
+                    Text(job, "error") ?? "The SF encode did not finish.", ct);
+                return;
+            }
+
+            if (status != "done")
+            {
+                await MoviePreparationStore.SetProgressAsync(
+                    connection, movieId, "analysis", MoviePreparationStore.Waiting,
+                    MoviePreparationStore.SfStage, Number(job, "progress"), null, null, ct);
+                return;
+            }
+
+            var storage = services.GetRequiredService<IMovieFileStorageService>();
+            var sourceKey = (await storage.GetMovieVariantsAsync(new[] { movieId }, ct))
+                .FirstOrDefault()?.SlimKey;
+            if (string.IsNullOrWhiteSpace(sourceKey))
+            {
+                await MoviePreparationStore.SetProgressAsync(
+                    connection, movieId, "analysis", MoviePreparationStore.Error,
+                    MoviePreparationStore.SfStage, 1, null,
+                    "The SF encode finished but no SF proxy is in the movie's folder.", ct);
+                return;
+            }
+
+            _logger.LogInformation(
+                "SF proxy for movie {MovieId} is made; preparing the movie from it.", movieId);
+            await MoviePreparationStore.SetSourceAsync(connection, movieId, sourceKey, ct);
+            if (_walkthrough)
+                await StartWalkthroughAsync(services, connection, movieId, sourceKey, ct);
+            else
+                await StartAnalysisAsync(services, connection, movieId, sourceKey, ct);
         }
 
         private async Task PollAnalysisAsync(
