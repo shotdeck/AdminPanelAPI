@@ -29,3 +29,32 @@ public class TaggingDropStoreTests
         Assert.Equal("", TaggingDropStore.Format(null));
     }
 }
+
+public class TaggingDropReleaseTests
+{
+    private static TaggingDropStore.OpenDrop Drop(long id, int day, int titles, int assigned) =>
+        new(id, new DateOnly(2026, 10, day), titles, assigned);
+
+    [Fact]
+    public void The_first_open_drop_is_always_released()
+    {
+        var released = TaggingDropStore.Released(new[] { Drop(2, 20, 10, 0), Drop(1, 13, 10, 0) }, 75);
+        Assert.Equal(new long[] { 1 }, released.Select(d => d.Id));
+    }
+
+    [Fact]
+    public void A_later_drop_waits_until_the_earlier_one_is_assigned_enough()
+    {
+        var drops = new[] { Drop(1, 13, 8, 6), Drop(2, 20, 10, 7), Drop(3, 27, 4, 0) };
+        Assert.Equal(new long[] { 1, 2 }, TaggingDropStore.Released(drops, 75).Select(d => d.Id));
+        Assert.Equal(new long[] { 1 }, TaggingDropStore.Released(drops, 80).Select(d => d.Id));
+        Assert.Equal(new long[] { 1, 2, 3 }, TaggingDropStore.Released(drops, 0).Select(d => d.Id));
+    }
+
+    [Fact]
+    public void An_empty_drop_does_not_hold_back_the_next()
+    {
+        var released = TaggingDropStore.Released(new[] { Drop(1, 13, 0, 0), Drop(2, 20, 3, 0) }, 75);
+        Assert.Equal(new long[] { 1, 2 }, released.Select(d => d.Id));
+    }
+}

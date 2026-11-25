@@ -344,6 +344,167 @@ RETURNING t.priority, t.due_date_override, COALESCE(t.due_date_override, d.due_d
             });
         }
 
+        public sealed class ClaimRequest
+        {
+            public int MovieId { get; set; }
+            public string? ActingUser { get; set; }
+        }
+
+        /// <summary>
+        /// What a tagger may add to their queue: the unassigned titles of the
+        /// released open drops (still before their due date, and within the set
+        /// weeks), with how many titles the tagger has in hand and may hold.
+        /// </summary>
+        [HttpGet("available")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public async Task<IActionResult> GetAvailable(
+            [FromQuery] string? tagger = null, CancellationToken ct = default)
+        {
+            await EnsureReadyAsync(ct);
+            var settings = await TaggingDropStore.SettingsAsync(_connection, ct);
+            var released = await ReleasedDropsAsync(settings, ct);
+            var inQueue = string.IsNullOrWhiteSpace(tagger) ? 0 : await InQueueAsync(tagger, ct);
+            var max = settings[TaggingDropStore.MaxTitlesPerTagger];
+
+            var titles = new List<object>();
+            if (released.Count > 0)
+            {
+                await using var cmd = new NpgsqlCommand(@"
+SELECT t.movie_id, d.drop_date, COALESCE(t.due_date_override, d.due_date), t.priority,
+       COALESCE(m.title, ''), m.year, m.media_type::text, m.poster
+FROM frl.frl_tagging_drop_titles t
+JOIN frl.frl_tagging_drops d ON d.id = t.drop_id
+LEFT JOIN frl.frl_movies m ON m.idnum = t.movie_id
+WHERE t.drop_id = ANY(@drops)
+  AND NOT EXISTS (SELECT 1 FROM frl.frl_movie_tagger_assignments a WHERE a.movie_id = t.movie_id)
+ORDER BY d.drop_date, t.priority DESC, COALESCE(m.title, ''), t.movie_id;", _connection);
+                cmd.Parameters.AddWithValue("@drops", released.Select(d => d.Id).ToArray());
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    titles.Add(new
+                    {
+                        movieId = reader.GetInt32(0),
+                        dropDate = TaggingDropStore.Format(TaggingDropStore.ReadDate(reader, 1)),
+                        dueDate = TaggingDropStore.Format(TaggingDropStore.ReadDate(reader, 2)),
+                        priority = reader.GetBoolean(3),
+                        title = reader.GetString(4),
+                        year = reader.IsDBNull(5) ? (int?)null : reader.GetInt32(5),
+                        mediaType = reader.IsDBNull(6) ? "" : reader.GetString(6),
+                        poster = reader.IsDBNull(7) ? null : PosterBaseUrl + reader.GetString(7)
+                    });
+                }
+            }
+
+            return Ok(new
+            {
+                titles,
+                drops = released.Select(d => TaggingDropStore.Format(d.DropDate)),
+                inQueue,
+                maxTitles = max,
+                canAdd = Math.Max(0, max - inQueue)
+            });
+        }
+
+        /// <summary>
+        /// A tagger adds an available title to their own queue. The title is
+        /// then theirs alone, and a full queue is refused.
+        /// </summary>
+        [HttpPost("claim")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status409Conflict)]
+        public async Task<IActionResult> Claim(
+            [FromBody] ClaimRequest request, CancellationToken ct = default)
+        {
+            var tagger = (request.ActingUser ?? "").Trim();
+            if (request.MovieId <= 0)
+                return BadRequest(new { error = "movieId is required." });
+            if (tagger == "")
+                return BadRequest(new { error = "actingUser is required." });
+
+            await EnsureReadyAsync(ct);
+            await using (var user = new NpgsqlCommand(
+                "SELECT 1 FROM frl.frl_camera_movement_users WHERE lower(name) = lower(@name) LIMIT 1;",
+                _connection))
+            {
+                user.Parameters.AddWithValue("@name", tagger);
+                if (await user.ExecuteScalarAsync(ct) == null)
+                    return BadRequest(new { error = "Unknown tagger." });
+            }
+
+            var settings = await TaggingDropStore.SettingsAsync(_connection, ct);
+            var released = await ReleasedDropsAsync(settings, ct);
+            var max = settings[TaggingDropStore.MaxTitlesPerTagger];
+
+            await using var tx = await _connection.BeginTransactionAsync(ct);
+            await using (var lockCmd = new NpgsqlCommand(
+                "SELECT pg_advisory_xact_lock(hashtext('tagging-claim:' || lower(@tagger)));",
+                _connection, tx))
+            {
+                lockCmd.Parameters.AddWithValue("@tagger", tagger);
+                await lockCmd.ExecuteNonQueryAsync(ct);
+            }
+
+            if (await InQueueAsync(tagger, ct, tx) >= max)
+                return Conflict(new { error = $"You may have up to {max} titles in your queue." });
+
+            await using (var inDrop = new NpgsqlCommand(
+                "SELECT 1 FROM frl.frl_tagging_drop_titles WHERE movie_id = @movieId AND drop_id = ANY(@drops);",
+                _connection, tx))
+            {
+                inDrop.Parameters.AddWithValue("@movieId", request.MovieId);
+                inDrop.Parameters.AddWithValue("@drops", released.Select(d => d.Id).ToArray());
+                if (await inDrop.ExecuteScalarAsync(ct) == null)
+                    return Conflict(new { error = "That title isn't available to add." });
+            }
+
+            await using (var insert = new NpgsqlCommand(@"
+INSERT INTO frl.frl_movie_tagger_assignments (movie_id, tagger, status, assigned_by)
+VALUES (@movieId, @tagger, 'tagger_allocated', @tagger)
+ON CONFLICT (movie_id) DO NOTHING;", _connection, tx))
+            {
+                insert.Parameters.AddWithValue("@movieId", request.MovieId);
+                insert.Parameters.AddWithValue("@tagger", tagger);
+                if (await insert.ExecuteNonQueryAsync(ct) == 0)
+                    return Conflict(new { error = "Someone else has just added that title." });
+            }
+
+            await tx.CommitAsync(ct);
+            return Ok(new { movieId = request.MovieId, tagger, status = "tagger_allocated" });
+        }
+
+        /// <summary>Titles a tagger has in hand: assigned and not yet confirmed.</summary>
+        private async Task<int> InQueueAsync(string tagger, CancellationToken ct, NpgsqlTransaction? tx = null)
+        {
+            await using var cmd = new NpgsqlCommand(@"
+SELECT COUNT(*) FROM frl.frl_movie_tagger_assignments
+WHERE lower(tagger) = lower(@tagger) AND status <> 'tags_confirmed';", _connection, tx);
+            cmd.Parameters.AddWithValue("@tagger", tagger.Trim());
+            return (int)(long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
+        }
+
+        private async Task<List<TaggingDropStore.OpenDrop>> ReleasedDropsAsync(
+            Dictionary<string, int> settings, CancellationToken ct)
+        {
+            var open = new List<TaggingDropStore.OpenDrop>();
+            await using var cmd = new NpgsqlCommand(@"
+SELECT d.id, d.drop_date, COUNT(t.movie_id), COUNT(a.movie_id)
+FROM frl.frl_tagging_drops d
+LEFT JOIN frl.frl_tagging_drop_titles t ON t.drop_id = d.id
+LEFT JOIN frl.frl_movie_tagger_assignments a ON a.movie_id = t.movie_id
+WHERE d.due_date >= CURRENT_DATE AND d.drop_date < CURRENT_DATE + @days
+GROUP BY d.id, d.drop_date
+ORDER BY d.drop_date;", _connection);
+            cmd.Parameters.AddWithValue("@days", Math.Max(1, settings[TaggingDropStore.OpenDropWeeks]) * 7);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                open.Add(new TaggingDropStore.OpenDrop(reader.GetInt64(0),
+                    reader.GetFieldValue<DateOnly>(1), (int)reader.GetInt64(2), (int)reader.GetInt64(3)));
+            }
+            return TaggingDropStore.Released(open, settings[TaggingDropStore.ReleaseNextDropPercent]);
+        }
+
         [HttpGet("settings")]
         [ProducesResponseType(StatusCodes.Status200OK)]
         public async Task<IActionResult> GetSettings(CancellationToken ct = default)
