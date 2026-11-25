@@ -222,8 +222,7 @@ WHERE id = @id;", _connection);
         {
             if (_connection.State != ConnectionState.Open)
                 await _connection.OpenAsync(ct);
-            await using var cmd = new NpgsqlCommand(TaggingQcNoteStore.Schema, _connection);
-            await cmd.ExecuteNonQueryAsync(ct);
+            await SchemaOnce.EnsureAsync(_connection, TaggingQcNoteStore.Schema, ct);
         }
 
         private async Task<bool> IsAdminAsync(string? name, CancellationToken ct)

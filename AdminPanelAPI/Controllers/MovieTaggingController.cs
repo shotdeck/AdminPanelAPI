@@ -2409,8 +2409,7 @@ CREATE INDEX IF NOT EXISTS idx_fmki_movie_decision
                 + MoviePreparationStore.Schema + KeyImageTagStore.Schema
                 + TrainingRunStore.Schema + KeyImageCrop.Schema
                 + TaggingDropStore.Schema;
-            await using var cmd = new NpgsqlCommand(sql, _connection);
-            await cmd.ExecuteNonQueryAsync(ct);
+            await SchemaOnce.EnsureAsync(_connection, sql, ct);
         }
 
         /// <summary>Admins, and the tagger the movie is allocated to, may pick frames.</summary>
