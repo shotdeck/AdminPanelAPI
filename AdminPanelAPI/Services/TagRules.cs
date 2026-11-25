@@ -9,9 +9,12 @@ namespace AdminPanelAPI.Services;
 /// </summary>
 public static class TagRules
 {
-    public static List<string> Errors(string taxonomyJson, IReadOnlyDictionary<string, string> chosen)
+    public static List<string> Errors(string taxonomyJson, IReadOnlyDictionary<string, string> chosenTags)
     {
         var errors = new List<string>();
+        // Category names are matched without regard to case, as the save's legal-values check does.
+        var chosen = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, value) in chosenTags) chosen[name] = value;
         JsonDocument document;
         try
         {
@@ -30,11 +33,15 @@ public static class TagRules
             if (root.TryGetProperty("categories", out var categories) &&
                 categories.ValueKind == JsonValueKind.Object)
             {
+                var byName = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+                foreach (var property in categories.EnumerateObject()) byName[property.Name] = property.Value;
+
                 foreach (var (name, value) in chosen)
                 {
                     var terms = Terms(value);
                     if (terms.Count < 2 ||
-                        !categories.TryGetProperty(name, out var category) ||
+                        !byName.TryGetValue(name, out var category) ||
+                        category.ValueKind != JsonValueKind.Object ||
                         !category.TryGetProperty("legal_combinations", out var combos) ||
                         combos.ValueKind != JsonValueKind.Array)
                         continue;
