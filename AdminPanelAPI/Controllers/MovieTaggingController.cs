@@ -284,9 +284,10 @@ namespace ShotDeckSearch.Controllers
             var sql = $@"
 SELECT a.movie_id, a.tagger, a.status, a.note, a.assigned_by, a.assigned_at, a.updated_at,
        COALESCE(m.title, '') AS title, m.year, m.media_type::text AS media_type, m.poster,
-       a.watch_position_seconds, a.watch_duration_seconds, a.watched_at
+       a.watch_position_seconds, a.watch_duration_seconds, a.watched_at,
+       {TaggingDropStore.AssignmentColumns}
 FROM frl.frl_movie_tagger_assignments a
-LEFT JOIN frl.frl_movies m ON m.idnum = a.movie_id{filter}
+LEFT JOIN frl.frl_movies m ON m.idnum = a.movie_id{TaggingDropStore.AssignmentJoin}{filter}
 ORDER BY a.updated_at DESC;";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);
@@ -314,7 +315,10 @@ ORDER BY a.updated_at DESC;";
                     poster = reader.IsDBNull(10) ? null : PosterBaseUrl + reader.GetString(10),
                     watchPositionSeconds = reader.GetInt32(11),
                     watchDurationSeconds = reader.IsDBNull(12) ? (int?)null : reader.GetInt32(12),
-                    watchedAt = reader.IsDBNull(13) ? (DateTime?)null : reader.GetDateTime(13)
+                    watchedAt = reader.IsDBNull(13) ? (DateTime?)null : reader.GetDateTime(13),
+                    dropDate = reader.IsDBNull(14) ? null : TaggingDropStore.Format(TaggingDropStore.ReadDate(reader, 14)),
+                    dueDate = reader.IsDBNull(15) ? null : TaggingDropStore.Format(TaggingDropStore.ReadDate(reader, 15)),
+                    priority = reader.GetBoolean(16)
                 });
             }
 
@@ -2401,7 +2405,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_fmki_movie_position_story
 CREATE INDEX IF NOT EXISTS idx_fmki_movie_decision
     ON frl.frl_movie_key_images (movie_id, decision);"
                 + MoviePreparationStore.Schema + KeyImageTagStore.Schema
-                + TrainingRunStore.Schema + KeyImageCrop.Schema;
+                + TrainingRunStore.Schema + KeyImageCrop.Schema
+                + TaggingDropStore.Schema;
             await using var cmd = new NpgsqlCommand(sql, _connection);
             await cmd.ExecuteNonQueryAsync(ct);
         }
