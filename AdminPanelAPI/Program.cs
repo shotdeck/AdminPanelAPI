@@ -39,22 +39,9 @@ TunnelPortSelector.Apply(builder.Configuration);
 builder.Services.AddSingleton<SshTunnelService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SshTunnelService>());
 
-// Database connection (scoped, lazy - only opened when first accessed)
-builder.Services.AddScoped<Lazy<NpgsqlConnection>>(sp =>
-{
-    return new Lazy<NpgsqlConnection>(() =>
-    {
-        var connStr = builder.Configuration["ConnectionStrings:Default"]
-            ?? throw new InvalidOperationException("DefaultConnection is not configured.");
-
-        var conn = new NpgsqlConnection(connStr);
-        conn.Open();
-        return conn;
-    });
-});
-
-// Keep NpgsqlConnection resolvable for code that injects it directly
-builder.Services.AddScoped<NpgsqlConnection>(sp => sp.GetRequiredService<Lazy<NpgsqlConnection>>().Value);
+// Database connection: one per request, opened on first use, returned to the pool when the request ends
+builder.Services.AddScopedConnection(() => builder.Configuration["ConnectionStrings:Default"]
+    ?? throw new InvalidOperationException("DefaultConnection is not configured."));
 
 // Keyword caching (singleton) - also includes unwanted words caching
 builder.Services.AddSingleton<IKeywordCacheService, KeywordCacheService>();
