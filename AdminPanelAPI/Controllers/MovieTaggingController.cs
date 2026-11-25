@@ -1810,6 +1810,14 @@ WHERE movie_id = @movieId
                 chosen[name] = chosenValue;
             }
 
+            var taxonomy = await _imageTags.GetTaxonomyAsync(ct);
+            if (taxonomy.IsSuccess)
+            {
+                var broken = TagRules.Errors(taxonomy.Body, chosen);
+                if (broken.Count > 0)
+                    return BadRequest(new { error = string.Join(" ", broken) });
+            }
+
             await KeyImageTagStore.SaveDecisionsAsync(_connection, id, chosen, actingUser, ct);
             return Ok(new { id, saved = chosen.Count, decidedBy = actingUser });
         }
