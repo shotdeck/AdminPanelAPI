@@ -61,7 +61,7 @@ namespace ShotDeckSearch.Controllers
 
             await using var cmd = new NpgsqlCommand($@"
 SELECT q.id, q.movie_id, q.key_image_id, q.category, q.note, q.created_by, q.created_at,
-       q.reply, q.addressed_by, q.addressed_at, a.tagger, k.position_seconds
+       q.reply, q.addressed_by, q.addressed_at, a.tagger, COALESCE(k.position_seconds, q.position_seconds)
 FROM frl.frl_tagging_qc_notes q
 LEFT JOIN frl.frl_movie_tagger_assignments a ON a.movie_id = q.movie_id
 LEFT JOIN frl.frl_movie_key_images k ON k.id = q.key_image_id{filter}
@@ -122,8 +122,10 @@ ORDER BY q.created_at DESC, q.id DESC;", _connection);
             }
 
             await using var cmd = new NpgsqlCommand(@"
-INSERT INTO frl.frl_tagging_qc_notes (movie_id, key_image_id, category, note, created_by)
-VALUES (@movieId, @keyImageId, @category, @note, @actingUser)
+INSERT INTO frl.frl_tagging_qc_notes (movie_id, key_image_id, position_seconds, category, note, created_by)
+VALUES (@movieId, @keyImageId,
+        (SELECT position_seconds FROM frl.frl_movie_key_images WHERE id = @keyImageId),
+        @category, @note, @actingUser)
 RETURNING id;", _connection);
             cmd.Parameters.AddWithValue("@movieId", request.MovieId);
             cmd.Parameters.Add(new NpgsqlParameter("@keyImageId", NpgsqlTypes.NpgsqlDbType.Bigint)

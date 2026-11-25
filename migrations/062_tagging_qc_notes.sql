@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS frl.frl_tagging_qc_notes (
     addressed_by  VARCHAR(120),
     addressed_at  TIMESTAMPTZ
 );
+ALTER TABLE frl.frl_tagging_qc_notes
+    ADD COLUMN IF NOT EXISTS position_seconds NUMERIC(10,3);
 CREATE INDEX IF NOT EXISTS idx_ftqn_movie
     ON frl.frl_tagging_qc_notes (movie_id);
 
