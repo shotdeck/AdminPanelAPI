@@ -9,12 +9,9 @@ namespace AdminPanelAPI.Services;
 /// </summary>
 public static class TagRules
 {
-    public static List<string> Errors(string taxonomyJson, IReadOnlyDictionary<string, string> chosenTags)
+    public static List<string> Errors(string taxonomyJson, IReadOnlyDictionary<string, string> chosen)
     {
         var errors = new List<string>();
-        // Category names are matched without regard to case, as the save's legal-values check does.
-        var chosen = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var (name, value) in chosenTags) chosen[name] = value;
         JsonDocument document;
         try
         {
@@ -61,31 +58,38 @@ public static class TagRules
                 {
                     if (rule.ValueKind != JsonValueKind.Object ||
                         !rule.TryGetProperty("category", out var category) ||
-                        category.GetString() is not { } name ||
-                        !chosen.TryGetValue(name, out var value))
+                        category.GetString() is not { } name)
                         continue;
 
-                    var terms = Terms(value);
-                    bool broken;
-                    if (rule.TryGetProperty("never_together", out var together))
+                    // Category names are matched without regard to case, as the save's
+                    // legal-values check does; every spelling the save carries is checked.
+                    foreach (var (chosenName, value) in chosen)
                     {
-                        broken = Strings(together).All(terms.Contains);
-                    }
-                    else
-                    {
-                        var term = rule.TryGetProperty("value", out var v) ? v.GetString() : null;
-                        broken = term != null && terms.Contains(term) && (
-                            (rule.TryGetProperty("alone", out var alone) &&
-                             alone.ValueKind == JsonValueKind.True && terms.Count > 1) ||
-                            (rule.TryGetProperty("needs_one_of", out var needs) &&
-                             !Strings(needs).Any(terms.Contains)));
-                    }
+                        if (!string.Equals(chosenName, name, StringComparison.OrdinalIgnoreCase))
+                            continue;
 
-                    if (broken)
-                        errors.Add(rule.TryGetProperty("message", out var message) &&
-                                   message.GetString() is { Length: > 0 } text
-                            ? text
-                            : $"That combination of {name} can't be right.");
+                        var terms = Terms(value);
+                        bool broken;
+                        if (rule.TryGetProperty("never_together", out var together))
+                        {
+                            broken = Strings(together).All(terms.Contains);
+                        }
+                        else
+                        {
+                            var term = rule.TryGetProperty("value", out var v) ? v.GetString() : null;
+                            broken = term != null && terms.Contains(term) && (
+                                (rule.TryGetProperty("alone", out var alone) &&
+                                 alone.ValueKind == JsonValueKind.True && terms.Count > 1) ||
+                                (rule.TryGetProperty("needs_one_of", out var needs) &&
+                                 !Strings(needs).Any(terms.Contains)));
+                        }
+
+                        if (broken)
+                            errors.Add(rule.TryGetProperty("message", out var message) &&
+                                       message.GetString() is { Length: > 0 } text
+                                ? text
+                                : $"That combination of {name} can't be right.");
+                    }
                 }
             }
         }
