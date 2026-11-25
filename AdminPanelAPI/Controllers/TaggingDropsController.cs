@@ -556,8 +556,7 @@ SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()
         {
             if (_connection.State != ConnectionState.Open)
                 await _connection.OpenAsync(ct);
-            await using var cmd = new NpgsqlCommand(TaggingDropStore.Schema, _connection);
-            await cmd.ExecuteNonQueryAsync(ct);
+            await SchemaOnce.EnsureAsync(_connection, TaggingDropStore.Schema, ct);
         }
 
         private async Task<bool> IsAdminAsync(string? name, CancellationToken ct)
