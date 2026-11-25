@@ -30,11 +30,15 @@ public static class TagRules
             if (root.TryGetProperty("categories", out var categories) &&
                 categories.ValueKind == JsonValueKind.Object)
             {
+                var byName = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+                foreach (var property in categories.EnumerateObject()) byName[property.Name] = property.Value;
+
                 foreach (var (name, value) in chosen)
                 {
                     var terms = Terms(value);
                     if (terms.Count < 2 ||
-                        !categories.TryGetProperty(name, out var category) ||
+                        !byName.TryGetValue(name, out var category) ||
+                        category.ValueKind != JsonValueKind.Object ||
                         !category.TryGetProperty("legal_combinations", out var combos) ||
                         combos.ValueKind != JsonValueKind.Array)
                         continue;
@@ -54,31 +58,38 @@ public static class TagRules
                 {
                     if (rule.ValueKind != JsonValueKind.Object ||
                         !rule.TryGetProperty("category", out var category) ||
-                        category.GetString() is not { } name ||
-                        !chosen.TryGetValue(name, out var value))
+                        category.GetString() is not { } name)
                         continue;
 
-                    var terms = Terms(value);
-                    bool broken;
-                    if (rule.TryGetProperty("never_together", out var together))
+                    // Category names are matched without regard to case, as the save's
+                    // legal-values check does; every spelling the save carries is checked.
+                    foreach (var (chosenName, value) in chosen)
                     {
-                        broken = Strings(together).All(terms.Contains);
-                    }
-                    else
-                    {
-                        var term = rule.TryGetProperty("value", out var v) ? v.GetString() : null;
-                        broken = term != null && terms.Contains(term) && (
-                            (rule.TryGetProperty("alone", out var alone) &&
-                             alone.ValueKind == JsonValueKind.True && terms.Count > 1) ||
-                            (rule.TryGetProperty("needs_one_of", out var needs) &&
-                             !Strings(needs).Any(terms.Contains)));
-                    }
+                        if (!string.Equals(chosenName, name, StringComparison.OrdinalIgnoreCase))
+                            continue;
 
-                    if (broken)
-                        errors.Add(rule.TryGetProperty("message", out var message) &&
-                                   message.GetString() is { Length: > 0 } text
-                            ? text
-                            : $"That combination of {name} can't be right.");
+                        var terms = Terms(value);
+                        bool broken;
+                        if (rule.TryGetProperty("never_together", out var together))
+                        {
+                            broken = Strings(together).All(terms.Contains);
+                        }
+                        else
+                        {
+                            var term = rule.TryGetProperty("value", out var v) ? v.GetString() : null;
+                            broken = term != null && terms.Contains(term) && (
+                                (rule.TryGetProperty("alone", out var alone) &&
+                                 alone.ValueKind == JsonValueKind.True && terms.Count > 1) ||
+                                (rule.TryGetProperty("needs_one_of", out var needs) &&
+                                 !Strings(needs).Any(terms.Contains)));
+                        }
+
+                        if (broken)
+                            errors.Add(rule.TryGetProperty("message", out var message) &&
+                                       message.GetString() is { Length: > 0 } text
+                                ? text
+                                : $"That combination of {name} can't be right.");
+                    }
                 }
             }
         }

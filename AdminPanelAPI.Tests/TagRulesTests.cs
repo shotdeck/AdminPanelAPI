@@ -43,6 +43,20 @@ public class TagRulesTests
     public void RefusesImpossibleCombinations(string category, string value, string error) =>
         Assert.Equal(new[] { error }, Check(category, value));
 
+    [Theory]
+    [InlineData("Time_Of_Day", "day + night")]
+    [InlineData("LIGHTING_TYPE", "daylight + moonlight")]
+    public void MatchesCategoriesWithoutRegardToCase(string category, string value) =>
+        Assert.Single(Check(category, value));
+
+    [Fact]
+    public void ChecksEverySpellingOfACategory() =>
+        Assert.Single(TagRules.Errors(Taxonomy, new Dictionary<string, string>
+        {
+            ["lighting_type"] = "daylight + moonlight",
+            ["Lighting_Type"] = "daylight",
+        }));
+
     [Fact]
     public void UnreadableTaxonomyRefusesNothing() =>
         Assert.Empty(TagRules.Errors("not json", new Dictionary<string, string> { ["x"] = "a + b" }));
