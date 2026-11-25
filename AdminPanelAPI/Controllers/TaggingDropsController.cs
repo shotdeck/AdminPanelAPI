@@ -526,6 +526,8 @@ ORDER BY d.drop_date;", _connection);
                 return BadRequest(new { error = "Unknown settings: " + string.Join(", ", unknown) });
             if (values.Values.Any(v => v < 0 || v > 365))
                 return BadRequest(new { error = "Settings must be between 0 and 365." });
+            if (values.TryGetValue(TaggingDropStore.ReleaseNextDropPercent, out var percent) && percent > 100)
+                return BadRequest(new { error = "release_next_drop_percent must be between 0 and 100." });
 
             await EnsureReadyAsync(ct);
             if (!await IsAdminAsync(request.ActingUser, ct))
