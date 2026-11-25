@@ -13,13 +13,15 @@ namespace AdminPanelAPI.Services
         public const string MaxTitlesPerTagger = "max_titles_per_tagger";
         public const string OpenDropWeeks = "open_drop_weeks";
         public const string DueDaysBeforeDrop = "due_days_before_drop";
+        public const string ReleaseNextDropPercent = "release_next_drop_percent";
 
         public static readonly IReadOnlyDictionary<string, int> DefaultSettings =
             new Dictionary<string, int>
             {
                 [MaxTitlesPerTagger] = 3,
                 [OpenDropWeeks] = 2,
-                [DueDaysBeforeDrop] = 5
+                [DueDaysBeforeDrop] = 5,
+                [ReleaseNextDropPercent] = 75
             };
 
         /// <summary>Mirrors migrations/061.</summary>
@@ -53,7 +55,8 @@ CREATE TABLE IF NOT EXISTS frl.frl_tagging_settings (
 INSERT INTO frl.frl_tagging_settings (name, value) VALUES
     ('max_titles_per_tagger', 3),
     ('open_drop_weeks', 2),
-    ('due_days_before_drop', 5)
+    ('due_days_before_drop', 5),
+    ('release_next_drop_percent', 75)
 ON CONFLICT (name) DO NOTHING;";
 
         /// <summary>
@@ -80,6 +83,25 @@ LEFT JOIN frl.frl_tagging_drops d ON d.id = t.drop_id";
         /// <summary>A drop's due date when none is given: the set number of days before it.</summary>
         public static DateOnly DefaultDue(DateOnly dropDate, int daysBefore) =>
             dropDate.AddDays(-Math.Max(0, daysBefore));
+
+        public sealed record OpenDrop(long Id, DateOnly DropDate, int Titles, int Assigned);
+
+        /// <summary>
+        /// The open drops taggers may pick titles from, soonest first: the first
+        /// always, and each later one only once every drop before it has at
+        /// least the set share of its titles assigned.
+        /// </summary>
+        public static List<OpenDrop> Released(IEnumerable<OpenDrop> open, int percent)
+        {
+            var released = new List<OpenDrop>();
+            foreach (var drop in open.OrderBy(d => d.DropDate))
+            {
+                released.Add(drop);
+                var share = drop.Titles == 0 ? 100.0 : 100.0 * drop.Assigned / drop.Titles;
+                if (share < percent) break;
+            }
+            return released;
+        }
 
         public static async Task<Dictionary<string, int>> SettingsAsync(
             NpgsqlConnection connection, CancellationToken ct)

@@ -1397,9 +1397,9 @@ GROUP BY 1;";
         }
 
         /// <summary>
-        /// Keep or discard a selection of proposals. Discarding leaves the row
-        /// behind so the same frame is not proposed again; keeping turns it into
-        /// one of the movie's key images.
+        /// Keep or discard a selection of proposals, or put them back undecided.
+        /// Discarding leaves the row behind so the same frame is not proposed
+        /// again; keeping turns it into one of the movie's key images.
         /// </summary>
         [HttpPost("key-images/decide")]
         [ProducesResponseType(StatusCodes.Status200OK)]
@@ -1412,8 +1412,8 @@ GROUP BY 1;";
                 return BadRequest(new { error = "actingUser is required." });
 
             var decision = (request.Decision ?? "").Trim().ToLowerInvariant();
-            if (decision is not ("kept" or "discarded"))
-                return BadRequest(new { error = "decision must be kept or discarded." });
+            if (decision is not ("kept" or "discarded" or "proposed"))
+                return BadRequest(new { error = "decision must be kept, discarded or proposed." });
 
             var ids = (request.Ids ?? Array.Empty<long>()).Distinct().ToArray();
             if (ids.Length == 0)
@@ -1438,7 +1438,9 @@ GROUP BY 1;";
 
             const string sql = @"
 UPDATE frl.frl_movie_key_images
-SET decision = @decision, decided_by = @actingUser, decided_at = now()
+SET decision = @decision,
+    decided_by = CASE WHEN @decision = 'proposed' THEN NULL ELSE @actingUser END,
+    decided_at = CASE WHEN @decision = 'proposed' THEN NULL ELSE now() END
 WHERE id = ANY(@ids);";
 
             await using var cmd = new NpgsqlCommand(sql, _connection);

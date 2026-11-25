@@ -119,13 +119,20 @@ ON CONFLICT (movie_id, position_seconds, COALESCE(story_from, '')) DO UPDATE
         look_score  = EXCLUDED.look_score,
         story_score = EXCLUDED.story_score,
         image_key   = EXCLUDED.image_key,
-        crop_x      = EXCLUDED.crop_x,
-        crop_y      = EXCLUDED.crop_y,
-        crop_w      = EXCLUDED.crop_w,
-        crop_h      = EXCLUDED.crop_h,
-        crop_source = EXCLUDED.crop_source,
-        cropped_key = EXCLUDED.cropped_key,
-        crop_check  = EXCLUDED.crop_check
+        crop_x      = CASE WHEN frl.frl_movie_key_images.crop_source = 'tagger'
+                           THEN frl.frl_movie_key_images.crop_x ELSE EXCLUDED.crop_x END,
+        crop_y      = CASE WHEN frl.frl_movie_key_images.crop_source = 'tagger'
+                           THEN frl.frl_movie_key_images.crop_y ELSE EXCLUDED.crop_y END,
+        crop_w      = CASE WHEN frl.frl_movie_key_images.crop_source = 'tagger'
+                           THEN frl.frl_movie_key_images.crop_w ELSE EXCLUDED.crop_w END,
+        crop_h      = CASE WHEN frl.frl_movie_key_images.crop_source = 'tagger'
+                           THEN frl.frl_movie_key_images.crop_h ELSE EXCLUDED.crop_h END,
+        cropped_key = CASE WHEN frl.frl_movie_key_images.crop_source = 'tagger'
+                           THEN frl.frl_movie_key_images.cropped_key ELSE EXCLUDED.cropped_key END,
+        crop_check  = CASE WHEN frl.frl_movie_key_images.crop_source = 'tagger'
+                           THEN frl.frl_movie_key_images.crop_check ELSE EXCLUDED.crop_check END,
+        crop_source = CASE WHEN frl.frl_movie_key_images.crop_source = 'tagger'
+                           THEN 'tagger' ELSE EXCLUDED.crop_source END
     WHERE frl.frl_movie_key_images.decision = 'proposed'
       AND frl.frl_movie_key_images.source = 'ai';
 
