@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 
@@ -46,6 +47,13 @@ namespace AdminPanelAPI.Services
         private readonly ILogger<ImageTechnicalTagService> _logger;
         private readonly string _baseUrl;
 
+        /// <summary>
+        /// Shared token the tagger asks for before it tags anything, since each
+        /// unsure frame can cost an OpenAI call. Azure holds it as an app
+        /// setting; a shell holds it as IMAGE_TAGGER_TOKEN.
+        /// </summary>
+        private readonly string _token;
+
         /// <summary>The taxonomy as the service last gave it, and when.</summary>
         private string? _taxonomy;
         private DateTimeOffset _taxonomyAt = DateTimeOffset.MinValue;
@@ -64,6 +72,9 @@ namespace AdminPanelAPI.Services
             _baseUrl = (configuration["MovieFiles:ImageTagApiBaseUrl"]
                 ?? "https://semanticsearch--image-technical-tagger-serve-tagger-web.modal.run")
                 .TrimEnd('/');
+            _token = configuration["MovieFiles:ImageTagApiToken"]
+                ?? configuration["IMAGE_TAGGER_TOKEN"]
+                ?? "";
         }
 
         public int BatchLimit => 32;
@@ -152,6 +163,8 @@ namespace AdminPanelAPI.Services
             client.Timeout = TimeSpan.FromMinutes(10);
 
             using var request = new HttpRequestMessage(method, _baseUrl + path);
+            if (_token.Length > 0)
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
             if (body != null)
                 request.Content = new StringContent(body, Encoding.UTF8, "application/json");
 
